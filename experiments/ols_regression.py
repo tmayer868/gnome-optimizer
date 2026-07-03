@@ -58,6 +58,7 @@ from experiments.baselines.soap import SOAP
 from experiments.common import (
     RunLogger,
     baseline_cosine_scheduler,
+    current_lr,
     pick_device,
 )
 
@@ -103,7 +104,7 @@ def build_optimizer(
         raise ValueError(f"unknown optimizer: {name}")
 
     scheduler = baseline_cosine_scheduler(opt, warmup, total_steps, cosine_decay)
-    cfg["warmup_steps"] = warmup
+    cfg["warmup"] = warmup
     cfg["cosine_decay_floor"] = cosine_decay
     return opt, cfg, scheduler
 
@@ -323,8 +324,8 @@ def main():
             ss_tot = ((y_val_t - y_val_t.mean()) ** 2).sum().item()
             r2 = 1.0 - ss_res / max(ss_tot, 1e-12)
         val_beta_dist = beta_dist()
-        run.log_val(step, epoch=epoch, beta_dist=val_beta_dist,
-                    loss=val_loss, r2=r2)
+        run.log_val(step, epoch=epoch, lr=current_lr(opt),
+                    beta_dist=val_beta_dist, loss=val_loss, r2=r2)
         if not args.quiet:
             print(
                 f"  epoch {epoch:3d}/{args.epochs}  "

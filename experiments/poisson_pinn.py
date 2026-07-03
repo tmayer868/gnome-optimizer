@@ -51,7 +51,12 @@ import torch.nn as nn
 
 from gnome import Gnome, stack_residuals
 from experiments.baselines import SOAP
-from experiments.common import RunLogger, baseline_cosine_scheduler, pick_device
+from experiments.common import (
+    RunLogger,
+    baseline_cosine_scheduler,
+    current_lr,
+    pick_device,
+)
 
 
 EXPERIMENT = "poisson_pinn"
@@ -236,7 +241,7 @@ def build_optimizer(
         raise ValueError(f"unknown optimizer: {name}")
 
     scheduler = baseline_cosine_scheduler(opt, warmup, total_steps, cosine_decay)
-    cfg["warmup_steps"] = warmup
+    cfg["warmup"] = warmup
     cfg["cosine_decay_floor"] = cosine_decay
     return opt, cfg, scheduler
 
@@ -360,7 +365,7 @@ def train(args: argparse.Namespace) -> str:
             last_rel_l2 = rl2
             best_avg = min(best_avg, last_avg)
             best_rel_l2 = min(best_rel_l2, rl2)
-            run.log_val(step + 1, loss=last_avg,
+            run.log_val(step + 1, loss=last_avg, lr=current_lr(opt),
                         pde=tl["pde"], bc=tl["bc"], rel_l2=rl2)
             if not args.quiet:
                 ms_per = (time.perf_counter() - t_start) / (step + 1) * 1000

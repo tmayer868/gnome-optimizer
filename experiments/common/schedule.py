@@ -44,3 +44,12 @@ def baseline_cosine_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda s: cosine_with_warmup(s, warmup, total, min_frac)
     )
+
+
+def current_lr(optimizer: torch.optim.Optimizer) -> float:
+    """The current learning rate of the optimizer's first parameter group.
+
+    For the scheduled baselines this reflects the cosine curve; for Gnome
+    (fixed lr) it is the constant base lr.
+    """
+    return float(optimizer.param_groups[0]["lr"])
