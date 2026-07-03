@@ -7,5 +7,17 @@ from experiments.common.run_log import (
     load_run,
     make_run_id,
 )
+from experiments.common.schedule import (
+    baseline_cosine_scheduler,
+    cosine_with_warmup,
+)
 
-__all__ = ["pick_device", "RunLogger", "RunRecord", "load_run", "make_run_id"]
+__all__ = [
+    "pick_device",
+    "RunLogger",
+    "RunRecord",
+    "load_run",
+    "make_run_id",
+    "baseline_cosine_scheduler",
+    "cosine_with_warmup",
+]
