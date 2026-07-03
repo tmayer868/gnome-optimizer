@@ -1,11 +1,8 @@
 # Variance of the surrogate GGN estimator and the role of the aux batch size $K$
 
-This note answers one question: **when does increasing the auxiliary batch size $K$ reduce
-the variance of the rank-1 GGN estimator $G_s = g_s g_s^\top$?** The answer is a direct
-matrix generalization of the scalar Hutchinson result "kurtosis $> 3$": the relevant
-quantity is a *multivariate* excess kurtosis of the per-sample probe vector, measured
-against a Gaussian baseline. The scalar toy is recovered exactly as the $1$-dimensional
-special case.
+This note answers two questions: 
+1. **When does increasing the auxiliary batch size $K$ reduce the variance of the rank-1 GGN estimator $G_s = g_s g_s^\top$?** The answer is a direct matrix generalization of the scalar Hutchinson result "kurtosis $> 3$": the relevant quantity is a *multivariate* excess kurtosis of the per-sample probe vector, measured against a Gaussian baseline.
+2. **For CCE losses, how does the choice of output-space probe (MC label sampling vs. Rademacher Hutchinson) affect variance, and does it scale with the number of classes $K_c$?** We rigorously compare the two estimators and show that the variance penalty does not scale directly with $K_c$, but rather with the interaction between a heavy-tailed class probability vector and heterogeneous class geometry in the model Jacobian.
 
 ---
 
@@ -245,7 +242,47 @@ and *lowers the bar* at which $K>1$ becomes worthwhile.
 
 ---
 
-## 8. Reading it back to Gnome
+## 8. Case Study: MC Sampling vs. Hutchinson for CCE
+
+For the CCE loss, the output Hessian is $H = \mathrm{diag}(p) - pp^\top$ where $p$ is the model's predicted class distribution. There are two standard ways to construct the output-space probe $u$ such that $\mathbb{E}[uu^\top] = H$:
+1. **Monte Carlo (MC):** Sample a fake label $c \sim \mathrm{Categorical}(p)$ and set $u_c = p - e_c$.
+2. **Hutchinson:** Use the closed-form square root $A = \mathrm{diag}(\sqrt{p})(I - \sqrt{p}\sqrt{p}^\top)$ and set $u = AR$ where $R$ is a Rademacher vector.
+
+Both estimators share the same target $G = J^\top H J$ and trace $\tau = \mathrm{tr}(G) = \mathbb{E}\|w\|^2$. Per §2, their variances reduce entirely to comparing $\mathbb{E}\|w\|^4$.
+
+### 8.1 The MC Estimator
+The parameter-space probe is $w_c = J^\top(p - e_c)$, drawn with probability $p_c$. Let the per-class curvature score be $\eta_c = \|w_c\|^2$. Because $\mathbb{E}_{c\sim p}[\eta_c] = \tau$, the fourth moment is:
+$$ \mathbb{E}_{c\sim p}\|w_c\|^4 = \mathbb{E}_{c\sim p}[\eta_c^2] = \mathrm{Var}_{c\sim p}(\eta_c) + \tau^2 $$
+Subtracting $\|G\|_F^2$ yields the MC variance:
+$$ V_{\text{MC}} = \tau^2 + \mathrm{Var}_{c\sim p}\big(\|J^\top(p - e_c)\|^2\big) - \|G\|_F^2 $$
+
+### 8.2 The Hutchinson Estimator
+Let $\tilde{M} = A^\top J J^\top A$. By the cyclic property of the trace, $\mathrm{tr}(\tilde{M}) = \tau$ and $\|\tilde{M}\|_F^2 = \|G\|_F^2$. Using the standard Rademacher quartic identity, where the $-2\sum_i \tilde{M}_{ii}^2$ term is the strict lower-kurtosis advantage of Rademacher:
+$$ \mathbb{E}_R\|w\|^4 = (\mathrm{tr}\tilde{M})^2 + 2\|\tilde{M}\|_F^2 - 2\sum_i \tilde{M}_{ii}^2 = \tau^2 + 2\|G\|_F^2 - 2\sum_i \tilde{M}_{ii}^2 $$
+Subtracting $\|G\|_F^2$ yields the Hutchinson variance:
+$$ V_{\text{H}} = \tau^2 + \|G\|_F^2 - 2\sum_i \tilde{M}_{ii}^2 $$
+
+### 8.3 The Comparison and the $K_c$ Paradox
+Subtracting the two variances collapses the shared structural terms and isolates the "within-sample" noise of each estimator:
+$$ V_{\text{MC}} - V_{\text{H}} = \mathrm{Var}_{c\sim p}\big(\|J^\top(p - e_c)\|^2\big) - 2\sum_{i \neq j} \tilde{M}_{ij}^2 $$
+MC has higher variance **if and only if** the spread of per-class curvature scores under a single draw exceeds Hutchinson's off-diagonal residual noise.
+
+**The Zero-Padding Lemma:** If a class has $p_c = 0$, it contributes nothing to either estimator (for MC, it is never sampled; for Hutchinson, $\sqrt{p_c}=0$ nullifies its row in $A$). Therefore, padding a fixed distribution $p$ from 10 to 10,000 classes leaves both variances bit-identical. **The variance does not depend directly on the number of classes $K_c$.** Any derivation showing explicit $K_c$ dependence must have parameterized $p$ by $K_c$ (e.g., assuming a uniform $p = 1/K_c$), making $K_c$ merely a proxy for entropy.
+
+**The Uniform/Isotropic Special Case:** If $p$ is uniform and the output geometry is flat ($J J^\top \propto I$), the MC curvature score $\|p - e_c\|^2 = 1 + S_2 - 2/K_c$ becomes a constant across classes. Thus $\mathrm{Var}_{c\sim p}(\eta_c) = 0$, meaning MC hits its structural variance floor. Meanwhile, Hutchinson retains a non-zero off-diagonal mass in $\tilde{M}$. In this strict regime, **MC is actually marginally optimal** ($V_{\text{MC}}/V_{\text{H}} \approx 0.95$ to $1.00$). There is no universal dominance theorem for CCE.
+
+### 8.4 The LM Regime: The True Driver of the MC Penalty
+The MC penalty is a distribution $\times$ geometry interaction term. In Language Modeling (LM), the regime exhibits two simultaneous properties:
+1. **High-Entropy $p$:** Zipfian class distributions where $d_{\text{eff}} = \tau^2 / \|G\|_F^2$ (the effective number of probable classes) grows. This drives Hutchinson's off-diagonal mass $2\sum_{i \neq j} \tilde{M}_{ij}^2$ toward zero (it "self-averages" away).
+2. **Heterogeneous Class Geometry:** The unembedding matrix rows $J$ have norms spanning orders of magnitude between frequent and rare tokens. 
+
+Because MC samples a single class, it frequently hits a rare token with a massive unembedding vector, spiking the curvature outlier $\|J^\top(p - e_c)\|^2$. This explodes $\mathrm{Var}_{c\sim p}(\eta_c)$. MC does not self-average over classes, so it re-imports a heterogeneity penalty inside each sample that Hutchinson's dense probe averages out for free. 
+
+Vocabulary size ($K_c$) enters only as the enabling condition: large vocabularies give you simultaneously high-entropy $p$ (crushing Hutchinson's noise) and heavy-tailed class geometry (exploding MC's noise). This is why the effect is invisible at CIFAR's $K_c=10$ and imposes a $2$–$2.5\times$ variance penalty at LM scale.
+
+---
+
+## 9. Reading it back to Gnome
 
 * **Each aux sample carries one probe.** Increasing $K$ buys more data coverage *and* more
   probes simultaneously; you cannot tune them separately in the current construction. The
@@ -275,4 +312,5 @@ $V(K) = (\tau^2+\|\Sigma\|_F^2) + \tfrac1K\big(\mathbb{E}\|w\|^4 - \tau^2 - 2\|\
 so $K>1$ lowers the GGN-estimator variance **iff** the probe vector $w=J^\top A R$ has
 positive multivariate excess kurtosis ($\bar\kappa>1$) — the exact generalization of
 "kurtosis $>3$," with the Gaussian-with-matching-covariance fourth moment $\tau^2+2\|\Sigma\|_F^2$
-playing the role of the scalar's $3\mu_2^2$.
+playing the role of the scalar's $3\mu_2^2$. For CCE, the choice of probe (MC vs. Hutchinson)
+does not depend on $K_c$ directly, but MC suffers a variance penalty equal to the $p$-weighted spread of per-class curvature scores minus Hutchinson's off-diagonal residual, which grows specifically in the high-entropy, heavy-tailed geometry regime of Language Modeling.
