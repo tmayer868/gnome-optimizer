@@ -30,7 +30,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = [
+    "pytest>=7.0",
+    "jupyter>=1.0",
+]
 # Reproducibility experiments: scipy for .mat references (Burgers,
 # Navier-Stokes), matplotlib for the comparison plots.
 experiments = [
