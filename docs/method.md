@@ -245,7 +245,13 @@ $$
 
 where the second equality uses $\mathrm{diag}(\sqrt p)\, \sqrt p = \sqrt p \odot \sqrt p = p$. This is $O(K_c)$ work per sample (no explicit $K_c \times K_c$ matrix is ever materialized) and plugs straight into the §4 recipe with $\mathbb{E}[(AR)(AR)^\top] = H_y$ *exactly* per sample — not just in expectation over labels.
 
-**Aside (MC alternative).** The Fisher / K-FAC tradition uses a different square root: sample a fake label $\tilde y_k \sim \mathrm{Categorical}(p_k)$ and use $\mathtt{F.cross\_entropy}(z_k, \tilde y_k)$ as the surrogate. The score-function identity $\mathbb{E}_{\tilde y \sim p}[(p - e_{\tilde y})(p - e_{\tilde y})^\top] = H_y$ gives the correct GGN expectation. We use Rademacher Hutchinson instead for consistency with the §4 recipe and for lower variance — Hutchinson's $AR$ uses every class simultaneously, while MC sampling's $p - e_{\tilde y}$ is a rank-1 contribution aligned with a single class direction per sample.
+**Aside (MC alternative).** The Fisher / K-FAC tradition replaces the square-root factorization with Monte Carlo label sampling: draw a fake label $\tilde y_k \sim \mathrm{Categorical}(p_k)$ from the model's own predictive distribution and use $\mathtt{F.cross\_entropy}(z_k, \tilde y_k)$ as the surrogate. Its logit gradient is $v = p - e_{\tilde y}$, and since $\mathbb{E}[e_{\tilde y}] = p$,
+
+$$
+\mathbb{E}_{\tilde y \sim p}\big[v v^\top\big] \;=\; \mathrm{Cov}(e_{\tilde y}) \;=\; \mathrm{diag}(p) - p p^\top \;=\; H_y ,
+$$
+
+so the outer products have the correct GGN expectation with no factorization of $H_y$ involved — the label randomness plays the role of the Rademacher probe, with the softmax's own covariance standing in for $A A^\top$. We use Rademacher Hutchinson instead for consistency with the §4 recipe and for lower variance — Hutchinson's $AR$ uses every class simultaneously, while MC sampling's $p - e_{\tilde y}$ is a rank-1 contribution aligned with a single class direction per sample.
 
 **Variance behaviour.** As the model becomes confident ($p$ approaches a one-hot vector), $\sqrt p \odot R$ collapses to a near-one-hot vector and the simplex-projection term $(\sqrt p \cdot R)\, p$ cancels the surviving coordinate. The variance of the estimator decays toward zero with the Gini impurity of $p$, so late in training — exactly when classification gradients are sharp and the MC alternative's single-class probe becomes most wasteful — Hutchinson approaches a noise-free preconditioner.
 
