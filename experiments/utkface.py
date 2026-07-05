@@ -198,56 +198,117 @@ def load_utkface_data(seed: int, val_frac: float, image_size: int,
     )
 
 
-def augment_batch(x: torch.Tensor, max_rotation_deg: float, max_scale: float,
-                  hflip_prob: float, brightness: float = 0.2, contrast: float = 0.2,
-                  cutout_prob: float = 0.5, cutout_ratio: float = 0.25) -> torch.Tensor:
-    """On-device train augmentation: hflip, small rotation/zoom, brightness/
-    contrast jitter, and random-erasing cutout. All batched, no Python loop."""
+def augment_batch(
+        x: torch.Tensor,
+        max_rotation_deg: float = 10.0,
+        max_scale: float = 1.1,
+        hflip_prob: float = 0.5,
+        brightness: float = 0.15,
+        contrast: float = 0.15,
+        geo_prob: float = 0.5,
+        photo_prob: float = 0.5,
+        cutout_prob: float = 0.35,
+        cutout_ratio: float = 0.10,
+) -> torch.Tensor:
+    """On-device batched train augmentation for face/age estimation.
+
+    Assumes ``x`` is normalized to [-1, 1] (0 = mid-gray) and square (h == w).
+
+    Blocks (each gated independently PER SAMPLE):
+      - hflip:      applied with probability ``hflip_prob``
+      - geometric:  rotation + zoom-in + translation, with prob ``geo_prob``
+      - photometric: additive brightness + contrast about the grayscale mean,
+                     with prob ``photo_prob``
+      - cutout:     one square erased region, with prob ``cutout_prob``
+
+    With independent gates, most samples receive only a subset of transforms,
+    which keeps per-batch difficulty well-behaved instead of stacking every
+    distortion on every image.
+    """
     b, c, h, w = x.shape
     device = x.device
+    assert h == w, "Rotation via affine_grid assumes square inputs (h == w)."
+    assert max_scale >= 1.0, "Only zoom-in is supported (max_scale >= 1.0)."
 
+    # ---- horizontal flip (per-sample gate) ----------------------------------
     if hflip_prob > 0:
         flip = torch.rand(b, device=device) < hflip_prob
-        if flip.any():
-            x = torch.where(flip[:, None, None, None], x.flip(-1), x)
+        x = torch.where(flip[:, None, None, None], x.flip(-1), x)
 
-    if max_rotation_deg > 0 or max_scale > 1.0:
-        s = 1.0 + (max_scale - 1.0) * torch.rand(b, device=device)
+    # ---- geometric: rotation + zoom + translation (per-sample gate) ---------
+    if geo_prob > 0 and (max_rotation_deg > 0 or max_scale > 1.0):
+        apply_geo = (torch.rand(b, device=device) < geo_prob).float()
+
+        # Zero out strengths for gated-off samples -> identity transform.
+        s = 1.0 + (max_scale - 1.0) * torch.rand(b, device=device) * apply_geo
         inv_s = 1.0 / s
-        if max_rotation_deg > 0:
-            theta = (torch.rand(b, device=device) * 2 - 1) * max_rotation_deg * (math.pi / 180.0)
-            cos_t, sin_t = torch.cos(theta), torch.sin(theta)
-        else:
-            cos_t, sin_t = torch.ones(b, device=device), torch.zeros(b, device=device)
+
+        theta = (
+                (torch.rand(b, device=device) * 2 - 1)
+                * max_rotation_deg
+                * (math.pi / 180.0)
+                * apply_geo
+        )
+        cos_t, sin_t = torch.cos(theta), torch.sin(theta)
+
+        # Translation bounded so the zoomed window stays inside the image.
         margin = 1.0 - inv_s
         tx = (torch.rand(b, device=device) * 2 - 1) * margin
         ty = (torch.rand(b, device=device) * 2 - 1) * margin
-        aff = torch.stack([
-            torch.stack([inv_s * cos_t, -inv_s * sin_t, tx], dim=-1),
-            torch.stack([inv_s * sin_t,  inv_s * cos_t, ty], dim=-1),
-        ], dim=-2)
+
+        aff = torch.stack(
+            [
+                torch.stack([inv_s * cos_t, -inv_s * sin_t, tx], dim=-1),
+                torch.stack([inv_s * sin_t, inv_s * cos_t, ty], dim=-1),
+            ],
+            dim=-2,
+        )
         grid = F.affine_grid(aff, list(x.shape), align_corners=False)
-        x = F.grid_sample(x, grid, align_corners=False, padding_mode="zeros")
+        # Reflection padding: no gray wedges in rotated corners.
+        x = F.grid_sample(
+            x, grid, align_corners=False, padding_mode="reflection"
+        )
 
-    if brightness > 0 or contrast > 0:
-        bf = 1.0 + (torch.rand(b, 1, 1, 1, device=device) * 2 - 1) * brightness
-        cf = 1.0 + (torch.rand(b, 1, 1, 1, device=device) * 2 - 1) * contrast
-        x = x * bf
-        mean = x.mean(dim=[2, 3], keepdim=True)
-        x = torch.clamp((x - mean) * cf + mean, -1.0, 1.0)
+    # ---- photometric: brightness + contrast (per-sample gate) ---------------
+    if photo_prob > 0 and (brightness > 0 or contrast > 0):
+        apply_photo = (
+                torch.rand(b, 1, 1, 1, device=device) < photo_prob
+        ).float()
 
-    if cutout_prob > 0:
+        # Additive brightness (correct for [-1, 1] normalization).
+        if brightness > 0:
+            delta = (
+                    (torch.rand(b, 1, 1, 1, device=device) * 2 - 1)
+                    * brightness
+                    * apply_photo
+            )
+            x = x + delta
+
+        # Contrast about the grayscale mean (all channels), matching
+        # torchvision semantics; avoids per-channel color-balance drift.
+        if contrast > 0:
+            cf = 1.0 + (
+                    (torch.rand(b, 1, 1, 1, device=device) * 2 - 1)
+                    * contrast
+                    * apply_photo
+            )
+            mean = x.mean(dim=[1, 2, 3], keepdim=True)
+            x = (x - mean) * cf + mean
+
+        x = torch.clamp(x, -1.0, 1.0)
+
+    # ---- cutout / random erasing (per-sample gate) ---------------------------
+    if cutout_prob > 0 and cutout_ratio > 0:
         mask = torch.rand(b, device=device) < cutout_prob
-        if mask.any():
-            bh, bw = int(h * cutout_ratio), int(w * cutout_ratio)
-            y1 = torch.randint(0, h - bh + 1, (b,), device=device)
-            x1 = torch.randint(0, w - bw + 1, (b,), device=device)
-            yg = torch.arange(h, device=device).view(1, h, 1)
-            xg = torch.arange(w, device=device).view(1, 1, w)
-            ym = (yg >= y1.view(b, 1, 1)) & (yg < (y1 + bh).view(b, 1, 1))
-            xm = (xg >= x1.view(b, 1, 1)) & (xg < (x1 + bw).view(b, 1, 1))
-            region = ym & xm & mask.view(b, 1, 1)
-            x = torch.where(region.unsqueeze(1), torch.zeros_like(x), x)
+        bh, bw = max(1, int(h * cutout_ratio)), max(1, int(w * cutout_ratio))
+        y1 = torch.randint(0, h - bh + 1, (b,), device=device)
+        x1 = torch.randint(0, w - bw + 1, (b,), device=device)
+        yg = torch.arange(h, device=device).view(1, h, 1)
+        xg = torch.arange(w, device=device).view(1, 1, w)
+        ym = (yg >= y1.view(b, 1, 1)) & (yg < (y1 + bh).view(b, 1, 1))
+        xm = (xg >= x1.view(b, 1, 1)) & (xg < (x1 + bw).view(b, 1, 1))
+        region = ym & xm & mask.view(b, 1, 1)
+        x = torch.where(region.unsqueeze(1), torch.zeros_like(x), x)
 
     return x
 
@@ -266,9 +327,9 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
     if name == "gnome":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
-            betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-4,
+            betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-8,
             precondition_frequency=10, aux_batch_size=10,
-            clip=1.0, norm_free=False, warmup=warmup,
+            clip=1.0, warmup=warmup,
             loss="mse", precondition_1d=False,
         )
         return Gnome(params, **cfg), cfg, None
@@ -377,6 +438,7 @@ def main():
                     opt.zero_grad()
                     loss = F.mse_loss(model(x_batch), y_batch)
                     loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     opt.step()
                 if scheduler is not None:
                     scheduler.step()

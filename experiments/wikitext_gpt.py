@@ -229,7 +229,7 @@ def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float
         lr=lr, weight_decay=weight_decay,
         betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-4,
         precondition_frequency=10, aux_batch_size=5,
-        clip=1.0, norm_free=False, warmup=0,
+        clip=1.0, warmup=0,
         precondition_1d=False,
     )
     if name == "gnome_fisher":

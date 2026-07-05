@@ -164,10 +164,13 @@ class Gnome(Optimizer):
             rates it does nothing, but it prevents blow-ups from pathological
             denominators (e.g. early steps with a noisy eigenbasis estimate).
             Pass ``None`` to disable.
-        norm_free: If True, divide the squared rotated surrogate by its
-            norm before entering the curvature EMA. Useful for classification
-            (cross-entropy) where the surrogate scale varies sharply with
-            confidence; usually left False for regression.
+        max_grad_norm: If not None, clip the global L2 norm of the main
+            gradient (across all parameters, à la
+            ``torch.nn.utils.clip_grad_norm_``) to this value each step before
+            it enters the update. Applies only to the main loss gradient, not
+            the curvature surrogate. Default None; the per-coordinate ``clip``
+            trust region is the usual safeguard, but a global norm clip can
+            help on steps where the raw gradient spikes.
         warmup: Number of steps over which the learning rate is linearly
             ramped from zero to ``lr``. At step ``k`` (1-indexed) the
             effective learning rate is ``lr * min(k / warmup, 1.0)``. Pass
@@ -200,7 +203,7 @@ class Gnome(Optimizer):
         max_precond_dim: int = 10000,
         aux_batch_size: int = 10,
         clip: Optional[float] = 1.0,
-        norm_free: bool = False,
+        max_grad_norm: Optional[float] = None,
         warmup: int = 200,
         loss: str = "mse",
         merge_dims: bool = False,
@@ -219,6 +222,8 @@ class Gnome(Optimizer):
             raise ValueError(f"Invalid aux_batch_size: {aux_batch_size}")
         if clip is not None and clip <= 0.0:
             raise ValueError(f"Invalid clip: {clip}")
+        if max_grad_norm is not None and max_grad_norm <= 0.0:
+            raise ValueError(f"Invalid max_grad_norm: {max_grad_norm}")
         if warmup < 0:
             raise ValueError(f"Invalid warmup: {warmup}")
         if loss not in ("mse", "cce", "cce_hutchinson"):
@@ -240,13 +245,14 @@ class Gnome(Optimizer):
             merge_dims=merge_dims,
             precondition_1d=precondition_1d,
             clip=clip,
-            norm_free=norm_free,
             warmup=warmup,
         )
         super().__init__(params, defaults)
         self._data_format = data_format
         self._loss_mode = loss
         self._aux_batch_size = aux_batch_size
+        # Global (all-parameter) main-gradient norm clip; None disables it.
+        self._max_grad_norm = max_grad_norm
         self._step_count = 0
 
     # ------------------------------------------------------------------
@@ -707,6 +713,21 @@ class Gnome(Optimizer):
                     g_accum[i].mul_(inv)
             mean_loss = weighted_loss * inv
 
+        # Optional global gradient-norm clip on the (accumulated) main gradient,
+        # matching torch.nn.utils.clip_grad_norm_: rescale every parameter's
+        # gradient so their combined L2 norm is at most max_grad_norm. The
+        # curvature surrogate (g_aux) is intentionally left untouched.
+        if self._max_grad_norm is not None:
+            grads = [g for g in g_accum if g is not None]
+            if grads:
+                total_norm = torch.sqrt(
+                    sum(g.detach().pow(2).sum() for g in grads)
+                )
+                clip_coef = self._max_grad_norm / (total_norm + 1e-6)
+                if clip_coef < 1.0:
+                    for g in grads:
+                        g.mul_(clip_coef)
+
         # AUX: forward + backward on the aux batch. Independent graph.
         with torch.enable_grad():
             aux_result = aux_closure()
@@ -776,7 +797,6 @@ class Gnome(Optimizer):
         state["step"] += 1
         beta1, beta2 = group["betas"]
         clip = group["clip"]
-        norm_free = group["norm_free"]
         warmup = group["warmup"]
         lr = group["lr"]
         if warmup > 0:
@@ -795,12 +815,8 @@ class Gnome(Optimizer):
             max_precond_dim=group["max_precond_dim"],
         )
 
-        # GND estimate in the rotated basis: squared surrogate, optionally
-        # norm-divided, EMA-aggregated.
-        gnd_raw = Gs_rot.square()
-        if norm_free:
-            gnd_raw = gnd_raw / gnd_raw.norm().clamp(min=1e-8)
-        gnd_m.mul_(beta2).add_(gnd_raw, alpha=(1.0 - beta2))
+        # GND estimate in the rotated basis: squared surrogate, EMA-aggregated.
+        gnd_m.mul_(beta2).add_(Gs_rot.square(), alpha=(1.0 - beta2))
 
         # Gradient EMA in the rotated basis.
         grad_m.mul_(beta1).add_(g_rot, alpha=(1.0 - beta1))
