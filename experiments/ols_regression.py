@@ -97,7 +97,7 @@ def build_optimizer(
     elif name == "adamw":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
-            betas=(0.9, 0.999), eps=1e-8,
+            betas=(0.9, 0.99), eps=1e-8,
         )
         opt = torch.optim.AdamW(params, **cfg)
     else:

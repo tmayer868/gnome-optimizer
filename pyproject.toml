@@ -45,6 +45,12 @@ llm = [
     "datasets>=2.14",
     "transformers>=4.30",
 ]
+# UTKFace age-regression benchmark: HuggingFace datasets + Pillow for image
+# decode. The dataset (~10k images) downloads on first run.
+utkface = [
+    "datasets>=2.14",
+    "pillow>=10.0",
+]
 # Web dashboard for queueing/monitoring runs (FastAPI + uvicorn + jinja2).
 dashboard = [
     "fastapi>=0.110",
