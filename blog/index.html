@@ -192,34 +192,34 @@ Table&nbsp;1: Final validation metrics per PINN benchmark (lower is better). Gno
 <tr class="odd">
 <td style="text-align: left;">Burgers</td>
 <td style="text-align: left;">rel. <span class="math inline">\(L_2\)</span></td>
-<td style="text-align: right;"><strong>2.2e-5</strong></td>
+<td style="text-align: right;"><strong>2.0e-5</strong></td>
 <td style="text-align: right;">3.7e-4</td>
 <td style="text-align: right;">6.3e-4</td>
-<td style="text-align: right;">17×</td>
+<td style="text-align: right;">19×</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;"></td>
 <td style="text-align: left;">val. loss</td>
-<td style="text-align: right;"><strong>1.2e-7</strong></td>
+<td style="text-align: right;"><strong>4.6e-8</strong></td>
 <td style="text-align: right;">2.5e-6</td>
 <td style="text-align: right;">9.0e-6</td>
-<td style="text-align: right;">21×</td>
+<td style="text-align: right;">54×</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Kuramoto–Sivashinsky</td>
 <td style="text-align: left;">rel. <span class="math inline">\(L_2\)</span></td>
-<td style="text-align: right;"><strong>1.1e-1</strong></td>
+<td style="text-align: right;"><strong>9.0e-2</strong></td>
 <td style="text-align: right;">4.8e-1</td>
 <td style="text-align: right;">4.8e-1</td>
-<td style="text-align: right;">4.3×</td>
+<td style="text-align: right;">5.3×</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;"></td>
 <td style="text-align: left;">val. loss</td>
-<td style="text-align: right;"><strong>7.2e-6</strong></td>
+<td style="text-align: right;"><strong>5.0e-6</strong></td>
 <td style="text-align: right;">6.4e-4</td>
 <td style="text-align: right;">6.7e-4</td>
-<td style="text-align: right;">90×</td>
+<td style="text-align: right;">129×</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Navier–Stokes (<span class="math inline">\(u\)</span>)</td>
@@ -282,7 +282,7 @@ Figure&nbsp;1: Left: distance to the OLS solution. Gnome descends to the closed-
 <section id="the-usual-fix-is-a-global-hack" class="level3">
 <h3 class="anchored" data-anchor-id="the-usual-fix-is-a-global-hack">The usual fix is a global hack</h3>
 <p>A common cure is to decay the learning rate to zero on a schedule, guiding the optimizer into the minimum by hand. Give these same runs a cosine decay to zero and both baselines drop onto <span class="math inline">\(\beta^\star\)</span>:</p>
-<div id="b2260135" class="cell" data-execution_count="4">
+<div id="dbda1dc3" class="cell" data-execution_count="4">
 <div class="cell-output cell-output-stdout">
 <pre><code>run                        final ‖β-β*‖
 OLS optimum                    5.65e-03
@@ -448,7 +448,7 @@ Figure&nbsp;3: Burgers: true solution error vs.&nbsp;a spectral reference (left)
 </div>
 </div>
 </div>
-<p>Gnome resolves the shock to a relative <span class="math inline">\(L_2\)</span> of <strong>2.2e-5</strong> at a fixed learning rate. Both baselines get the full cosine treatment and both land well short: SOAP at <strong>3.7e-4</strong> (roughly 17× Gnome’s error) and AdamW at <strong>6.3e-4</strong> (about 29×). The gap the gentle Poisson problem didn’t show is now open. It’s the same story from §1, one step harder: on Poisson the schedule kept the baselines within a small factor of Gnome; on the stiff Burgers landscape the schedule still helps but no longer closes the gap. And notice the <em>shape</em> again — Gnome’s descent is smooth and monotone while both baselines rattle by an order of magnitude the whole way down, the residual-driven step doing quietly what the schedule does noisily.</p>
+<p>Gnome resolves the shock to a relative <span class="math inline">\(L_2\)</span> of <strong>2.0e-5</strong> at a fixed learning rate. Both baselines get the full cosine treatment and both land well short: SOAP at <strong>3.7e-4</strong> (roughly 19× Gnome’s error) and AdamW at <strong>6.3e-4</strong> (about 32×). The gap the gentle Poisson problem didn’t show is now open. It’s the same story from §1, one step harder: on Poisson the schedule kept the baselines within a small factor of Gnome; on the stiff Burgers landscape the schedule still helps but no longer closes the gap. And notice the <em>shape</em> again — Gnome’s descent is smooth and monotone while both baselines rattle by an order of magnitude the whole way down, the residual-driven step doing quietly what the schedule does noisily.</p>
 </section>
 <section id="kuramotosivashinsky-a-reliable-breakthrough-vs.-an-unreliable-one" class="level3">
 <h3 class="anchored" data-anchor-id="kuramotosivashinsky-a-reliable-breakthrough-vs.-an-unreliable-one">3.3 Kuramoto–Sivashinsky — a reliable breakthrough vs.&nbsp;an unreliable one</h3>
@@ -467,7 +467,7 @@ Figure&nbsp;4: Kuramoto–Sivashinsky: true solution error (left) and PDE-residu
 </div>
 </div>
 </div>
-<p>Gnome breaks off the plateau early — below <span class="math inline">\(0.3\)</span> by step <strong>16,000</strong> — and descends steadily under a <em>fixed</em> learning rate to a final relative <span class="math inline">\(L_2\)</span> of <strong>0.112</strong>. It does this on every run we tried: the breakthrough is a reliable consequence of the residual-driven step, not a lucky configuration.</p>
+<p>Gnome breaks off the plateau early — below <span class="math inline">\(0.3\)</span> by step <strong>17,000</strong> — and descends steadily under a <em>fixed</em> learning rate to a final relative <span class="math inline">\(L_2\)</span> of <strong>0.090</strong>. It does this on every run we tried: the breakthrough is a reliable consequence of the residual-driven step, not a lucky configuration.</p>
 <p>SOAP and AdamW tell a different story. On the runs shown here <strong>neither breaks through</strong> — both stay pinned on the plateau, SOAP at <strong>0.48</strong> and AdamW at <strong>0.48</strong>. SOAP is not fundamentally incapable: on <em>other</em> runs — a longer schedule, a different seed — its cosine decay has occasionally dragged it off the plateau late in training, once the learning rate had annealed far enough. But we could not get that breakthrough to happen <strong>consistently</strong>; it comes and goes with the budget and the seed. AdamW’s diagonal preconditioner never escapes at all.</p>
 <p>That is the §1 thesis rendered as a training curve, and then sharpened. The schedule crutch isn’t just slower than a residual-driven step — it’s <em>unreliable</em>: sometimes the global cosine decay drags SOAP through, sometimes it doesn’t, and you can’t tell in advance. Gnome breaks through every time because the mechanism is intrinsic — the residual anneals its step for it, closed-loop, with no schedule to tune.</p>
 </section>
@@ -489,7 +489,7 @@ Figure&nbsp;5: Navier–Stokes inverse problem. Left: relative error of the disc
 </div>
 </div>
 </div>
-<div id="951e1086" class="cell" data-execution_count="9">
+<div id="7987fe61" class="cell" data-execution_count="9">
 <div class="cell-output cell-output-stdout">
 <pre><code>optimizer       λ1 err     λ2 err   rel_l2 u   rel_l2 v   rel_l2 p
 ------------------------------------------------------------------
