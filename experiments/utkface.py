@@ -38,6 +38,8 @@ import torch.nn.functional as F
 from gnome import Gnome
 from experiments.baselines import SOAP
 from experiments.common import (
+    DIVERGED_EXIT,
+    diverged,
     RunLogger,
     pick_device,
     baseline_cosine_scheduler,
@@ -240,7 +242,8 @@ def augment_batch(
 # Optimizer + schedule
 # ----------------------------------------------------------------------
 
-def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_decay):
+def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_decay,
+                    eps=1e-6, beta1=0.9, beta2=0.95):
     """Return ``(optimizer, config, scheduler)``.
 
     MSE regression, so the repo protocol applies: Gnome runs at a fixed
@@ -250,7 +253,7 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
     if name == "gnome":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
-            betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-8,
+            betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10, aux_batch_size=10,
             clip=1.0, warmup=warmup,
             loss="mse", precondition_1d=False,
@@ -259,7 +262,7 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
     if name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
-            betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-8,
+            betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
             precondition_frequency=10, precondition_1d=False,
         )
         opt = SOAP(params, **cfg)
@@ -299,7 +302,8 @@ def main():
     total_steps = args.epochs * steps_per_epoch
     opt, opt_cfg, scheduler = build_optimizer(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
-        args.warmup_steps, total_steps, args.cosine_decay,
+        args.warmup_steps, total_steps, args.cosine_decay, eps=args.eps,
+        beta1=args.beta1, beta2=args.beta2,
     )
     K = opt_cfg.get("aux_batch_size", 20) if args.optimizer == "gnome" else 0
 
@@ -367,6 +371,10 @@ def main():
                     scheduler.step()
 
                 loss_val = float(loss.detach().item())
+                if diverged(loss_val):
+                    run.finish(completed=False, diverged=True, diverged_step=step)
+                    print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
+                    raise SystemExit(DIVERGED_EXIT)
                 run.log_train(step, loss=loss_val)
                 window_sum += loss_val
                 window_n += 1
@@ -420,6 +428,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--eps", type=float, default=1e-6,
+                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
+                        "-> more gradient-descent-like, smaller -> fuller Newton "
+                        "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
+    p.add_argument("--beta1", type=float, default=0.9,
+                   help="First-moment (momentum) EMA for Gnome and SOAP.")
+    p.add_argument("--beta2", type=float, default=0.95,
+                   help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--model", choices=MODEL_NAMES, default="resnet12",
                    help="Architecture. resnet12 (default) is a custom net "

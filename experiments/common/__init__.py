@@ -1,6 +1,7 @@
 """Shared utilities for Gnome benchmark experiments."""
 
 from experiments.common.device import pick_device
+from experiments.common.divergence import DIVERGED_EXIT, diverged
 from experiments.common.run_log import (
     RunLogger,
     RunRecord,
@@ -15,6 +16,8 @@ from experiments.common.schedule import (
 
 __all__ = [
     "pick_device",
+    "DIVERGED_EXIT",
+    "diverged",
     "RunLogger",
     "RunRecord",
     "load_run",

@@ -176,66 +176,66 @@ Table&nbsp;1: Final validation metrics per PINN benchmark (lower is better). Gno
 <tr class="odd">
 <td style="text-align: left;">Poisson</td>
 <td style="text-align: left;">rel. <span class="math inline">\(L_2\)</span></td>
-<td style="text-align: right;"><strong>8.4e-6</strong></td>
-<td style="text-align: right;">6.5e-5</td>
+<td style="text-align: right;"><strong>2.9e-6</strong></td>
+<td style="text-align: right;">1.4e-4</td>
 <td style="text-align: right;">1.4e-3</td>
-<td style="text-align: right;">7.7×</td>
+<td style="text-align: right;">50×</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;"></td>
 <td style="text-align: left;">val. loss</td>
-<td style="text-align: right;"><strong>5.1e-10</strong></td>
-<td style="text-align: right;">1.2e-7</td>
+<td style="text-align: right;"><strong>1.4e-10</strong></td>
+<td style="text-align: right;">2.4e-7</td>
 <td style="text-align: right;">9.7e-6</td>
-<td style="text-align: right;">232×</td>
+<td style="text-align: right;">1,685×</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Burgers</td>
 <td style="text-align: left;">rel. <span class="math inline">\(L_2\)</span></td>
-<td style="text-align: right;"><strong>2.0e-5</strong></td>
-<td style="text-align: right;">3.7e-4</td>
-<td style="text-align: right;">6.3e-4</td>
-<td style="text-align: right;">19×</td>
+<td style="text-align: right;"><strong>1.7e-5</strong></td>
+<td style="text-align: right;">1.1e-4</td>
+<td style="text-align: right;">5.2e-4</td>
+<td style="text-align: right;">6.6×</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;"></td>
 <td style="text-align: left;">val. loss</td>
-<td style="text-align: right;"><strong>4.6e-8</strong></td>
-<td style="text-align: right;">2.5e-6</td>
-<td style="text-align: right;">9.0e-6</td>
-<td style="text-align: right;">54×</td>
+<td style="text-align: right;"><strong>3.9e-8</strong></td>
+<td style="text-align: right;">5.2e-7</td>
+<td style="text-align: right;">2.8e-6</td>
+<td style="text-align: right;">14×</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Kuramoto–Sivashinsky</td>
 <td style="text-align: left;">rel. <span class="math inline">\(L_2\)</span></td>
-<td style="text-align: right;"><strong>9.0e-2</strong></td>
+<td style="text-align: right;"><strong>8.4e-2</strong></td>
+<td style="text-align: right;">4.7e-1</td>
 <td style="text-align: right;">4.8e-1</td>
-<td style="text-align: right;">4.8e-1</td>
-<td style="text-align: right;">5.3×</td>
+<td style="text-align: right;">5.6×</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;"></td>
 <td style="text-align: left;">val. loss</td>
-<td style="text-align: right;"><strong>5.0e-6</strong></td>
-<td style="text-align: right;">6.4e-4</td>
-<td style="text-align: right;">6.7e-4</td>
-<td style="text-align: right;">129×</td>
+<td style="text-align: right;"><strong>3.2e-6</strong></td>
+<td style="text-align: right;">6.2e-4</td>
+<td style="text-align: right;">6.5e-4</td>
+<td style="text-align: right;">193×</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Navier–Stokes (<span class="math inline">\(u\)</span>)</td>
 <td style="text-align: left;">rel. <span class="math inline">\(L_2\)</span></td>
-<td style="text-align: right;"><strong>2.3e-3</strong></td>
-<td style="text-align: right;">3.5e-3</td>
+<td style="text-align: right;"><strong>1.9e-3</strong></td>
+<td style="text-align: right;">2.1e-3</td>
 <td style="text-align: right;">6.1e-3</td>
-<td style="text-align: right;">1.5×</td>
+<td style="text-align: right;">1.1×</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;"></td>
 <td style="text-align: left;">val. loss</td>
-<td style="text-align: right;"><strong>1.7e-5</strong></td>
-<td style="text-align: right;">4.3e-5</td>
+<td style="text-align: right;"><strong>4.9e-6</strong></td>
+<td style="text-align: right;">1.2e-5</td>
 <td style="text-align: right;">1.3e-4</td>
-<td style="text-align: right;">2.5×</td>
+<td style="text-align: right;">2.4×</td>
 </tr>
 </tbody>
 </table>
@@ -282,7 +282,7 @@ Figure&nbsp;1: Left: distance to the OLS solution. Gnome descends to the closed-
 <section id="the-usual-fix-is-a-global-hack" class="level3">
 <h3 class="anchored" data-anchor-id="the-usual-fix-is-a-global-hack">The usual fix is a global hack</h3>
 <p>A common cure is to decay the learning rate to zero on a schedule, guiding the optimizer into the minimum by hand. Give these same runs a cosine decay to zero and both baselines drop onto <span class="math inline">\(\beta^\star\)</span>:</p>
-<div id="dbda1dc3" class="cell" data-execution_count="4">
+<div id="2cf134f2" class="cell" data-execution_count="4">
 <div class="cell-output cell-output-stdout">
 <pre><code>run                        final ‖β-β*‖
 OLS optimum                    5.65e-03
@@ -429,7 +429,7 @@ Figure&nbsp;2: Poisson: true solution error (left) and the PDE-residual loss the
 </div>
 </div>
 </div>
-<p>Gnome reaches the lowest error (<strong>8.4e-6</strong>) at a fixed learning rate; SOAP with a tuned cosine decay is right behind (<strong>6.5e-5</strong>); AdamW trails at <strong>1.4e-3</strong>. The takeaway isn’t the Gnome-vs-SOAP margin here — it’s small and this is the easy problem — it’s that the decay schedule is doing real work for the baselines. Notice also the <em>shape</em>: Gnome descends smoothly and monotonically, while SOAP rattles up and down by an order of magnitude and only settles as its learning rate is annealed away — the same hovering from §1, now driven down by the schedule rather than by the residual. Hold that thought: on the next PDEs the same schedule is no longer enough.</p>
+<p>Gnome reaches the lowest error (<strong>2.9e-6</strong>) at a fixed learning rate; SOAP with a tuned cosine decay is right behind (<strong>1.4e-4</strong>); AdamW trails at <strong>1.4e-3</strong>. The takeaway isn’t the Gnome-vs-SOAP margin here — it’s small and this is the easy problem — it’s that the decay schedule is doing real work for the baselines. Notice also the <em>shape</em>: Gnome descends smoothly and monotonically, while SOAP rattles up and down by an order of magnitude and only settles as its learning rate is annealed away — the same hovering from §1, now driven down by the schedule rather than by the residual. Hold that thought: on the next PDEs the same schedule is no longer enough.</p>
 </section>
 <section id="burgers-a-shock-forms" class="level3">
 <h3 class="anchored" data-anchor-id="burgers-a-shock-forms">3.2 Burgers — a shock forms</h3>
@@ -448,7 +448,7 @@ Figure&nbsp;3: Burgers: true solution error vs.&nbsp;a spectral reference (left)
 </div>
 </div>
 </div>
-<p>Gnome resolves the shock to a relative <span class="math inline">\(L_2\)</span> of <strong>2.0e-5</strong> at a fixed learning rate. Both baselines get the full cosine treatment and both land well short: SOAP at <strong>3.7e-4</strong> (roughly 19× Gnome’s error) and AdamW at <strong>6.3e-4</strong> (about 32×). The gap the gentle Poisson problem didn’t show is now open. It’s the same story from §1, one step harder: on Poisson the schedule kept the baselines within a small factor of Gnome; on the stiff Burgers landscape the schedule still helps but no longer closes the gap. And notice the <em>shape</em> again — Gnome’s descent is smooth and monotone while both baselines rattle by an order of magnitude the whole way down, the residual-driven step doing quietly what the schedule does noisily.</p>
+<p>Gnome resolves the shock to a relative <span class="math inline">\(L_2\)</span> of <strong>1.7e-5</strong> at a fixed learning rate. Both baselines get the full cosine treatment and both land well short: SOAP at <strong>1.1e-4</strong> (roughly 7× Gnome’s error) and AdamW at <strong>5.2e-4</strong> (about 31×). The gap the gentle Poisson problem didn’t show is now open. It’s the same story from §1, one step harder: on Poisson the schedule kept the baselines within a small factor of Gnome; on the stiff Burgers landscape the schedule still helps but no longer closes the gap. And notice the <em>shape</em> again — Gnome’s descent is smooth and monotone while both baselines rattle by an order of magnitude the whole way down, the residual-driven step doing quietly what the schedule does noisily.</p>
 </section>
 <section id="kuramotosivashinsky-a-reliable-breakthrough-vs.-an-unreliable-one" class="level3">
 <h3 class="anchored" data-anchor-id="kuramotosivashinsky-a-reliable-breakthrough-vs.-an-unreliable-one">3.3 Kuramoto–Sivashinsky — a reliable breakthrough vs.&nbsp;an unreliable one</h3>
@@ -458,7 +458,7 @@ Figure&nbsp;3: Burgers: true solution error vs.&nbsp;a spectral reference (left)
 <div id="fig-ks" class="quarto-float quarto-figure quarto-figure-center anchored">
 <figure class="quarto-float quarto-float-fig figure">
 <div aria-describedby="fig-ks-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
-<img src="index_files/figure-html/fig-ks-output-1.png" width="1213" height="488" class="figure-img">
+<img src="index_files/figure-html/fig-ks-output-1.png" width="1217" height="488" class="figure-img">
 </div>
 <figcaption class="quarto-float-caption-bottom quarto-float-caption quarto-float-fig" id="fig-ks-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
 Figure&nbsp;4: Kuramoto–Sivashinsky: true solution error (left) and PDE-residual loss (right), both log scale. All three start pinned at the ~0.5 plateau. Gnome breaks through early and self-anneals down; on these runs both SOAP and AdamW stay stuck on the plateau. Same shape in both panels. Same MLP, equal block weights — no loss weighting, no causal training.
@@ -467,8 +467,8 @@ Figure&nbsp;4: Kuramoto–Sivashinsky: true solution error (left) and PDE-residu
 </div>
 </div>
 </div>
-<p>Gnome breaks off the plateau early — below <span class="math inline">\(0.3\)</span> by step <strong>17,000</strong> — and descends steadily under a <em>fixed</em> learning rate to a final relative <span class="math inline">\(L_2\)</span> of <strong>0.090</strong>. It does this on every run we tried: the breakthrough is a reliable consequence of the residual-driven step, not a lucky configuration.</p>
-<p>SOAP and AdamW tell a different story. On the runs shown here <strong>neither breaks through</strong> — both stay pinned on the plateau, SOAP at <strong>0.48</strong> and AdamW at <strong>0.48</strong>. SOAP is not fundamentally incapable: on <em>other</em> runs — a longer schedule, a different seed — its cosine decay has occasionally dragged it off the plateau late in training, once the learning rate had annealed far enough. But we could not get that breakthrough to happen <strong>consistently</strong>; it comes and goes with the budget and the seed. AdamW’s diagonal preconditioner never escapes at all.</p>
+<p>Gnome breaks off the plateau early — below <span class="math inline">\(0.3\)</span> by step <strong>24,000</strong> — and descends steadily under a <em>fixed</em> learning rate to a final relative <span class="math inline">\(L_2\)</span> of <strong>0.084</strong>. It does this on every run we tried: the breakthrough is a reliable consequence of the residual-driven step, not a lucky configuration.</p>
+<p>SOAP and AdamW tell a different story. On the runs shown here <strong>neither breaks through</strong> — both stay pinned on the plateau, SOAP at <strong>0.47</strong> and AdamW at <strong>0.48</strong>. SOAP is not fundamentally incapable: on <em>other</em> runs — a longer schedule, a different seed — its cosine decay has occasionally dragged it off the plateau late in training, once the learning rate had annealed far enough. But we could not get that breakthrough to happen <strong>consistently</strong>; it comes and goes with the budget and the seed. AdamW’s diagonal preconditioner never escapes at all.</p>
 <p>That is the §1 thesis rendered as a training curve, and then sharpened. The schedule crutch isn’t just slower than a residual-driven step — it’s <em>unreliable</em>: sometimes the global cosine decay drags SOAP through, sometimes it doesn’t, and you can’t tell in advance. Gnome breaks through every time because the mechanism is intrinsic — the residual anneals its step for it, closed-loop, with no schedule to tune.</p>
 </section>
 <section id="navierstokes-recovering-the-physics" class="level3">
@@ -489,12 +489,12 @@ Figure&nbsp;5: Navier–Stokes inverse problem. Left: relative error of the disc
 </div>
 </div>
 </div>
-<div id="7987fe61" class="cell" data-execution_count="9">
+<div id="e7b18428" class="cell" data-execution_count="9">
 <div class="cell-output cell-output-stdout">
 <pre><code>optimizer       λ1 err     λ2 err   rel_l2 u   rel_l2 v   rel_l2 p
 ------------------------------------------------------------------
-Gnome         1.64e-04   2.91e-04   2.34e-03   9.46e-03   8.96e-02
-SOAP          1.42e-04   4.65e-04   3.52e-03   1.17e-02   1.40e-01
+Gnome         2.60e-04   8.83e-05   1.86e-03   8.99e-03   9.05e-02
+SOAP          3.52e-04   1.26e-04   2.06e-03   9.24e-03   4.34e-02
 AdamW         1.17e-03   8.61e-04   6.12e-03   1.98e-02   1.09e-01</code></pre>
 </div>
 </div>

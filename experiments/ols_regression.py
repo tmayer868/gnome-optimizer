@@ -56,6 +56,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from gnome import Gnome
 from experiments.baselines.soap import SOAP
 from experiments.common import (
+    DIVERGED_EXIT,
+    diverged,
     RunLogger,
     baseline_cosine_scheduler,
     current_lr,
@@ -68,7 +70,8 @@ EXPERIMENT = "ols_regression"
 
 def build_optimizer(
     name: str, params, lr: float, weight_decay: float,
-    warmup: int, total_steps: int, cosine_decay: float,
+    warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
+    beta1: float = 0.9, beta2: float = 0.95,
 ):
     """Construct the optimizer and its LR schedule.
 
@@ -81,7 +84,7 @@ def build_optimizer(
     if name == "gnome":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
-            betas=(0.95, 0.95), shampoo_beta=0.95, eps=1e-8,
+            betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10, aux_batch_size=10,
             clip=1.0, warmup=warmup,
             loss="mse", precondition_1d=True,
@@ -90,7 +93,7 @@ def build_optimizer(
     if name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
-            betas=(0.95, 0.95), shampoo_beta=0.95, eps=1e-8,
+            betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
             precondition_frequency=10, precondition_1d=True,
         )
         opt = SOAP(params, **cfg)
@@ -143,6 +146,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-2)
+    p.add_argument("--eps", type=float, default=1e-6,
+                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
+                        "-> more gradient-descent-like, smaller -> fuller Newton "
+                        "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
+    p.add_argument("--beta1", type=float, default=0.9,
+                   help="First-moment (momentum) EMA for Gnome and SOAP.")
+    p.add_argument("--beta2", type=float, default=0.95,
+                   help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
     # Weight decay biases beta_hat away from beta_true (ridge), which
     # contaminates the distance metric. Default to 0 here.
     p.add_argument("--weight-decay", type=float, default=0.0)
@@ -246,7 +257,7 @@ def main():
     total_steps = args.epochs * len(loader)
     opt, opt_cfg, scheduler = build_optimizer(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
-        args.warmup_steps, total_steps, args.cosine_decay,
+        args.warmup_steps, total_steps, args.cosine_decay, args.eps, args.beta1, args.beta2,
     )
 
     K = opt_cfg.get("aux_batch_size", 10) if args.optimizer == "gnome" else 0
@@ -312,7 +323,12 @@ def main():
             if scheduler is not None:
                 scheduler.step()
 
-            run.log_train(step, loss=float(loss.detach().item()),
+            loss_val = float(loss.detach().item())
+            if diverged(loss_val):
+                run.finish(completed=False, diverged=True, diverged_step=step)
+                print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
+                raise SystemExit(DIVERGED_EXIT)
+            run.log_train(step, loss=loss_val,
                           beta_dist=beta_dist())
             step += 1
 
