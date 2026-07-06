@@ -45,8 +45,12 @@ llm = [
     "datasets>=2.14",
     "transformers>=4.30",
 ]
-# UTKFace age-regression benchmark: HuggingFace datasets + Pillow for image
-# decode. The dataset (~10k images) downloads on first run.
+# CIFAR-10 rotation-regression benchmark: torchvision for the dataset.
+cifar = [
+    "torchvision>=0.15",
+]
+# UTKFace age-regression benchmark (kept for reference; not in the writeup):
+# HuggingFace datasets + Pillow for image decode.
 utkface = [
     "datasets>=2.14",
     "pillow>=10.0",

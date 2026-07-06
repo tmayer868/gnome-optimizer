@@ -218,8 +218,8 @@ def build_optimizer(
     if name == "gnome":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
-            betas=(0.95, 0.99), shampoo_beta=0.99, eps=1e-4,
-            precondition_frequency=50, aux_batch_size=10,
+            betas=(0.95, 0.99), shampoo_beta=0.99, eps=1e-8,
+            precondition_frequency=10, aux_batch_size=10,
             clip=1.0, warmup=warmup,
             loss="mse", precondition_1d=True,
         )
@@ -228,7 +228,7 @@ def build_optimizer(
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(0.95, 0.99), shampoo_beta=0.99, eps=1e-8,
-            precondition_frequency=50, precondition_1d=True,
+            precondition_frequency=10, precondition_1d=True,
         )
         opt = SOAP(params, **cfg)
     elif name == "adamw":
