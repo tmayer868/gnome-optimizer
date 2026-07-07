@@ -872,7 +872,47 @@ schedule. The §1 fixed-LR trick is specific to MSE, where the step vanishes bec
 residual does; cross-entropy gradients don't vanish at the optimum, so there is no free
 self-annealing to exploit and Gnome takes the schedule too.
 
-## 5. Reproducing this
+## 5. Related optimizers
+
+A short map of the neighborhood, and where Gnome sits in it.
+
+- **[K-FAC](https://arxiv.org/abs/1503.05671)** — natural gradient with the Fisher
+  (equal to the GGN for the losses here; §2's aside) approximated per layer as a
+  Kronecker product, estimated by sampling labels from the model's own predictions.
+  Same target matrix as Gnome; different estimator (sampled labels vs. Rademacher
+  probes) and different machinery (explicit factor inversion vs. an eigenbasis plus a
+  diagonal).
+- **[EKFAC](https://arxiv.org/abs/1806.03884)** — K-FAC's Kronecker eigenbasis plus a
+  per-coordinate second-moment rescaling of the gradient in that basis, with no square
+  root: the closest structural relative of Gnome's step. Gnome differs in the curvature
+  signal (§2's unbiased probe estimate, EMA'd, instead of sampled-label Fisher
+  factors), in building the basis with SOAP's machinery, and in the trust-region clip.
+- **[Sophia](https://arxiv.org/abs/2305.14342)** — diagonal, square-root-free, and
+  clipped: an EMA of the gradient over an EMA of a stochastic Hessian-diagonal
+  estimate, clipped elementwise. Its Gauss–Newton–Bartlett estimator is the same
+  sampled-label trick as `gnome_fisher`. Gnome is the rotated version of the same
+  philosophy: the division happens in the GGN's eigenbasis, where a diagonal can
+  actually represent the curvature, rather than in the coordinate basis, where it
+  mostly can't.
+- **[Shampoo](https://arxiv.org/abs/1802.09568) /
+  [SOAP](https://arxiv.org/abs/2409.11321)** — the machinery Gnome is built from. Both
+  precondition with second moments of the loss gradient — the empirical Fisher, §1's
+  residual-warped matrix — and both keep Adam-style square roots, so both inherit §1's
+  step-size story. Gnome keeps the basis mechanics, swaps the signal, and changes the
+  step.
+- **[Hessian-free optimization](https://www.cs.toronto.edu/~jmartens/docs/Deep_HessianFree.pdf)
+  and [energy natural gradient for PINNs](https://arxiv.org/abs/2302.13163)** — solve
+  the full GGN/Fisher system each step with CG or least squares: very accurate, but the
+  per-step cost scales badly. Gnome amortizes the same curvature into a Kronecker
+  eigenbasis maintained by cheap EMAs — one extra backward pass on a few samples per
+  step.
+- **[Muon](https://kellerjordan.github.io/posts/muon/)** — orthogonalizes the momentum
+  matrix, pushing every singular value to one: sign descent at the matrix level.
+  Effective on transformers, but the step magnitude is independent of how close you are
+  by construction — §1's pathology as a design choice — so it leans on a schedule the
+  same way Adam does.
+
+## 6. Reproducing this
 
 Everything above is regenerated, not transcribed. Each experiment streams an append-only
 JSONL log to `runs/<experiment>/<run_id>.jsonl`, and this post is a Quarto document that
