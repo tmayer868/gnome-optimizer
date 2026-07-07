@@ -114,10 +114,15 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
-            precondition_frequency=10, aux_batch_size=10,
+            precondition_frequency=10,
             clip=1.0, warmup=warmup, loss="mse", precondition_1d=False,
         )
-        return Gnome(params, **cfg), cfg, None
+        opt = Gnome(params, **cfg)
+        # aux_batch_size sizes the auxiliary batch the caller builds for
+        # opt.step(...); it is not a Gnome constructor arg. Recorded in the
+        # returned config for logging and to set K below.
+        cfg["aux_batch_size"] = 10
+        return opt, cfg, None
     if name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,

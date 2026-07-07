@@ -139,7 +139,7 @@ $$
 \mathbb{E}_{R,\,\text{batch}}\!\left[g_s g_s^\top\right] \;=\; \mathbb{E}_{x,y}\!\left[J^\top H_y J\right] \;=\; \text{GGN}, \qquad \text{for any } K \ge 1.
 $$
 
-The estimator is unbiased at every batch size. $K$ controls **variance**, not bias: with the $1/\sqrt K$ scaling, $\mathbb{E}\|g_s\|^2$ is independent of $K$ but $\mathrm{Var}(g_s)$ decreases as $K$ grows. The $1/\sqrt K$ normalization thus decouples the surrogate's scale from `aux_batch_size` entirely, so `eps` and `clip` calibrate against a fixed-scale surrogate regardless of $K$. (`tests/test_surrogate_scaling.py` pins this empirically across $K \in \{1,4,16,64\}$.)
+The estimator is unbiased at every batch size. $K$ controls **variance**, not bias: with the $1/\sqrt K$ scaling, $\mathbb{E}\|g_s\|^2$ is independent of $K$ but $\mathrm{Var}(g_s)$ decreases as $K$ grows. The $1/\sqrt K$ normalization thus decouples the surrogate's scale from the aux batch size $K$ entirely, so `eps` and `clip` calibrate against a fixed-scale surrogate regardless of $K$. (`tests/test_surrogate_scaling.py` pins this empirically across $K \in \{1,4,16,64\}$.)
 
 The explicit per-sample sum is the uniform notation that handles all three losses in §5. For MSE and BCE, $A_k$ doesn't depend on $k$ (it's either constant or a per-element function of detached logits), and the sum collapses into a single inner product over `(batch × output_dim)` axes — both losses can be written in batched-tensor form. For CCE, $A_k$ varies per sample through the softmax probabilities $p_k$, so the sum is genuinely a per-sample operation.
 

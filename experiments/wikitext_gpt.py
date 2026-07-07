@@ -228,16 +228,24 @@ def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float
     common_gnome = dict(
         lr=lr, weight_decay=weight_decay,
         betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-4,
-        precondition_frequency=10, aux_batch_size=5,
+        precondition_frequency=10,
         clip=1.0, warmup=0,
         precondition_1d=False,
     )
+    # aux_batch_size sizes the auxiliary batch the caller builds for
+    # opt.step(...); it is not a Gnome constructor arg (see K below, and the
+    # docstring above for why it is kept small).
+    aux_k = 5
     if name == "gnome_fisher":
         cfg = dict(common_gnome, loss="cce")
-        return Gnome(params, **cfg), cfg
+        opt = Gnome(params, **cfg)
+        cfg["aux_batch_size"] = aux_k
+        return opt, cfg
     if name == "gnome_hutchinson":
         cfg = dict(common_gnome, loss="cce_hutchinson")
-        return Gnome(params, **cfg), cfg
+        opt = Gnome(params, **cfg)
+        cfg["aux_batch_size"] = aux_k
+        return opt, cfg
     if name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,

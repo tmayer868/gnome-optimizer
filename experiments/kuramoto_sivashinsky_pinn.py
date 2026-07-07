@@ -327,7 +327,7 @@ def build_optimizer(
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
-            precondition_frequency=10, aux_batch_size=10,
+            precondition_frequency=10,
             clip=1.0, warmup=warmup,
             loss="mse", precondition_1d=True,
         )
