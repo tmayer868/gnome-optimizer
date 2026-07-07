@@ -71,7 +71,7 @@ EXPERIMENT = "ols_regression"
 def build_optimizer(
     name: str, params, lr: float, weight_decay: float,
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
-    beta1: float = 0.9, beta2: float = 0.95,
+    beta1: float = 0.9, beta2: float = 0.99,
 ):
     """Construct the optimizer and its LR schedule.
 
@@ -152,7 +152,7 @@ def parse_args() -> argparse.Namespace:
                         "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
     p.add_argument("--beta1", type=float, default=0.9,
                    help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.95,
+    p.add_argument("--beta2", type=float, default=0.99,
                    help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
     # Weight decay biases beta_hat away from beta_true (ridge), which
     # contaminates the distance metric. Default to 0 here.

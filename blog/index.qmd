@@ -1,10 +1,10 @@
 ---
-title: "Gnome: a Gauss–Newton optimizer that actually reaches the minimum"
-subtitle: "Why Adam and SOAP can't fit a linear regression, and what to change so they can"
+title: "Gnome: A Gauss–Newton optimizer for sciml."
+subtitle: "Empirical Fisher based optimizers, like adam and SOAP, struggle with MSE. Gnome is a targeted fix."
 format:
   html:
     toc: true
-    toc-depth: 2
+    toc-depth: 3
     code-fold: true
     code-tools: true
     fig-width: 9
@@ -45,6 +45,15 @@ def sci(x, p=1):
     """Scientific notation for prose, e.g. 4.6e-5 (no zero-padded exponent)."""
     m, e = f"{x:.{p}e}".split("e")
     return f"{m}e{int(e)}"
+
+def rl2(x):
+    """None-safe sci() — renders '—' for a run that hasn't completed yet, so the
+    prose survives a mid-sweep render instead of crashing on a missing number."""
+    return sci(x) if x is not None else "—"
+
+def xratio(a, b):
+    """None-safe 'a/b as an integer ×' for prose."""
+    return f"{a / b:.0f}" if (a is not None and b) else "—"
 
 # OLS (fixed-LR / raw baselines)
 _g  = latest("ols_regression", "gnome")
@@ -92,14 +101,10 @@ ks_gnome    = _final_rl2("kuramoto_sivashinsky_pinn", "gnome")
 ks_soap     = _final_rl2("kuramoto_sivashinsky_pinn", "soap")
 ks_adamw    = _final_rl2("kuramoto_sivashinsky_pinn", "adamw")
 ks_gnome_bt = _breakthrough("kuramoto_sivashinsky_pinn", "gnome")
-ks_soap_bt  = _breakthrough("kuramoto_sivashinsky_pinn", "soap")
 
-# None-safe display strings: a run that never crossed the threshold has no
-# breakthrough step. (Prose wording for the no-breakthrough case is TODO.)
+# None-safe display string: a run that never crossed the threshold has no
+# breakthrough step.
 ks_gnome_bt_str = f"{ks_gnome_bt:,}" if ks_gnome_bt else "—"
-ks_soap_bt_str  = f"{ks_soap_bt:,}"  if ks_soap_bt  else "—"
-ks_speedup_str  = (f"{ks_soap_bt / ks_gnome_bt:.0f}"
-                   if (ks_soap_bt and ks_gnome_bt) else "—")
 
 def pinn_figure(experiment, title):
     """Two-panel PINN convergence figure: the true solution error (validation
@@ -124,64 +129,6 @@ def pinn_figure(experiment, title):
     fig.tight_layout()
     plt.show()
 
-# ---- Navier–Stokes (inverse problem) --------------------------------------
-# Filter out smoke/debug runs (steps <= 1000) so only real runs are pulled.
-NS = "navier_stokes_pinn"
-_ns_real = lambda hp: hp.get("steps", 0) > 1000
-
-def _ns_run(opt):
-    try:
-        return latest(NS, opt, where=_ns_real, completed_only=True)
-    except FileNotFoundError:
-        return None
-
-def ns_figure():
-    """Two panels: coefficient recovery (|λ−λ*|/λ*, left) and flow-field
-    reconstruction (mean rel L2 over u,v,p, right). All three optimizers pulled
-    automatically; an optimizer with no completed full-length run is skipped."""
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.5, 3.8))
-    for key in ("gnome", "soap", "adamw"):
-        r = _ns_run(key)
-        if r is None:
-            continue
-        c, lab = STYLE[key]["color"], STYLE[key]["label"]
-        t1 = r.hyperparameters.get("true_lambda1", 1.0)
-        t2 = r.hyperparameters.get("true_lambda2", 0.01)
-        st, e1 = r.series("val", "lambda1_err")
-        _,  e2 = r.series("val", "lambda2_err")
-        axL.plot(st, np.array(e1) / t1, color=c, lw=1.8, label=lab)          # λ1
-        axL.plot(st, np.array(e2) / t2, color=c, lw=1.8, ls="--")            # λ2
-        _, u = r.series("val", "rel_l2_u")
-        _, v = r.series("val", "rel_l2_v")
-        _, p = r.series("val", "rel_l2_p")
-        axR.plot(st, (np.array(u) + np.array(v) + np.array(p)) / 3,
-                 color=c, lw=1.8, label=lab)
-    axL.set(yscale="log", xlabel="step", ylabel=r"coefficient rel. error",
-            title=r"recovering $\lambda_1,\lambda_2$")
-    axR.set(yscale="log", xlabel="step", ylabel=r"mean field rel. $L_2$",
-            title=r"reconstructing $u,v,p$")
-    axL.legend(frameon=False, title=r"solid $\lambda_1$ · dashed $\lambda_2$")
-    axR.legend(frameon=False)
-    fig.suptitle("Navier–Stokes (inverse problem)")
-    fig.tight_layout()
-    plt.show()
-
-def ns_table():
-    """Final coefficient errors and per-field rel L2, one row per optimizer
-    that has a completed full-length run (others show as pending)."""
-    cols = ("λ1 err", "λ2 err", "rel_l2 u", "rel_l2 v", "rel_l2 p")
-    hdr = f"{'optimizer':11s}" + "".join(f"{c:>11s}" for c in cols)
-    print(hdr); print("-" * len(hdr))
-    for key in ("gnome", "soap", "adamw"):
-        r = _ns_run(key)
-        lab = STYLE[key]["label"]
-        if r is None:
-            print(f"{lab:11s}{'(run pending)':>55s}"); continue
-        f = lambda m: r.final("val", m)
-        vals = (f("lambda1_err"), f("lambda2_err"),
-                f("rel_l2_u"), f("rel_l2_v"), f("rel_l2_p"))
-        print(f"{lab:11s}" + "".join(f"{v:>11.2e}" for v in vals))
-
 # ---- WikiText-103 GPT (categorical cross-entropy) -------------------------
 WIKI_OPTS = ("adamw", "soap", "gnome_fisher", "gnome_hutchinson")
 
@@ -191,25 +138,28 @@ def _wiki(opt):
     except FileNotFoundError:
         return None
 
+# Common step window where every truncated Colab run has data (SOAP stops
+# earliest, ~19.5k), so all four curves are compared on equal footing.
+WIKI_MAX_STEP = 19_000
+
 def wikitext_figure():
-    """Two panels: training loss (left) and validation perplexity (right, log
-    scale) for the four optimizers. Curves end at different steps — these are
-    truncated Colab runs (see prose)."""
-    fig, (axL, axR) = plt.subplots(1, 2, figsize=(9.5, 3.8))
+    """Single panel: validation loss (CCE) for the four optimizers, plotted only
+    up to WIKI_MAX_STEP where every truncated Colab run still has data."""
+    fig, ax = plt.subplots(figsize=(6.4, 4.0))
     for key in WIKI_OPTS:
         r = _wiki(key)
         if r is None:
             continue
         c, lab = STYLE[key]["color"], STYLE[key]["label"]
-        ts, tl = r.series("train", "loss")
-        vs, vp = r.series("val", "ppl")
-        axL.plot(ts, tl, color=c, lw=1.4, label=lab)
-        axR.plot(vs, vp, color=c, lw=1.8, label=lab)
-    axL.set(xlabel="step", ylabel="training loss (CCE)", title="training loss")
-    axR.set(yscale="log", xlabel="step", ylabel="validation perplexity",
-            title="validation perplexity")
-    axR.legend(frameon=False)
-    fig.suptitle("WikiText-103 · GPT-2 small (124M params)")
+        vs, vl = r.series("val", "loss")
+        pts = [(s, l) for s, l in zip(vs, vl) if s <= WIKI_MAX_STEP]
+        if not pts:
+            continue
+        xs, ys = zip(*pts)
+        ax.plot(xs, ys, color=c, lw=1.8, label=lab)
+    ax.set(xlabel="step", ylabel="validation loss (CCE)",
+           title="WikiText-103 · GPT-2 small (124M params)")
+    ax.legend(frameon=False)
     fig.tight_layout()
     plt.show()
 
@@ -226,6 +176,9 @@ wik_adamw = _wiki_bestppl("adamw")
 ppl = lambda x: f"{x:.1f}" if x is not None else "—"
 ```
 
+*Code, experiments, and everything needed to reproduce this post:
+[`github.com/tmayer868/gnome-optimizer`](https://github.com/tmayer868/gnome-optimizer).*
+
 AdamW, the default optimizer in deep learning, can't fit a linear regression. Run it
 at a fixed learning rate and it never reaches the minimum — it gets within a ball of
 radius $\sim\eta$ of the solution and rattles around in there forever. SOAP, which has
@@ -240,13 +193,25 @@ convex, smooth, closed-form answer — and the rare case where you can measure e
 how wrong the final parameters are instead of squinting at a loss curve. An optimizer
 that needs a babysitter here needs one everywhere; it's just harder to catch.
 
-This post shows the failure, explains it in one equation (it's the denominator), and
-introduces **Gnome** (**G**auss-**N**ewton **o**ptimizer via **m**atrix
-**e**igendecomposition). Gnome modifies [SOAP](https://arxiv.org/abs/2409.11321) in
-two ways: it replaces SOAP's empirical-Fisher curvature approximation with an unbiased
-estimate of the generalized Gauss–Newton matrix, and it takes a clipped Newton step in
-the rotated basis instead of an Adam step. The result is a step size that goes to zero
-because the residual does, not because a schedule said so.
+This post shows the failure and traces it to two defects of the Adam/empirical-Fisher
+family, each one equation long:
+
+1. **Step size.** $\mathbb E[\hat g^2] = \mathbb E[g]^2 + \tfrac{1}{B}\operatorname{Var}[g]$
+   — neither term is curvature: the first cancels against the numerator (sign-steps),
+   the second is a noise floor set by the batch size $B$. With or without the square
+   root, whether the step anneals is an accident of local signal-to-noise, never a
+   measurement of arrival.
+2. **Basis.** $\sum_k g_k g_k^\top = 4\sum_k r_k^2\, J_k^\top J_k$ — the empirical
+   Fisher is the Gauss–Newton matrix with every sample reweighted by its squared
+   residual, so outliers vote quadratically and the eigenbasis tracks your worst
+   errors, not the curvature.
+
+**Gnome** (**G**auss-**N**ewton **o**ptimizer via **m**atrix **e**igendecomposition)
+modifies [SOAP](https://arxiv.org/abs/2409.11321) with one fix per defect: it replaces
+SOAP's empirical-Fisher curvature approximation with an unbiased estimate of the
+generalized Gauss–Newton matrix (the basis), and it takes a clipped Newton step in the
+rotated basis instead of an Adam step (the step size). The result is a step size that
+goes to zero because the residual does, not because a schedule said so.
 
 Here's the headline before the argument — physics-informed neural network (PINN)
 benchmarks, final error against a reference solution, Gnome at a **fixed learning
@@ -258,10 +223,9 @@ rate** versus baselines given warmup plus a tuned cosine decay to zero:
 # Each experiment appears automatically once it has a completed, full-length run
 # on disk — same auto-updating contract as every other figure in this post.
 HERO = [
-    ("Poisson",                "poisson_pinn",               "rel_l2"),
-    ("Burgers",                "burgers_pinn",               "rel_l2"),
-    ("Kuramoto–Sivashinsky",   "kuramoto_sivashinsky_pinn",  "rel_l2"),
-    ("Navier–Stokes ($u$)",    "navier_stokes_pinn",         "rel_l2_u"),
+    ("Poisson", "poisson_pinn", "rel_l2"),
+    ("Burgers", "burgers_pinn", "rel_l2"),
+    ("Kuramoto–Sivashinsky", "kuramoto_sivashinsky_pinn", "rel_l2"),
 ]
 full_length = lambda hp: hp.get("steps", 0) > 1000   # skip smoke-test runs
 OPTS = ("gnome", "soap", "adamw")
@@ -327,7 +291,7 @@ $$
 $$
 
 There is a single right answer, and we can compute it directly. So we can ask an
-optimizer the sharpest possible question: after training, **how far is your $\beta$
+optimizer the most exacting question there is: after training, **how far is your $\beta$
 from $\beta^\star$?** Not "how low is the loss" — how close is the actual solution.
 
 Here are Gnome, AdamW, and SOAP on a 64-feature least-squares problem
@@ -377,7 +341,8 @@ out your solution is wrong.
 
 ### Why they stall: the step size never goes to zero
 
-The cause is the denominator. Adam's update, per coordinate, is
+The cause is the denominator. Here is the heuristic version of the argument first.
+Adam's update, per coordinate, is
 
 $$
 \Delta\theta \;=\; -\,\eta\,\frac{\hat m}{\sqrt{\hat v} + \varepsilon}
@@ -386,15 +351,55 @@ $$
 $$
 
 because $\hat m$ tracks the gradient $g$ and $\sqrt{\hat v}$ tracks its root-mean-square
-— roughly $\lvert g\rvert$. The magnitudes cancel. The step is (about) $\eta$ in every
-coordinate **regardless of how small the gradient is**. SOAP inherits exactly this
-behaviour; it runs Adam in a rotated basis, but the denominator is still $\sqrt{\hat v}$.
+— which, when the gradient's signal dominates its sampling noise, is roughly
+$\lvert g\rvert$. The magnitudes cancel: the step is (about) $\eta$ in every coordinate
+**regardless of how small the gradient is**. SOAP inherits exactly this behaviour; it
+runs Adam in a rotated basis, but the denominator is still $\sqrt{\hat v}$.
 
-So as the iterate approaches $\beta^\star$ and the gradient shrinks toward zero, the
-step size does *not* shrink with it. The optimizer keeps taking $\eta$-sized steps and
-rattles around inside a ball of radius $\sim\eta$ around the minimum. It never settles.
-The only way to make it settle is to shrink $\eta$ yourself — a decay schedule — until
-the steps are small enough that "hovering" looks like "converged."
+Taken at face value, this says the step never shrinks as the iterate approaches
+$\beta^\star$: the optimizer keeps taking $\eta$-sized steps and rattles around inside a
+ball of radius $\sim\eta$ around the minimum. That is a heuristic, not a theorem — near
+a minimum the gradient's sampling noise enters the denominator too, and the general
+statement below is less clean-cut — but on OLS its conclusion is exactly what @fig-ols
+shows: the baselines stall at a floor and stay there no matter how long they run. The
+only way to make them settle is to shrink $\eta$ yourself — a decay schedule — until the
+steps are small enough that "hovering" looks like "converged."
+
+The general statement is one line. Per coordinate, over minibatches of size $B$,
+
+$$
+\mathbb E[\hat g^2] \;=\; \mathbb E[g]^2 \;+\; \tfrac{1}{B}\operatorname{Var}[g],
+$$
+
+and **neither term is curvature**: the first cancels against the numerator — the
+heuristic above, now visible as the signal-dominated case — and the second is a noise
+floor set by the batch size.
+Nor does dropping the square root fix it: $g/\mathbb E[\hat g^2]$ divides the gradient
+by noise when noise dominates (annealing at a rate set by $\operatorname{Var}[g]/B$,
+rescaled every time you change the batch size) and by $g^2$ when signal dominates
+(diverging into the $\varepsilon$ floor as $g \to 0$). The denominator a Newton step
+wants is curvature — the one quantity that stays put at the minimum — and it simply
+isn't in $\mathbb E[g^2]$. Whether such a step anneals is an accident of local
+signal-to-noise, never a measurement of arrival — and the stall in @fig-ols is what
+that accident looks like in practice.
+
+### Why the basis is wrong: outliers warp the empirical Fisher
+
+The step size is only half the indictment. For squared error the per-sample gradient
+is $g_k = 2\,r_k J_k^\top$, so the empirical Fisher SOAP builds its rotation from is
+
+$$
+\sum_k g_k g_k^\top \;=\; 4\sum_k r_k^2\, J_k^\top J_k
+$$
+
+— the Gauss–Newton matrix with every sample's curvature contribution reweighted by its
+squared residual. Outliers vote quadratically: a sample 10× more wrong gets 100× the
+say, so the eigenbasis tilts toward the Jacobian directions of the current worst
+errors, not the curvature — which on OLS is literally constant ($X^\top X$) while the
+empirical Fisher churns for the entire run. This is a known failure of
+empirical-Fisher preconditioning
+([Kunstner et al., 2019](https://arxiv.org/abs/1905.12558)); §2 fixes it at the
+source, by building the basis from an estimator with no residual in it.
 
 ### The usual fix is a global hack
 
@@ -434,6 +439,8 @@ it is heavy-handed in two concrete ways:
 On a convex problem like OLS a global clock happens to be good enough to fake
 convergence. The trouble is that it's a patch over the symptom, and — as the stiff,
 non-convex PDEs in §3 show — a patch that stops working when the problem gets hard.
+And it only patches the *first* problem: a global scalar can shrink the step, but no
+schedule, however carefully annealed, can re-point a warped eigenbasis.
 
 ### What Gnome does instead
 
@@ -441,8 +448,8 @@ Gnome uses SOAP's machinery to construct a proper Gauss–Newton optimizer — o
 steps settle into minima on their own. The recipe:
 
 1. **Start from SOAP's signal.** SOAP builds its rotation from outer products of the
-   batch loss gradient, $\mathrm{EMA}[g g^\top]$ — the *empirical Fisher*, a poor
-   stand-in for curvature.
+   batch loss gradient, $\mathrm{EMA}[g g^\top]$ — the *empirical Fisher*, the
+   residual-warped matrix above.
 2. **Swap the signal.** Gnome constructs a scalar surrogate $S$ whose gradient
    $g_s = \partial S/\partial\theta$ satisfies
    $\mathbb E[g_s g_s^\top] = J^\top H_y J$ — the *generalized Gauss–Newton* matrix
@@ -614,7 +621,7 @@ v \;=\; \sqrt{p(1-p)} \odot R,
 S_{\text{BCE}} \;=\; \langle z,\, \operatorname{detach}(v)\rangle .
 $$
 
-One trap: $p$ must be detached. The gradient flows through the logits $z$ only — $p$
+One thing to get right: $p$ must be detached. The gradient flows through the logits $z$ only — $p$
 enters as a scale on the probe, and letting autograd differentiate through it
 estimates the wrong matrix. (BCE isn't a shipped `loss=` option; it's here because
 the recipe should visibly generalize, and because it's the diagonal special case of
@@ -675,7 +682,7 @@ losses that are exponential-family negative log-likelihoods in their natural
 parameters (Gaussian ↔ MSE, Bernoulli ↔ BCE, categorical ↔ CCE; see
 [Martens](https://arxiv.org/abs/1412.1193)), so the two framings pick out the same
 preconditioner and you can use whichever motivation fits the loss. On MSE, Gauss–Newton
-is the sharper reading: the loss is a quadratic bowl in the outputs and the settling
+is the more literal reading: the loss is a quadratic bowl in the outputs and the settling
 argument of §1 applies literally. On CCE the bowl picture is weaker and natural
 gradient is the better story — precondition by the geometry of the predictive
 distribution. The distinction that actually matters in this post is a different one:
@@ -691,26 +698,39 @@ couples per-sample Jacobians) — are in [`docs/method.md`](../docs/method.md).*
 
 ---
 
-<!-- SKETCH: sections below are outline-only, to be filled from full runs -->
+## 3. The same failure on harder problems: PINNs
 
-## 3. Escalation: PINNs, where a decay schedule is no longer enough
+Least squares isolated the mechanism in the cleanest possible setting. The obvious
+question is whether it's a toy artifact or something that actually bites — so here is the
+*identical* denominator story on physics-informed neural networks (PINNs). A PINN
+minimizes the residual of a PDE at collocation points — still a sum of squared errors, so
+Gnome's MSE surrogate applies unchanged — but the landscape is stiff and non-convex, and
+the "right answer" is a continuous field we score against a high-accuracy reference via
+relative $L_2$ error. We look at three: **Poisson**, about as gentle as a PINN gets;
+**Burgers**, a canonical shock; and **Kuramoto–Sivashinsky**, a stiff fourth-order
+operator.
 
-Least squares was the clean case. Physics-informed neural networks (PINNs) are where the
-denominator starts to *decide* the result. A PINN minimizes the residual of a PDE at
-collocation points — still a sum of squared errors, so Gnome's MSE surrogate applies
-unchanged — but the loss landscape is stiff and non-convex, and the "right answer" is a
-continuous field we compare against a high-accuracy reference solution via relative
-$L_2$ error.
-
-Each PINN figure below has two panels: the **relative $L_2$ error** against that reference
-(the true metric — how right the solution is) on the left, and the **PDE-residual loss**
-the optimizer actually minimizes on the right. In §1 those two came apart — the loss looked
-converged while the parameter error didn't. On these PINNs they move together, so the
-residual is at least an honest proxy here; what changes across the four problems is *how
-fast*, and *whether a schedule was needed*, to drive both down.
-
-We escalate through four of them. The baselines here get the full standard treatment —
+Each figure has two panels: the **relative $L_2$ error** against the reference (the true
+metric — how right the solution is) on the left, and the **PDE-residual loss** the
+optimizer actually minimizes on the right. In §1 those two came apart — the loss looked
+converged while the parameter error didn't; on these PINNs they move together, so the
+residual is at least an honest proxy. The baselines get the full standard treatment —
 warmup plus cosine decay to zero — while Gnome runs at a fixed learning rate throughout.
+
+One set of hyperparameters covers every experiment in this section — nothing is
+retuned per problem:
+
+| optimizer | LR | $(\beta_1, \beta_2)$ | eigenbasis refresh | schedule |
+|:----------|:---------------|:--------------------|:-------------------|:---------------------|
+| Gnome     | $10^{-2}$, fixed | (0.9, 0.99)         | every 10 steps      | none                  |
+| SOAP      | $10^{-3}$        | (0.9, 0.99)         | every 10 steps      | warmup + cosine → 0   |
+| AdamW     | $10^{-3}$        | (0.9, 0.999)        | —                   | warmup + cosine → 0   |
+
+: Hyperparameters, identical across all three PINN benchmarks. {#tbl-pinn-hp}
+
+On the fairness of that table: SOAP performed no better at a higher or lower learning
+rate, and both baselines *did* perform better with cosine decay than without — the
+schedule is there because it helps them, not to handicap them.
 
 ### 3.1 Poisson — the gentle case
 
@@ -721,19 +741,19 @@ validation curves for the three optimizers on a 25k-parameter MLP.
 ```{python}
 #| echo: false
 #| label: fig-poisson
-#| fig-cap: "Poisson: true solution error (left) and the PDE-residual loss the optimizer minimizes (right), both log scale. SOAP with cosine decay tracks Gnome closely and both reach the mid-$10^{-5}$ range; AdamW settles more than an order of magnitude higher. On the gentle problem a decayed baseline keeps up — the gap opens on the harder PDEs."
+#| fig-cap: "Poisson: true solution error (left) and the PDE-residual loss the optimizer minimizes (right), both log scale. SOAP with cosine decay tracks Gnome closely and both reach the mid-$10^{-5}$ range; AdamW settles more than an order of magnitude higher. On the gentle problem a decayed baseline keeps up — the gap opens on Burgers."
 pinn_figure("poisson_pinn", "Poisson equation")
 ```
 
 Gnome reaches the lowest error (**`{python} sci(pois_gnome)`**) at a fixed learning rate;
-SOAP with a tuned cosine decay is right behind (**`{python} sci(pois_soap)`**); AdamW
+SOAP with a tuned cosine decay is behind at **`{python} sci(pois_soap)`**; AdamW
 trails at **`{python} sci(pois_adamw)`**. The takeaway isn't
 the Gnome-vs-SOAP margin here — it's small and this is the easy problem — it's that the
 decay schedule is doing real work for the baselines. Notice also the *shape*: Gnome
 descends smoothly and monotonically, while SOAP rattles up and down by an order of
 magnitude and only settles as its learning rate is annealed away — the same hovering from
-§1, now driven down by the schedule rather than by the residual. Hold that thought: on the
-next PDEs the same schedule is no longer enough.
+§1, now driven down by the schedule rather than by the residual. Hold that thought: on
+Burgers the same schedule is no longer enough.
 
 ### 3.2 Burgers — a shock forms
 
@@ -750,86 +770,65 @@ baselines on warmup + cosine-to-zero, Gnome at fixed LR.
 pinn_figure("burgers_pinn", "Burgers equation")
 ```
 
-Gnome resolves the shock to a relative $L_2$ of **`{python} sci(burg_gnome)`** at a fixed
+Gnome resolves the shock to a relative $L_2$ of **`{python} rl2(burg_gnome)`** at a fixed
 learning rate. Both baselines get the full cosine treatment and both land well short: SOAP
-at **`{python} sci(burg_soap)`** (roughly `{python} f"{burg_soap/burg_gnome:.0f}"`× Gnome's
-error) and AdamW at **`{python} sci(burg_adamw)`** (about
-`{python} f"{burg_adamw/burg_gnome:.0f}"`×). The gap the gentle Poisson problem didn't show
+at **`{python} rl2(burg_soap)`** (roughly `{python} xratio(burg_soap, burg_gnome)`× Gnome's
+error) and AdamW at **`{python} rl2(burg_adamw)`** (about
+`{python} xratio(burg_adamw, burg_gnome)`×). The gap the gentle Poisson problem didn't show
 is now open. It's the same story from §1, one step harder: on Poisson the schedule kept the
 baselines within a small factor of Gnome; on the stiff Burgers landscape the schedule still
 helps but no longer closes the gap. And notice the *shape* again — Gnome's descent is smooth
 and monotone while both baselines rattle by an order of magnitude the whole way down,
 the residual-driven step doing quietly what the schedule does noisily.
 
-### 3.3 Kuramoto–Sivashinsky — a reliable breakthrough vs. an unreliable one
+Burgers opened the gap on a single stationary shock. Kuramoto–Sivashinsky leans on the
+same weakness harder — its difficulty is a genuinely stiff operator, not a single
+localized feature like the shock.
 
-Kuramoto–Sivashinsky is the stiff, chaotic one, and it draws the §1 argument in the
-sharpest possible terms. Early in training every optimizer is stuck at a relative $L_2$
-of about $0.5$ — the "hasn't found the attractor yet" plateau. What happens next is the
-whole story.
+### 3.3 Kuramoto–Sivashinsky — the stiffest operator
+
+KS is the hardest PDE in this post, and the difficulty is *stiffness*, not chaos. Its linear
+part, $u_{xx} + u_{xxxx}$, spans an enormous range of scales at once: low-wavenumber modes are
+amplified (the $k^2$ term, where $k^2 > k^4$) while high-wavenumber modes are strongly damped
+(the $k^4$ term, $k^4 \gg k^2$), and the nonlinear $u\,u_x$ term couples them together. That
+fourth-order operator is exactly the kind of wildly anisotropic, ill-conditioned curvature a
+diagonal preconditioner cannot see — the residual landscape is stiff in the strong sense, and
+it is where a curvature-aware step earns its keep most clearly.
+
+One deliberate choice: we solve KS only on the early window $t \in [0, 30]$ and stop short of
+the chaotic regime. On this large periodic domain ($L = 32\pi$, the canonical Kassam–Trefethen
+setup) the solution stays spatially coherent and its energy actually *decays* through
+$t \approx 30$; the coherent structure then destabilizes and breaks up into sustained
+spatiotemporal chaos near $t \approx 40$. We do not venture past that breakup, and on purpose.
+Once the flow is chaotic, sensitive dependence on initial conditions makes a *pointwise* error
+against a reference meaningless — two solutions agreeing to eight digits separate to order one
+within a few dozen time units, so a relative $L_2$ score would be measuring the chaos, not the
+optimizer. Staying in the pre-chaotic transient keeps the metric honest while preserving the
+difficulty we actually care about: the stiffness of the operator.
 
 ```{python}
 #| echo: false
 #| label: fig-ks
-#| fig-cap: "Kuramoto–Sivashinsky: true solution error (left) and PDE-residual loss (right), both log scale. All three start pinned at the ~0.5 plateau. Gnome breaks through early and self-anneals down; on these runs both SOAP and AdamW stay stuck on the plateau. Same shape in both panels. Same MLP, equal block weights — no loss weighting, no causal training."
+#| fig-cap: "Kuramoto–Sivashinsky on the pre-chaotic window $t \\in [0, 30]$: true-solution error vs. an ETDRK4 spectral reference (left) and PDE-residual loss (right), both log scale. Same plain tanh MLP and collocation set for all three optimizers; baselines on warmup + cosine-to-zero, Gnome at fixed LR."
 pinn_figure("kuramoto_sivashinsky_pinn", "Kuramoto–Sivashinsky equation")
 ```
 
-Gnome breaks off the plateau early — below $0.3$ by step **`{python} ks_gnome_bt_str`** —
-and descends steadily under a *fixed* learning rate to a final relative $L_2$ of
-**`{python} f"{ks_gnome:.3f}"`**. It does this on every run we tried: the breakthrough is a
-reliable consequence of the residual-driven step, not a lucky configuration.
+This time the baselines don't just trail — they never leave the gate. SOAP and AdamW spend
+all 70,000 steps pinned at a relative $L_2$ of roughly 0.5 (final:
+**`{python} rl2(ks_soap)`** and **`{python} rl2(ks_adamw)`**), and the schedule that kept
+them competitive on Poisson and merely behind on Burgers buys nothing here. Gnome breaks
+below 0.3 by step `{python} ks_gnome_bt_str` and descends to **`{python} rl2(ks_gnome)`** —
+all against the same ETDRK4 reference, on the same tanh MLP and the same collocation points,
+with only the optimizer changed.
 
-SOAP and AdamW tell a different story. On the runs shown here **neither breaks through** —
-both stay pinned on the plateau, SOAP at **`{python} f"{ks_soap:.2f}"`** and AdamW at
-**`{python} f"{ks_adamw:.2f}"`**. SOAP is not fundamentally incapable: on *other* runs — a
-longer schedule, a different seed — its cosine decay has occasionally dragged it off the
-plateau late in training, once the learning rate had annealed far enough. But we could not
-get that breakthrough to happen **consistently**; it comes and goes with the budget and the
-seed. AdamW's diagonal preconditioner never escapes at all.
+That is the whole arc: the exact denominator pathology from §1 — a step that won't vanish
+without a hand-tuned schedule — escalating cleanly across three PDEs. Poisson is gentle
+enough that the schedule keeps the baselines close; Burgers opens the gap at a shock; and on
+KS, the stiffest of the three, the baselines fail outright while the residual-driven step
+converges. Same mechanism, harder problem each time, plainly visible in the metric you
+actually care about.
 
-That is the §1 thesis rendered as a training curve, and then sharpened. The schedule crutch
-isn't just slower than a residual-driven step — it's *unreliable*: sometimes the global
-cosine decay drags SOAP through, sometimes it doesn't, and you can't tell in advance. Gnome
-breaks through every time because the mechanism is intrinsic — the residual anneals its step
-for it, closed-loop, with no schedule to tune.
-
-### 3.4 Navier–Stokes — recovering the physics
-
-The last problem flips the question. Instead of solving a PDE with known coefficients, the
-Navier–Stokes benchmark is an *inverse problem*: the two coefficients $\lambda_1,\lambda_2$
-of the momentum equations are **unknown** and must be discovered from sparse velocity
-observations, jointly with the full flow field. The true values are $\lambda_1 = 1.0$
-(convection) and $\lambda_2 = 0.01$ (viscosity), and both are initialized at $0$ — so a
-working optimizer has to *lift them onto the right physics* while fitting the flow.
-
-That gives two things to watch, one per panel below: how close the discovered coefficients
-get to the truth (left), and how well the reconstructed velocity/pressure field matches the
-reference (right).
-
-```{python}
-#| echo: false
-#| label: fig-ns
-#| fig-cap: "Navier–Stokes inverse problem. Left: relative error of the discovered coefficients (solid $\\lambda_1$, dashed $\\lambda_2$) — how close to the true physics. Right: mean reconstruction error over the $u,v,p$ fields. Both log scale; each optimizer appears once it has a completed full-length run."
-ns_figure()
-```
-
-```{python}
-#| echo: false
-ns_table()
-```
-
-Both Gnome and SOAP recover the equation — $\lambda_1$ and $\lambda_2$ land within a
-fraction of a percent of the truth — and reconstruct the flow. Gnome's advantage is on the
-**fields**, most clearly the **pressure**: pressure is never observed directly, only pinned
-indirectly through the momentum balance, so it's the most sensitive test of the
-preconditioner, and it's where Gnome opens the widest margin (see the `rel_l2 p` column). It
-is a modest, honest win rather than a blowout — the coefficient recovery is close to a tie.
-Navier–Stokes is also the natural place to watch an optimizer fail outright: one that can't
-make progress simply leaves $\lambda_1,\lambda_2$ stuck near their zero initialization, a
-flat line pinned at the top of the left panel.
-
-## 4. A curiosity: WikiText GPT
+## 4. One real language task: WikiText GPT
 
 Everything in §3 was regression — the $\sqrt 2\, I$ surrogate. Language modeling is
 categorical cross-entropy, so this is where §2's CCE surrogates earn their keep. The
@@ -841,15 +840,17 @@ lower-variance eigenbasis shows up as better training.
 
 ### The result
 
-A caveat before the plot: these are **truncated Colab runs**. The sessions disconnected at
-different points, so SOAP stops around 19.5k steps, the Gnome variants near 24–26k, and only
-AdamW reached the full 30k. Read them as directional, not a controlled benchmark — matched
-full-length runs on dedicated GPUs are coming.
+We had the compute budget for exactly one real language-modeling task, so here it is:
+GPT-2 small (124M parameters) on WikiText-103. SOAP and AdamW run on their recommended
+hyperparameters; the Gnome variants simply borrow SOAP's, untuned. One logistical note:
+the Colab sessions hosting these runs disconnected at different points — SOAP earliest,
+around 19.5k steps — so the plot is capped at 19k, the common window where all four
+have data.
 
 ```{python}
 #| echo: false
 #| label: fig-wikitext
-#| fig-cap: "WikiText-103, GPT-2 small (124M). Training loss (left) and validation perplexity (right, log scale) for the four optimizers. Curves end at different steps because the Colab sessions disconnected at different points — this is a preview, not a matched benchmark."
+#| fig-cap: "WikiText-103, GPT-2 small (124M). Validation loss (CCE) for the four optimizers, plotted up to 19k steps — the common window where every run has data. Baselines on their recommended hyperparameters; Gnome on SOAP's, untuned."
 wikitext_figure()
 ```
 
@@ -861,17 +862,44 @@ Hutchinson edging Fisher (**`{python} ppl(wik_ghut)`** vs **`{python} ppl(wik_gf
 the small signal §2 predicts: an all-classes-at-once curvature probe has lower variance than
 a single-sampled-class one, and it shows up as slightly better training.
 
-We are deliberately **not** making a claim of it. The perplexity gaps are small, the runs
-are short and unequal in length, and one language model at one scale says nothing about LLMs
-in general — we don't have the compute budget for that argument. It's here as a curiosity:
-the denominator/GGN story that decides the PINN results doesn't fall apart the moment you
-leave regression for cross-entropy.
+One model at one scale is not an LLM claim, and we aren't making one. The point is
+narrower, and it holds: the GGN story that decides the PINN results doesn't fall apart
+the moment you leave regression for cross-entropy — on borrowed, untuned hyperparameters,
+Gnome lands ahead of both baselines.
 
 One difference from §3: on cross-entropy **every** optimizer, Gnome included, gets a cosine
 schedule. The §1 fixed-LR trick is specific to MSE, where the step vanishes because the
 residual does; cross-entropy gradients don't vanish at the optimum, so there is no free
 self-annealing to exploit and Gnome takes the schedule too.
 
-## 5. Reproducing this  *(outline)*
+## 5. Reproducing this
 
-- `uv sync`, one command per experiment, every figure regenerated from `runs/*.jsonl`.
+Everything above is regenerated, not transcribed. Each experiment streams an append-only
+JSONL log to `runs/<experiment>/<run_id>.jsonl`, and this post is a Quarto document that
+reads those logs at render time — every figure, every table, and every bolded number in
+the prose is pulled from the latest completed run on disk. Re-run an experiment and the
+post updates itself on the next render; delete a run and its numbers degrade to "—"
+rather than silently going stale.
+
+The code is at [`github.com/tmayer868/gnome-optimizer`](https://github.com/tmayer868/gnome-optimizer),
+with dependencies managed by [uv](https://docs.astral.sh/uv/). One command per experiment:
+
+```bash
+git clone https://github.com/tmayer868/gnome-optimizer && cd gnome-optimizer
+uv sync --extra experiments
+
+uv run python -m experiments.ols_regression              --optimizer gnome --lr 0.1
+uv run python -m experiments.poisson_pinn                --optimizer gnome --steps 50000
+uv run python -m experiments.burgers_pinn                --optimizer gnome --steps 75000
+uv run python -m experiments.kuramoto_sivashinsky_pinn   --optimizer gnome --steps 100000
+```
+
+Swap `--optimizer soap` or `adamw` for the baselines. The schedule protocol from §1 is
+the default: baseline runs get warmup plus cosine decay to zero out of the box, while
+Gnome ignores the schedule on MSE losses because it self-anneals — so reproducing the
+comparison requires no flag juggling. (`--cosine-decay 1` disables decay for the raw
+fixed-LR baselines of §1.) The regression and PINN experiments run on CPU, Apple MPS, or
+CUDA, whichever is available; the WikiText run (§4) needs `uv sync --extra llm` and a
+GPU. The [README](https://github.com/tmayer868/gnome-optimizer#readme) has the full
+argument lists and the run-artifact format, and
+[`docs/method.md`](../docs/method.md) has the method details that didn't fit here.

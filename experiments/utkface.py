@@ -243,7 +243,7 @@ def augment_batch(
 # ----------------------------------------------------------------------
 
 def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_decay,
-                    eps=1e-6, beta1=0.9, beta2=0.95):
+                    eps=1e-6, beta1=0.9, beta2=0.99):
     """Return ``(optimizer, config, scheduler)``.
 
     MSE regression, so the repo protocol applies: Gnome runs at a fixed
@@ -434,7 +434,7 @@ def parse_args() -> argparse.Namespace:
                         "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
     p.add_argument("--beta1", type=float, default=0.9,
                    help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.95,
+    p.add_argument("--beta2", type=float, default=0.99,
                    help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--model", choices=MODEL_NAMES, default="resnet12",

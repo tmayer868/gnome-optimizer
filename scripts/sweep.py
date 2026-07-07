@@ -85,16 +85,16 @@ RUNS += grid(
 
 RUNS += grid(
     "poisson_pinn", optimizer="gnome", steps=STEPS, seed=0,
-    lr=[1e-2, 3e-2],
-    eps=[1e-4, 1e-6],
-    beta2=.95,
+    lr=1e-2,
+    eps=1e-6,
+    beta2=.99,
     depth=8,
 )
 
 RUNS += grid(
     "poisson_pinn", optimizer="soap", steps=STEPS, seed=0,
-    lr=[7e-4, 1e-3, 3e-3],
-    beta2=.95,
+    lr=1e-3,
+    beta2=.99,
     hidden = 64,
     depth = 8,
 )
@@ -108,17 +108,17 @@ RUNS += grid(
 
 RUNS += grid(
     "burgers_pinn", optimizer="gnome", steps=STEPS, seed=0,
-    lr=[1e-2, 3e-2],
-    eps=[1e-4, 1e-6],
-    beta2=.95,
+    lr=1e-2,
+    eps=1e-6,
+    beta2=.99,
     hidden=64,
     depth=8,
 )
 
 RUNS += grid(
     "burgers_pinn", optimizer="soap", steps=STEPS, seed=0,
-    lr=[7e-4, 1e-3, 3e-3],
-    beta2=.95,
+    lr=1e-3,
+    beta2=.99,
     hidden=64,
     depth=8,
 )
@@ -135,48 +135,23 @@ RUNS += grid(
 
 RUNS += grid(
     "kuramoto_sivashinsky_pinn", optimizer="gnome", steps=STEPS, seed=0,
-    lr=[1e-2, 3e-2],
-    eps=[1e-4, 1e-6],
-    beta2=.95,
+    lr=1e-2,
+    eps=1e-6,
+    beta2=.99,
     hidden=64,
     depth=8,
 )
 
 RUNS += grid(
     "kuramoto_sivashinsky_pinn", optimizer="soap", steps=STEPS, seed=0,
-    lr=[7e-4, 1e-3, 3e-3],
-    beta2=.95,
+    lr=1e-3,
+    beta2=.99,
     hidden=64,
     depth=8,
 )
 
 RUNS += grid(
     "kuramoto_sivashinsky_pinn", optimizer="adamw", steps=STEPS, seed=0,
-    lr=1e-3,
-    hidden=64,
-    depth=8,
-)
-
-
-RUNS += grid(
-    "navier_stokes_pinn", optimizer="gnome", steps=STEPS, seed=0,
-    lr=[3e-2, 5e-2],
-    eps=[1e-4, 1e-6],
-    beta2=.95,
-    hidden=64,
-    depth=8,
-)
-
-RUNS += grid(
-    "navier_stokes_pinn", optimizer="soap", steps=STEPS, seed=0,
-    lr=[1e-3, 3e-3, 5e-3],
-    beta2=.95,
-    hidden=64,
-    depth=8,
-)
-
-RUNS += grid(
-    "navier_stokes_pinn", optimizer="adamw", steps=STEPS, seed=0,
     lr=1e-3,
     hidden=64,
     depth=8,

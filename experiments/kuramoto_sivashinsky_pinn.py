@@ -4,11 +4,18 @@ PDE:  u_t + u·u_x + u_xx + u_xxxx = 0,    x ∈ [0, 32π],  t ∈ [0, 30]
 IC:   u(0, x) = cos(x/16)·(1 + sin(x/16))
 BC:   u(t, 0) = u(t, 32π),  u_x(t, 0) = u_x(t, 32π)    (periodic)
 
-The canonical chaotic-regime Kuramoto-Sivashinsky benchmark: the large-L
-periodic domain + Kassam-Trefethen IC produces sustained spatiotemporal
-chaos. The 4th-order linear part of the PDE (``u_xx + u_xxxx``) is what
-makes KS distinctive — small-k modes are amplified (k² > k⁴), large-k
-damped (k⁴ ≫ k²), and the nonlinear ``u·u_x`` term ties them together.
+The large-L (L = 32π) periodic domain and Kassam-Trefethen IC are the
+canonical Kuramoto-Sivashinsky setup, but we integrate only to t = 30 —
+which stays inside the *laminar pre-chaotic transient*. From this smooth
+IC the solution stays spatially coherent and its energy decays through
+t ≈ 30; the coherent structure then destabilizes and breaks up into
+sustained spatiotemporal chaos near t ≈ 40. We deliberately stop short of
+that breakup: once the flow is chaotic, sensitive dependence makes a
+pointwise rel-L2 against a reference meaningless (it would measure the
+chaos, not the optimizer). What remains on [0, 30] is the difficulty we
+want — the stiffness of the 4th-order linear operator ``u_xx + u_xxxx``:
+small-k modes are amplified (k² > k⁴), large-k damped (k⁴ ≫ k²), and the
+nonlinear ``u·u_x`` term ties them together.
 
 Compared to Burgers, the PINN residual costs roughly 2× more (four
 ``autograd.grad`` calls through the network input instead of two), but
@@ -21,7 +28,7 @@ endpoints.
 Reference: ETDRK4 spectral integrator (Kassam & Trefethen 2005). RK4
 would need a CFL of ``O(dx⁴ / 1)`` because of the 4th-order linear
 operator; ETDRK4 handles the linear part exactly per step and lets us
-take ``dt ≈ 0.025`` even at the chaotic-regime length scales.
+take ``dt ≈ 0.025`` even on the large-L domain.
 
 All three optimizers share one plain tanh MLP so the only variable is the
 optimizer. The baselines (SOAP, AdamW) get a linear-warmup + cosine-decay
@@ -67,6 +74,9 @@ L_DOMAIN = X_MAX - X_MIN
 
 
 # ========================= Model =========================
+class SineActivation(nn.Module):
+    def forward(self, x):
+        return torch.sin(x)
 
 class PINN(nn.Module):
     """Maps ``(t, x) → u`` via a plain tanh MLP."""
@@ -303,7 +313,7 @@ def eval_rel_l2(
 def build_optimizer(
     name: str, params, lr: float, weight_decay: float,
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
-    beta1: float = 0.9, beta2: float = 0.95,
+    beta1: float = 0.9, beta2: float = 0.99,
 ):
     """Construct the optimizer and its LR schedule.
 
@@ -368,11 +378,11 @@ def parse_args() -> argparse.Namespace:
                         "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
     p.add_argument("--beta1", type=float, default=0.9,
                    help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.95,
+    p.add_argument("--beta2", type=float, default=0.99,
                    help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
     p.add_argument("--weight-decay", type=float, default=1e-8)
     p.add_argument("--hidden", type=int, default=128,
-                   help="MLP width. KS chaotic regime needs more capacity than "
+                   help="MLP width. The stiff KS operator needs more capacity than "
                         "Burgers; 128 is a reasonable default.")
     p.add_argument("--depth", type=int, default=6, help="MLP depth.")
     p.add_argument("--warmup-steps", type=int, default=200,

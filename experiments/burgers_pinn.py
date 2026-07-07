@@ -333,7 +333,7 @@ def eval_rel_l2(
 def build_optimizer(
     name: str, params, lr: float, weight_decay: float,
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
-    beta1: float = 0.9, beta2: float = 0.95,
+    beta1: float = 0.9, beta2: float = 0.99,
 ):
     """Construct the optimizer and its LR schedule.
 
@@ -397,7 +397,7 @@ def parse_args() -> argparse.Namespace:
                         "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
     p.add_argument("--beta1", type=float, default=0.9,
                    help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.95,
+    p.add_argument("--beta2", type=float, default=0.99,
                    help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
     p.add_argument("--weight-decay", type=float, default=1e-8)
     p.add_argument("--hidden", type=int, default=20, help="MLP width.")
