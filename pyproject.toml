@@ -1,0 +1,78 @@
+[project]
+name = "gnome-optimizer"
+version = "0.1.0"
+description = "Gnome: Gauss-Newton Optimizer via Matrix Eigen-decomposition"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "tmayer868" }]
+keywords = [
+    "pytorch",
+    "optimizer",
+    "second-order",
+    "gauss-newton",
+    "soap",
+    "pinn",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "jupyter>=1.0",
+]
+# Reproducibility experiments: scipy for .mat references (Burgers,
+# Navier-Stokes), matplotlib for the comparison plots.
+experiments = [
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+]
+# Language-model benchmark (WikiText GPT) — heavier, GPU-oriented.
+llm = [
+    "datasets>=2.14",
+    "transformers>=4.30",
+]
+# CIFAR-10 rotation-regression benchmark: torchvision for the dataset.
+cifar = [
+    "torchvision>=0.15",
+]
+# UTKFace age-regression benchmark (kept for reference; not in the writeup):
+# HuggingFace datasets + Pillow for image decode.
+utkface = [
+    "datasets>=2.14",
+    "pillow>=10.0",
+]
+# Web dashboard for queueing/monitoring runs (FastAPI + uvicorn + jinja2).
+dashboard = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "jinja2>=3.1",
+    "websockets>=12.0",
+]
+
+[project.scripts]
+gnome-dashboard = "dashboard.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/tmayer868/gnome-optimizer"
+Repository = "https://github.com/tmayer868/gnome-optimizer"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gnome"]
