@@ -42,7 +42,7 @@ arg — so that the curvature scaling is unambiguous and reduction-independent:
     ``v = sqrt(p) ⊙ R - (sqrt(p)·R) · p`` gives ``E[v v^T] = H`` exactly,
     so ``S = <y_hat, detach(v)>.sum() / sqrt(K)`` estimates the same GGN
     as ``cce`` without a discrete label draw. Lower per-step variance at
-    the same ``aux_batch_size``.
+    the same aux batch size ``K``.
 
 Because the optimizer owns both the loss and the surrogate, your two
 closures just return ``(y_hat, y)`` for the main batch and the aux batch
@@ -156,8 +156,6 @@ class Gnome(Optimizer):
         precondition_frequency: Steps between eigenbasis refreshes.
         max_precond_dim: Modes larger than this are skipped (no Kronecker
             factor maintained along that dimension).
-        aux_batch_size: Number of samples used to form the surrogate
-            curvature estimate each step.
         clip: If not None, clamp the per-coordinate update magnitude to
             ``[-clip, +clip]`` in both the rotated and the rotated-back
             bases. Acts as a trust-region safeguard: at sensible learning
@@ -201,7 +199,6 @@ class Gnome(Optimizer):
         weight_decay: float = 0.01,
         precondition_frequency: int = 10,
         max_precond_dim: int = 10000,
-        aux_batch_size: int = 10,
         clip: Optional[float] = 1.0,
         max_grad_norm: Optional[float] = None,
         warmup: int = 200,
@@ -218,8 +215,6 @@ class Gnome(Optimizer):
             raise ValueError(f"Invalid beta2: {betas[1]}")
         if eps < 0.0:
             raise ValueError(f"Invalid eps: {eps}")
-        if aux_batch_size < 1:
-            raise ValueError(f"Invalid aux_batch_size: {aux_batch_size}")
         if clip is not None and clip <= 0.0:
             raise ValueError(f"Invalid clip: {clip}")
         if max_grad_norm is not None and max_grad_norm <= 0.0:
@@ -250,7 +245,6 @@ class Gnome(Optimizer):
         super().__init__(params, defaults)
         self._data_format = data_format
         self._loss_mode = loss
-        self._aux_batch_size = aux_batch_size
         # Global (all-parameter) main-gradient norm clip; None disables it.
         self._max_grad_norm = max_grad_norm
         self._step_count = 0
@@ -532,7 +526,7 @@ class Gnome(Optimizer):
 
         All branches divide their summed surrogate by ``sqrt(K)`` so that
         ``E[(dS/dθ)²] = (1/K) · sum_aux L''·J²`` is an unbiased estimator
-        of ``E_data[L''·J²]``, independent of ``aux_batch_size``.
+        of ``E_data[L''·J²]``, independent of ``K``.
 
         MSE: the intrinsic output Hessian is ``L'' = 2`` per element, so
         ``S = (sqrt(2) · eps · y_hat[aux_idx]).sum() / sqrt(K)`` with

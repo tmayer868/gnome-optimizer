@@ -46,7 +46,7 @@ import torch
 from gnome import Gnome
 
 model = ...  # any nn.Module. Under loss="cce", use LayerNorm/GroupNorm, not BatchNorm.
-opt = Gnome(model.parameters(), lr=1e-2, loss="mse", aux_batch_size=10)
+opt = Gnome(model.parameters(), lr=1e-2, loss="mse")
 
 for x, y in loader:
     idx = torch.randperm(x.shape[0])[:10]      # small auxiliary slice for curvature
@@ -65,8 +65,9 @@ Key arguments:
 - `loss` — `"mse"` (regression), `"cce"` (softmax cross-entropy, Fisher surrogate), or
   `"cce_hutchinson"` (cross-entropy, lower-variance Rademacher surrogate).
 - `lr` — for MSE, Gnome self-anneals, so a fixed learning rate is expected (no schedule).
-- `aux_batch_size` (`K`) — samples used for the curvature estimate (default 10). Controls
-  variance, not bias.
+- `K` (auxiliary batch size) — the number of samples in the aux slice you pass to
+  `aux_closure` (10 in the example above). Controls the curvature estimate's variance, not
+  bias. It is *not* a constructor argument — Gnome reads K from the aux batch you provide.
 - `eps` — curvature damping (larger → closer to gradient descent).
 
 For multi-block losses (e.g. PINNs — a PDE residual plus boundary/initial terms),
