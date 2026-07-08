@@ -136,7 +136,8 @@ window.Quarto = {
   <ul class="collapse">
   <li><a href="#the-result" id="toc-the-result" class="nav-link" data-scroll-target="#the-result">The result</a></li>
   </ul></li>
-  <li><a href="#reproducing-this" id="toc-reproducing-this" class="nav-link" data-scroll-target="#reproducing-this">5. Reproducing this</a></li>
+  <li><a href="#related-optimizers" id="toc-related-optimizers" class="nav-link" data-scroll-target="#related-optimizers">5. Related optimizers</a></li>
+  <li><a href="#reproducing-this" id="toc-reproducing-this" class="nav-link" data-scroll-target="#reproducing-this">6. Reproducing this</a></li>
   </ul>
 </nav>
 </div>
@@ -304,7 +305,7 @@ Figure&nbsp;1: Left: distance to the OLS solution. Gnome descends to the closed-
 <section id="the-usual-fix-is-a-global-hack" class="level3">
 <h3 class="anchored" data-anchor-id="the-usual-fix-is-a-global-hack">The usual fix is a global hack</h3>
 <p>A common cure is to decay the learning rate to zero on a schedule, guiding the optimizer into the minimum by hand. Give these same runs a cosine decay to zero and both baselines drop onto <span class="math inline">\(\beta^\star\)</span>:</p>
-<div id="7cd6ff29" class="cell" data-execution_count="4">
+<div id="33b17e17" class="cell" data-execution_count="4">
 <div class="cell-output cell-output-stdout">
 <pre><code>run                        final ‖β-β*‖
 OLS optimum                    2.26e-03
@@ -570,8 +571,20 @@ Figure&nbsp;5: WikiText-103, GPT-2 small (124M). Validation loss (CCE) for the f
 <p>One difference from §3: on cross-entropy <strong>every</strong> optimizer, Gnome included, gets a cosine schedule. The §1 fixed-LR trick is specific to MSE, where the step vanishes because the residual does; cross-entropy gradients don’t vanish at the optimum, so there is no free self-annealing to exploit and Gnome takes the schedule too.</p>
 </section>
 </section>
+<section id="related-optimizers" class="level2">
+<h2 class="anchored" data-anchor-id="related-optimizers">5. Related optimizers</h2>
+<p>A short map of the neighborhood, and where Gnome sits in it.</p>
+<ul>
+<li><strong><a href="https://arxiv.org/abs/1503.05671">K-FAC</a></strong> — natural gradient with the Fisher (equal to the GGN for the losses here; §2’s aside) approximated per layer as a Kronecker product, estimated by sampling labels from the model’s own predictions. Same target matrix as Gnome; different estimator (sampled labels vs.&nbsp;Rademacher probes) and different machinery (explicit factor inversion vs.&nbsp;an eigenbasis plus a diagonal).</li>
+<li><strong><a href="https://arxiv.org/abs/1806.03884">EKFAC</a></strong> — K-FAC’s Kronecker eigenbasis plus a per-coordinate second-moment rescaling of the gradient in that basis, with no square root: the closest structural relative of Gnome’s step. Gnome differs in the curvature signal (§2’s unbiased probe estimate, EMA’d, instead of sampled-label Fisher factors), in building the basis with SOAP’s machinery, and in the trust-region clip.</li>
+<li><strong><a href="https://arxiv.org/abs/2305.14342">Sophia</a></strong> — diagonal, square-root-free, and clipped: an EMA of the gradient over an EMA of a stochastic Hessian-diagonal estimate, clipped elementwise. Its Gauss–Newton–Bartlett estimator is the same sampled-label trick as <code>gnome_fisher</code>. Gnome is the rotated version of the same philosophy: the division happens in the GGN’s eigenbasis, where a diagonal can actually represent the curvature, rather than in the coordinate basis, where it mostly can’t.</li>
+<li><strong><a href="https://arxiv.org/abs/1802.09568">Shampoo</a> / <a href="https://arxiv.org/abs/2409.11321">SOAP</a></strong> — the machinery Gnome is built from. Both precondition with second moments of the loss gradient — the empirical Fisher, §1’s residual-warped matrix — and both keep Adam-style square roots, so both inherit §1’s step-size story. Gnome keeps the basis mechanics, swaps the signal, and changes the step.</li>
+<li><strong><a href="https://www.cs.toronto.edu/~jmartens/docs/Deep_HessianFree.pdf">Hessian-free optimization</a> and <a href="https://arxiv.org/abs/2302.13163">energy natural gradient for PINNs</a></strong> — solve the full GGN/Fisher system each step with CG or least squares: very accurate, but the per-step cost scales badly. Gnome amortizes the same curvature into a Kronecker eigenbasis maintained by cheap EMAs — one extra backward pass on a few samples per step.</li>
+<li><strong><a href="https://kellerjordan.github.io/posts/muon/">Muon</a></strong> — orthogonalizes the momentum matrix, pushing every singular value to one: sign descent at the matrix level. Effective on transformers, but the step magnitude is independent of how close you are by construction — §1’s pathology as a design choice — so it leans on a schedule the same way Adam does.</li>
+</ul>
+</section>
 <section id="reproducing-this" class="level2">
-<h2 class="anchored" data-anchor-id="reproducing-this">5. Reproducing this</h2>
+<h2 class="anchored" data-anchor-id="reproducing-this">6. Reproducing this</h2>
 <p>Everything above is regenerated, not transcribed. Each experiment streams an append-only JSONL log to <code>runs/&lt;experiment&gt;/&lt;run_id&gt;.jsonl</code>, and this post is a Quarto document that reads those logs at render time — every figure, every table, and every bolded number in the prose is pulled from the latest completed run on disk. Re-run an experiment and the post updates itself on the next render; delete a run and its numbers degrade to “—” rather than silently going stale.</p>
 <p>The code is at <a href="https://github.com/tmayer868/gnome-optimizer"><code>github.com/tmayer868/gnome-optimizer</code></a>, with dependencies managed by <a href="https://docs.astral.sh/uv/">uv</a>. One command per experiment:</p>
 <div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb2"><pre class="sourceCode bash code-with-copy"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> clone https://github.com/tmayer868/gnome-optimizer <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> gnome-optimizer</span>
@@ -1913,37 +1926,77 @@ Figure&nbsp;5: WikiText-103, GPT-2 small (124M). Validation loss (CCE) for the f
 <span id="cb3-888"><a href="#cb3-888" aria-hidden="true" tabindex="-1"></a>residual does; cross-entropy gradients don't vanish at the optimum, so there is no free</span>
 <span id="cb3-889"><a href="#cb3-889" aria-hidden="true" tabindex="-1"></a>self-annealing to exploit and Gnome takes the schedule too.</span>
 <span id="cb3-890"><a href="#cb3-890" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-891"><a href="#cb3-891" aria-hidden="true" tabindex="-1"></a><span class="fu">## 5. Reproducing this</span></span>
+<span id="cb3-891"><a href="#cb3-891" aria-hidden="true" tabindex="-1"></a><span class="fu">## 5. Related optimizers</span></span>
 <span id="cb3-892"><a href="#cb3-892" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-893"><a href="#cb3-893" aria-hidden="true" tabindex="-1"></a>Everything above is regenerated, not transcribed. Each experiment streams an append-only</span>
-<span id="cb3-894"><a href="#cb3-894" aria-hidden="true" tabindex="-1"></a>JSONL log to <span class="in">`runs/&lt;experiment&gt;/&lt;run_id&gt;.jsonl`</span>, and this post is a Quarto document that</span>
-<span id="cb3-895"><a href="#cb3-895" aria-hidden="true" tabindex="-1"></a>reads those logs at render time — every figure, every table, and every bolded number in</span>
-<span id="cb3-896"><a href="#cb3-896" aria-hidden="true" tabindex="-1"></a>the prose is pulled from the latest completed run on disk. Re-run an experiment and the</span>
-<span id="cb3-897"><a href="#cb3-897" aria-hidden="true" tabindex="-1"></a>post updates itself on the next render; delete a run and its numbers degrade to "—"</span>
-<span id="cb3-898"><a href="#cb3-898" aria-hidden="true" tabindex="-1"></a>rather than silently going stale.</span>
-<span id="cb3-899"><a href="#cb3-899" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-900"><a href="#cb3-900" aria-hidden="true" tabindex="-1"></a>The code is at <span class="co">[</span><span class="ot">`github.com/tmayer868/gnome-optimizer`</span><span class="co">](https://github.com/tmayer868/gnome-optimizer)</span>,</span>
-<span id="cb3-901"><a href="#cb3-901" aria-hidden="true" tabindex="-1"></a>with dependencies managed by <span class="co">[</span><span class="ot">uv</span><span class="co">](https://docs.astral.sh/uv/)</span>. One command per experiment:</span>
-<span id="cb3-902"><a href="#cb3-902" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-903"><a href="#cb3-903" aria-hidden="true" tabindex="-1"></a><span class="in">```bash</span></span>
-<span id="cb3-904"><a href="#cb3-904" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> clone https://github.com/tmayer868/gnome-optimizer <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> gnome-optimizer</span>
-<span id="cb3-905"><a href="#cb3-905" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> sync <span class="at">--extra</span> experiments</span>
-<span id="cb3-906"><a href="#cb3-906" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-907"><a href="#cb3-907" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> run python <span class="at">-m</span> experiments.ols_regression              <span class="at">--optimizer</span> gnome <span class="at">--lr</span> 0.1</span>
-<span id="cb3-908"><a href="#cb3-908" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> run python <span class="at">-m</span> experiments.poisson_pinn                <span class="at">--optimizer</span> gnome <span class="at">--steps</span> 50000</span>
-<span id="cb3-909"><a href="#cb3-909" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> run python <span class="at">-m</span> experiments.burgers_pinn                <span class="at">--optimizer</span> gnome <span class="at">--steps</span> 75000</span>
-<span id="cb3-910"><a href="#cb3-910" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> run python <span class="at">-m</span> experiments.kuramoto_sivashinsky_pinn   <span class="at">--optimizer</span> gnome <span class="at">--steps</span> 100000</span>
-<span id="cb3-911"><a href="#cb3-911" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
-<span id="cb3-912"><a href="#cb3-912" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-913"><a href="#cb3-913" aria-hidden="true" tabindex="-1"></a>Swap <span class="in">`--optimizer soap`</span> or <span class="in">`adamw`</span> for the baselines. The schedule protocol from §1 is</span>
-<span id="cb3-914"><a href="#cb3-914" aria-hidden="true" tabindex="-1"></a>the default: baseline runs get warmup plus cosine decay to zero out of the box, while</span>
-<span id="cb3-915"><a href="#cb3-915" aria-hidden="true" tabindex="-1"></a>Gnome ignores the schedule on MSE losses because it self-anneals — so reproducing the</span>
-<span id="cb3-916"><a href="#cb3-916" aria-hidden="true" tabindex="-1"></a>comparison requires no flag juggling. (<span class="in">`--cosine-decay 1`</span> disables decay for the raw</span>
-<span id="cb3-917"><a href="#cb3-917" aria-hidden="true" tabindex="-1"></a>fixed-LR baselines of §1.) The regression and PINN experiments run on CPU, Apple MPS, or</span>
-<span id="cb3-918"><a href="#cb3-918" aria-hidden="true" tabindex="-1"></a>CUDA, whichever is available; the WikiText run (§4) needs <span class="in">`uv sync --extra llm`</span> and a</span>
-<span id="cb3-919"><a href="#cb3-919" aria-hidden="true" tabindex="-1"></a>GPU. The <span class="co">[</span><span class="ot">README</span><span class="co">](https://github.com/tmayer868/gnome-optimizer#readme)</span> has the full</span>
-<span id="cb3-920"><a href="#cb3-920" aria-hidden="true" tabindex="-1"></a>argument lists and the run-artifact format, and</span>
-<span id="cb3-921"><a href="#cb3-921" aria-hidden="true" tabindex="-1"></a><span class="co">[</span><span class="ot">`docs/method.md`</span><span class="co">](../docs/method.md)</span> has the method details that didn't fit here.</span>
+<span id="cb3-893"><a href="#cb3-893" aria-hidden="true" tabindex="-1"></a>A short map of the neighborhood, and where Gnome sits in it.</span>
+<span id="cb3-894"><a href="#cb3-894" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-895"><a href="#cb3-895" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**[K-FAC](https://arxiv.org/abs/1503.05671)** — natural gradient with the Fisher</span>
+<span id="cb3-896"><a href="#cb3-896" aria-hidden="true" tabindex="-1"></a>  (equal to the GGN for the losses here; §2's aside) approximated per layer as a</span>
+<span id="cb3-897"><a href="#cb3-897" aria-hidden="true" tabindex="-1"></a>  Kronecker product, estimated by sampling labels from the model's own predictions.</span>
+<span id="cb3-898"><a href="#cb3-898" aria-hidden="true" tabindex="-1"></a>  Same target matrix as Gnome; different estimator (sampled labels vs. Rademacher</span>
+<span id="cb3-899"><a href="#cb3-899" aria-hidden="true" tabindex="-1"></a>  probes) and different machinery (explicit factor inversion vs. an eigenbasis plus a</span>
+<span id="cb3-900"><a href="#cb3-900" aria-hidden="true" tabindex="-1"></a>  diagonal).</span>
+<span id="cb3-901"><a href="#cb3-901" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**[EKFAC](https://arxiv.org/abs/1806.03884)** — K-FAC's Kronecker eigenbasis plus a</span>
+<span id="cb3-902"><a href="#cb3-902" aria-hidden="true" tabindex="-1"></a>  per-coordinate second-moment rescaling of the gradient in that basis, with no square</span>
+<span id="cb3-903"><a href="#cb3-903" aria-hidden="true" tabindex="-1"></a>  root: the closest structural relative of Gnome's step. Gnome differs in the curvature</span>
+<span id="cb3-904"><a href="#cb3-904" aria-hidden="true" tabindex="-1"></a>  signal (§2's unbiased probe estimate, EMA'd, instead of sampled-label Fisher</span>
+<span id="cb3-905"><a href="#cb3-905" aria-hidden="true" tabindex="-1"></a>  factors), in building the basis with SOAP's machinery, and in the trust-region clip.</span>
+<span id="cb3-906"><a href="#cb3-906" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**[Sophia](https://arxiv.org/abs/2305.14342)** — diagonal, square-root-free, and</span>
+<span id="cb3-907"><a href="#cb3-907" aria-hidden="true" tabindex="-1"></a>  clipped: an EMA of the gradient over an EMA of a stochastic Hessian-diagonal</span>
+<span id="cb3-908"><a href="#cb3-908" aria-hidden="true" tabindex="-1"></a>  estimate, clipped elementwise. Its Gauss–Newton–Bartlett estimator is the same</span>
+<span id="cb3-909"><a href="#cb3-909" aria-hidden="true" tabindex="-1"></a>  sampled-label trick as <span class="in">`gnome_fisher`</span>. Gnome is the rotated version of the same</span>
+<span id="cb3-910"><a href="#cb3-910" aria-hidden="true" tabindex="-1"></a>  philosophy: the division happens in the GGN's eigenbasis, where a diagonal can</span>
+<span id="cb3-911"><a href="#cb3-911" aria-hidden="true" tabindex="-1"></a>  actually represent the curvature, rather than in the coordinate basis, where it</span>
+<span id="cb3-912"><a href="#cb3-912" aria-hidden="true" tabindex="-1"></a>  mostly can't.</span>
+<span id="cb3-913"><a href="#cb3-913" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**<span class="co">[</span><span class="ot">Shampoo</span><span class="co">](https://arxiv.org/abs/1802.09568)</span> /</span>
+<span id="cb3-914"><a href="#cb3-914" aria-hidden="true" tabindex="-1"></a>  <span class="co">[</span><span class="ot">SOAP</span><span class="co">](https://arxiv.org/abs/2409.11321)</span>** — the machinery Gnome is built from. Both</span>
+<span id="cb3-915"><a href="#cb3-915" aria-hidden="true" tabindex="-1"></a>  precondition with second moments of the loss gradient — the empirical Fisher, §1's</span>
+<span id="cb3-916"><a href="#cb3-916" aria-hidden="true" tabindex="-1"></a>  residual-warped matrix — and both keep Adam-style square roots, so both inherit §1's</span>
+<span id="cb3-917"><a href="#cb3-917" aria-hidden="true" tabindex="-1"></a>  step-size story. Gnome keeps the basis mechanics, swaps the signal, and changes the</span>
+<span id="cb3-918"><a href="#cb3-918" aria-hidden="true" tabindex="-1"></a>  step.</span>
+<span id="cb3-919"><a href="#cb3-919" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**<span class="co">[</span><span class="ot">Hessian-free optimization</span><span class="co">](https://www.cs.toronto.edu/~jmartens/docs/Deep_HessianFree.pdf)</span></span>
+<span id="cb3-920"><a href="#cb3-920" aria-hidden="true" tabindex="-1"></a>  and <span class="co">[</span><span class="ot">energy natural gradient for PINNs</span><span class="co">](https://arxiv.org/abs/2302.13163)</span>** — solve</span>
+<span id="cb3-921"><a href="#cb3-921" aria-hidden="true" tabindex="-1"></a>  the full GGN/Fisher system each step with CG or least squares: very accurate, but the</span>
+<span id="cb3-922"><a href="#cb3-922" aria-hidden="true" tabindex="-1"></a>  per-step cost scales badly. Gnome amortizes the same curvature into a Kronecker</span>
+<span id="cb3-923"><a href="#cb3-923" aria-hidden="true" tabindex="-1"></a>  eigenbasis maintained by cheap EMAs — one extra backward pass on a few samples per</span>
+<span id="cb3-924"><a href="#cb3-924" aria-hidden="true" tabindex="-1"></a>  step.</span>
+<span id="cb3-925"><a href="#cb3-925" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>**[Muon](https://kellerjordan.github.io/posts/muon/)** — orthogonalizes the momentum</span>
+<span id="cb3-926"><a href="#cb3-926" aria-hidden="true" tabindex="-1"></a>  matrix, pushing every singular value to one: sign descent at the matrix level.</span>
+<span id="cb3-927"><a href="#cb3-927" aria-hidden="true" tabindex="-1"></a>  Effective on transformers, but the step magnitude is independent of how close you are</span>
+<span id="cb3-928"><a href="#cb3-928" aria-hidden="true" tabindex="-1"></a>  by construction — §1's pathology as a design choice — so it leans on a schedule the</span>
+<span id="cb3-929"><a href="#cb3-929" aria-hidden="true" tabindex="-1"></a>  same way Adam does.</span>
+<span id="cb3-930"><a href="#cb3-930" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-931"><a href="#cb3-931" aria-hidden="true" tabindex="-1"></a><span class="fu">## 6. Reproducing this</span></span>
+<span id="cb3-932"><a href="#cb3-932" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-933"><a href="#cb3-933" aria-hidden="true" tabindex="-1"></a>Everything above is regenerated, not transcribed. Each experiment streams an append-only</span>
+<span id="cb3-934"><a href="#cb3-934" aria-hidden="true" tabindex="-1"></a>JSONL log to <span class="in">`runs/&lt;experiment&gt;/&lt;run_id&gt;.jsonl`</span>, and this post is a Quarto document that</span>
+<span id="cb3-935"><a href="#cb3-935" aria-hidden="true" tabindex="-1"></a>reads those logs at render time — every figure, every table, and every bolded number in</span>
+<span id="cb3-936"><a href="#cb3-936" aria-hidden="true" tabindex="-1"></a>the prose is pulled from the latest completed run on disk. Re-run an experiment and the</span>
+<span id="cb3-937"><a href="#cb3-937" aria-hidden="true" tabindex="-1"></a>post updates itself on the next render; delete a run and its numbers degrade to "—"</span>
+<span id="cb3-938"><a href="#cb3-938" aria-hidden="true" tabindex="-1"></a>rather than silently going stale.</span>
+<span id="cb3-939"><a href="#cb3-939" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-940"><a href="#cb3-940" aria-hidden="true" tabindex="-1"></a>The code is at <span class="co">[</span><span class="ot">`github.com/tmayer868/gnome-optimizer`</span><span class="co">](https://github.com/tmayer868/gnome-optimizer)</span>,</span>
+<span id="cb3-941"><a href="#cb3-941" aria-hidden="true" tabindex="-1"></a>with dependencies managed by <span class="co">[</span><span class="ot">uv</span><span class="co">](https://docs.astral.sh/uv/)</span>. One command per experiment:</span>
+<span id="cb3-942"><a href="#cb3-942" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-943"><a href="#cb3-943" aria-hidden="true" tabindex="-1"></a><span class="in">```bash</span></span>
+<span id="cb3-944"><a href="#cb3-944" aria-hidden="true" tabindex="-1"></a><span class="fu">git</span> clone https://github.com/tmayer868/gnome-optimizer <span class="kw">&amp;&amp;</span> <span class="bu">cd</span> gnome-optimizer</span>
+<span id="cb3-945"><a href="#cb3-945" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> sync <span class="at">--extra</span> experiments</span>
+<span id="cb3-946"><a href="#cb3-946" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-947"><a href="#cb3-947" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> run python <span class="at">-m</span> experiments.ols_regression              <span class="at">--optimizer</span> gnome <span class="at">--lr</span> 0.1</span>
+<span id="cb3-948"><a href="#cb3-948" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> run python <span class="at">-m</span> experiments.poisson_pinn                <span class="at">--optimizer</span> gnome <span class="at">--steps</span> 50000</span>
+<span id="cb3-949"><a href="#cb3-949" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> run python <span class="at">-m</span> experiments.burgers_pinn                <span class="at">--optimizer</span> gnome <span class="at">--steps</span> 75000</span>
+<span id="cb3-950"><a href="#cb3-950" aria-hidden="true" tabindex="-1"></a><span class="ex">uv</span> run python <span class="at">-m</span> experiments.kuramoto_sivashinsky_pinn   <span class="at">--optimizer</span> gnome <span class="at">--steps</span> 100000</span>
+<span id="cb3-951"><a href="#cb3-951" aria-hidden="true" tabindex="-1"></a><span class="in">```</span></span>
+<span id="cb3-952"><a href="#cb3-952" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-953"><a href="#cb3-953" aria-hidden="true" tabindex="-1"></a>Swap <span class="in">`--optimizer soap`</span> or <span class="in">`adamw`</span> for the baselines. The schedule protocol from §1 is</span>
+<span id="cb3-954"><a href="#cb3-954" aria-hidden="true" tabindex="-1"></a>the default: baseline runs get warmup plus cosine decay to zero out of the box, while</span>
+<span id="cb3-955"><a href="#cb3-955" aria-hidden="true" tabindex="-1"></a>Gnome ignores the schedule on MSE losses because it self-anneals — so reproducing the</span>
+<span id="cb3-956"><a href="#cb3-956" aria-hidden="true" tabindex="-1"></a>comparison requires no flag juggling. (<span class="in">`--cosine-decay 1`</span> disables decay for the raw</span>
+<span id="cb3-957"><a href="#cb3-957" aria-hidden="true" tabindex="-1"></a>fixed-LR baselines of §1.) The regression and PINN experiments run on CPU, Apple MPS, or</span>
+<span id="cb3-958"><a href="#cb3-958" aria-hidden="true" tabindex="-1"></a>CUDA, whichever is available; the WikiText run (§4) needs <span class="in">`uv sync --extra llm`</span> and a</span>
+<span id="cb3-959"><a href="#cb3-959" aria-hidden="true" tabindex="-1"></a>GPU. The <span class="co">[</span><span class="ot">README</span><span class="co">](https://github.com/tmayer868/gnome-optimizer#readme)</span> has the full</span>
+<span id="cb3-960"><a href="#cb3-960" aria-hidden="true" tabindex="-1"></a>argument lists and the run-artifact format, and</span>
+<span id="cb3-961"><a href="#cb3-961" aria-hidden="true" tabindex="-1"></a><span class="co">[</span><span class="ot">`docs/method.md`</span><span class="co">](../docs/method.md)</span> has the method details that didn't fit here.</span>
 </code></pre></div><button title="Copy to Clipboard" class="code-copy-button" data-in-quarto-modal=""><i class="bi"></i></button></div>
 </div></div></div></div></div>
 </div> <!-- /content -->
