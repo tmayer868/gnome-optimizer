@@ -78,7 +78,6 @@ from typing import Callable, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch.optim.optimizer import Optimizer
-import numpy as np
 
 ClosureReturn = Tuple[torch.Tensor, torch.Tensor]
 
@@ -319,7 +318,10 @@ class Gnome(Optimizer):
             grad = self._merge_dims(grad, max_precond_dim)
         for mat in state["Q"]:
             if len(mat) > 0:
-                grad = torch.tensordot(grad, mat, dims=[[0], [0]])
+                # Q is stored in the eigen-decomposition's float32 working
+                # precision; align it to grad's dtype (a no-op for float32
+                # params, an upcast for float64) so the projection matches.
+                grad = torch.tensordot(grad, mat.to(grad.dtype), dims=[[0], [0]])
             else:
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
@@ -345,7 +347,7 @@ class Gnome(Optimizer):
             grad = self._merge_dims(grad, max_precond_dim)
         for mat in state["Q"]:
             if len(mat) > 0:
-                grad = torch.tensordot(grad, mat, dims=[[0], [1]])
+                grad = torch.tensordot(grad, mat.to(grad.dtype), dims=[[0], [1]])
             else:
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
@@ -381,8 +383,13 @@ class Gnome(Optimizer):
 
         if G_s.dim() == 1:
             if precondition_1d and G_s.shape[0] <= max_precond_dim:
-                state["GG"][0].lerp_(
-                    G_s.unsqueeze(1) @ G_s.unsqueeze(0),
+                gg = state["GG"][0]
+                # GG is kept in float32 (the preconditioner's internal working
+                # precision, matching _eigh_safe); cast the contribution to its
+                # dtype so higher-precision (e.g. float64) grads accumulate. For
+                # float32 grads this .to() is a no-op and behaviour is unchanged.
+                gg.lerp_(
+                    (G_s.unsqueeze(1) @ G_s.unsqueeze(0)).to(gg.dtype),
                     1 - state["shampoo_beta"],
                 )
         else:
@@ -395,7 +402,8 @@ class Gnome(Optimizer):
                             [*chain(range(idx), range(idx + 1, len(ref.shape)))]
                         ] * 2,
                     )
-                    state["GG"][idx].lerp_(outer, 1 - state["shampoo_beta"])
+                    gg = state["GG"][idx]
+                    gg.lerp_(outer.to(gg.dtype), 1 - state["shampoo_beta"])
 
         if state["Q"] is None:
             state["Q"] = self._eigvecs_descending(state["GG"])
@@ -823,10 +831,6 @@ class Gnome(Optimizer):
 
         # Adam/GNOME-style step in the rotated basis.
         update_rot = grad_hat / gnd_hat.add(group["eps"])
-        if np.random.rand() < .00:
-            shape = gnd_hat.shape
-            prop = (gnd_hat < group["eps"]).float().mean().item()
-            print(f"Layer Shape: {shape} || Proportion < eps {prop:.5f}")
         if clip is not None:
             update_rot = update_rot.clamp(min=-clip, max=clip)
 

@@ -227,7 +227,10 @@ class SOAP(optim.Optimizer):
 
         for mat in state["Q"]:
             if len(mat) > 0:
-                grad = torch.tensordot(grad, mat, dims=[[0], [0]])
+                # Q is stored in float32 (its eigen-decomposition precision);
+                # align to grad's dtype — a no-op for float32, an upcast for
+                # float64 — so the projection matches.
+                grad = torch.tensordot(grad, mat.to(grad.dtype), dims=[[0], [0]])
             else:
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
@@ -249,7 +252,7 @@ class SOAP(optim.Optimizer):
 
         for mat in state["Q"]:
             if len(mat) > 0:
-                grad = torch.tensordot(grad, mat, dims=[[0], [1]])
+                grad = torch.tensordot(grad, mat.to(grad.dtype), dims=[[0], [1]])
             else:
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
@@ -270,10 +273,16 @@ class SOAP(optim.Optimizer):
                 state["exp_avg"], state,
                 merge_dims=merge_dims, max_precond_dim=max_precond_dim,
             )
+        # GG is kept in float32 (its eigenbasis working precision); cast each
+        # contribution to GG's dtype so higher-precision (e.g. float64) grads
+        # accumulate. For float32 grads this .to() is a no-op — behaviour of
+        # existing runs is unchanged.
         if grad.dim() == 1:
             if precondition_1d and grad.shape[0] <= max_precond_dim:
-                state["GG"][0].lerp_(
-                    grad.unsqueeze(1) @ grad.unsqueeze(0), 1 - state["shampoo_beta"]
+                gg = state["GG"][0]
+                gg.lerp_(
+                    (grad.unsqueeze(1) @ grad.unsqueeze(0)).to(gg.dtype),
+                    1 - state["shampoo_beta"],
                 )
         else:
             if merge_dims:
@@ -284,7 +293,8 @@ class SOAP(optim.Optimizer):
                             new_grad, new_grad,
                             dims=[[*chain(range(idx), range(idx + 1, len(new_grad.shape)))]] * 2,
                         )
-                        state["GG"][idx].lerp_(outer_product, 1 - state["shampoo_beta"])
+                        gg = state["GG"][idx]
+                        gg.lerp_(outer_product.to(gg.dtype), 1 - state["shampoo_beta"])
             else:
                 for idx, sh in enumerate(grad.shape):
                     if sh <= max_precond_dim:
@@ -292,7 +302,8 @@ class SOAP(optim.Optimizer):
                             grad, grad,
                             dims=[[*chain(range(idx), range(idx + 1, len(grad.shape)))]] * 2,
                         )
-                        state["GG"][idx].lerp_(outer_product, 1 - state["shampoo_beta"])
+                        gg = state["GG"][idx]
+                        gg.lerp_(outer_product.to(gg.dtype), 1 - state["shampoo_beta"])
 
         if state["Q"] is None:
             state["Q"] = self.get_orthogonal_matrix(state["GG"])
