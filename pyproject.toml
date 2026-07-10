@@ -55,6 +55,16 @@ utkface = [
     "datasets>=2.14",
     "pillow>=10.0",
 ]
+# JAX port of the optimizer (gnome_jax): jax for the core, optax for
+# baseline optimizers and lr schedules in the JAX experiments.
+jax = [
+    "jax>=0.4.35",
+    "optax>=0.2.3",
+    # chex + jaxtyping are only needed by the vendored SOAP_JAX baseline
+    # (experiments/baselines/soap_jax.py), not by gnome_jax itself.
+    "chex>=0.1.86",
+    "jaxtyping>=0.2.30",
+]
 # Web dashboard for queueing/monitoring runs (FastAPI + uvicorn + jinja2).
 dashboard = [
     "fastapi>=0.110",
@@ -75,4 +85,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["gnome"]
+packages = ["gnome", "gnome_jax"]
