@@ -1,48 +1,47 @@
-"""Burgers under the jaxpi protocol: Adam vs SOAP vs Gnome (gnome_jax).
+"""Allen-Cahn under the jaxpi protocol: Adam vs SOAP vs Gnome (gnome_jax).
 
-Replicates the training setup of Wang et al.'s jaxpi Burgers benchmark
-(``examples/burgers``, ``pirate`` branch, ``configs/sota.py``) — the
-codebase behind "Gradient Alignment in Physics-Informed Neural Networks"
-(arXiv:2502.00604) — with Gnome added as a third optimizer. PirateNet is
-deliberately out of scope for now; this uses their plain-arch protocol.
+Replicates the training setup of Wang et al.'s jaxpi Allen-Cahn benchmark
+(``examples/allen_cahn``, ``pirate`` branch, ``configs/default.py`` — the
+plain-arch protocol; PirateNet is out of scope for now) from the paper
+"Gradient Alignment in Physics-Informed Neural Networks"
+(arXiv:2502.00604), with Gnome added as a third optimizer.
 
-Protocol parity with their sota.py config:
+PDE:  u_t − 0.0001·u_xx + 5u³ − 5u = 0,   (t, x) ∈ [0,1] × [−1,1]
+IC:   u(0, x) = x² cos(πx);   periodic BCs (enforced exactly by the
+periodic input embedding — there is no bcs loss block).
 
-* **Architecture** — ModifiedMlp 4x256 with RWF (mean 1.0, stddev 0.1), no
-  Fourier features, no periodic embedding: see
-  ``experiments/common/pinn_arch_jax.py`` (pure-JAX reimplementation of
-  the published methods — jaxpi's own code is under a no-redistribution
-  Penn license and is NOT copied).
-* **Losses** — ics (u(0,x) from burgers.mat), bcs (u at both spatial
-  boundaries over the time grid), res (collocation residual
-  ``u_t + u·u_x − (0.01/π)·u_xx``) with **causal weighting** (sorted-t
-  chunks, ``w = exp(−tol · M @ l)``) and **grad-norm loss balancing**
-  (running average, momentum 0.9, updated every 1000 steps).
-* **Baselines** — Adam and SOAP (the vendored SOAP_JAX package — the same
-  implementation jaxpi itself imports), with their schedule: linear warmup
-  (5000) joined to exponential decay (rate 0.9 per 1000 steps).
-  ``--schedule-free`` additionally wraps the baseline in
-  ``optax.contrib.schedule_free`` + global-norm clip 1.0, matching their
-  ``pirate_soap.py`` optimizer treatment. SOAP uses
-  ``precondition_frequency=2`` exactly as jaxpi hardcodes it.
-* **Gnome** — fixed lr (no schedule; its Gauss-Newton step self-anneals),
-  the weighted multi-block loss mapped exactly onto ``stack_residuals``:
-  ics block (λ=w_ics), two bc blocks (λ=w_bcs each — their bcs loss is a
-  sum of two means), and the causal res block with each point scaled by
-  ``sqrt(w_chunk)`` (λ=w_res), so ``mean(stacked²)`` equals their weighted
-  loss identically. Grad-norm weight updates use the same machinery as the
-  baselines.
+Protocol parity with their default.py config:
 
-Data: jaxpi's ``burgers.mat`` (auto-downloaded to ``experiments/data/``,
-same file ``burgers_pinn.py`` uses for its ``rel_l2_jaxpi`` metric).
-Headline metric: ``rel_l2`` on their full 201x512 space-time grid. Final
-params are pickled next to the run's JSONL for post-hoc evaluation.
+* **Architecture** — ModifiedMlp 4x256 with RWF (1.0/0.1), periodic
+  embedding (period π on the x axis) and trainable Random Fourier features
+  (scale 2.0, dim 256): ``experiments/common/pinn_arch_jax.py``, a pure-JAX
+  reimplementation of the published methods (jaxpi's code is under a
+  no-redistribution license and is not copied).
+* **Losses** — ics + causal-weighted res (tol 1.0, 32 chunks), balanced by
+  their **NTK weighting**: per-block mean of the per-point NTK diagonal
+  ``||∇_θ f||²`` (res chunk-averaged and multiplied by the causal
+  weights), ``w_k = mean_ntk / (ntk_k + 1e-5·mean_ntk)``, running average
+  momentum 0.9, updated every 1000 steps.
+* **Baselines** — Adam and SOAP (vendored SOAP_JAX, the same package jaxpi
+  imports; ``precondition_frequency=2`` as jaxpi hardcodes), with their
+  schedule: linear warmup (5000) joined to exponential decay (0.9 per
+  5000). ``--schedule-free`` applies their pirate-config optimizer
+  treatment.
+* **Gnome** — fixed lr, the weighted two-block loss mapped exactly onto
+  ``stack_residuals``: ics block (λ=w_ics) + causal res block with each
+  point scaled by ``sqrt(w_chunk)`` (λ=w_res), so ``mean(stacked²)``
+  equals their weighted loss identically.
+
+Their budget is 300k steps (AC is stiff). Data: jaxpi's
+``allen_cahn.mat`` (auto-downloaded to ``experiments/data/``). Headline
+metric: ``rel_l2`` on their full space-time grid. Final params are pickled
+next to the run's JSONL.
 
 Usage:
 
-    uv run -m experiments.burgers_jaxpi --optimizer gnome --seed 0
-    uv run -m experiments.burgers_jaxpi --optimizer soap  --seed 0
-    uv run -m experiments.burgers_jaxpi --optimizer adam  --seed 0
+    uv run -m experiments.allen_cahn_jaxpi --optimizer gnome --seed 0
+    uv run -m experiments.allen_cahn_jaxpi --optimizer soap  --seed 0
+    uv run -m experiments.allen_cahn_jaxpi --optimizer adam  --seed 0
 """
 
 from __future__ import annotations
@@ -66,21 +65,19 @@ from experiments.common import DIVERGED_EXIT, RunLogger, diverged
 from experiments.common.pinn_arch_jax import make_modified_mlp
 
 
-EXPERIMENT = "burgers_jaxpi"
+EXPERIMENT = "allen_cahn_jaxpi"
 
 DATA_URL = (
     "https://raw.githubusercontent.com/PredictiveIntelligenceLab/jaxpi/"
-    "pirate/examples/burgers/data/burgers.mat"
+    "pirate/examples/allen_cahn/data/allen_cahn.mat"
 )
-DATA_CACHE = "experiments/data/burgers.mat"
-
-NU_COEFF = 0.01 / math.pi  # viscosity in their r_net
+DATA_CACHE = "experiments/data/allen_cahn.mat"
 
 
 # ========================= Data =========================
 
 def load_dataset():
-    """jaxpi's burgers.mat: usol (nt, nx), t (nt,), x (nx,)."""
+    """jaxpi's allen_cahn.mat: usol (nt, nx), t (nt,), x (nx,)."""
     import scipy.io
 
     if not os.path.exists(DATA_CACHE):
@@ -102,10 +99,18 @@ def save_params(params, jsonl_path: str) -> str:
     return out
 
 
+def _segment_size(n: int, target: int = 256) -> int:
+    """Largest divisor of n that is <= target (for memory-chunked maps)."""
+    for s in range(min(target, n), 0, -1):
+        if n % s == 0:
+            return s
+    return 1
+
+
 # ========================= Problem definition =========================
 
-class BurgersProblem:
-    """Holds the grids and implements jaxpi's losses / weighting / eval."""
+class AllenCahnProblem:
+    """Grids + jaxpi's losses / NTK weighting / eval for Allen-Cahn."""
 
     def __init__(self, u_ref, t_star, x_star, causal_tol, num_chunks,
                  apply_fn):
@@ -116,8 +121,6 @@ class BurgersProblem:
         self.u0 = u_ref[0, :]
         self.tol = causal_tol
         self.num_chunks = num_chunks
-        # Causal accumulation matrix: chunk i is discounted by the summed
-        # residual mass of all earlier-time chunks.
         self.M = jnp.triu(jnp.ones((num_chunks, num_chunks)), k=1).T
         self.dom = jnp.array(
             [[t_star[0], t_star[-1]], [x_star[0], x_star[-1]]]
@@ -130,12 +133,11 @@ class BurgersProblem:
         return self._apply(params, jnp.stack([t, x]))[0]
 
     def r_net(self, params, t, x):
-        """Burgers residual, matching jaxpi: u_t + u·u_x − (0.01/π)·u_xx."""
+        """AC residual, matching jaxpi: u_t + 5u³ − 5u − 0.0001·u_xx."""
         u = self.u_net(params, t, x)
         u_t = grad(self.u_net, argnums=1)(params, t, x)
-        u_x = grad(self.u_net, argnums=2)(params, t, x)
         u_xx = grad(grad(self.u_net, argnums=2), argnums=2)(params, t, x)
-        return u_t + u * u_x - NU_COEFF * u_xx
+        return u_t + 5.0 * u**3 - 5.0 * u - 0.0001 * u_xx
 
     # ----- residual blocks -----
 
@@ -145,34 +147,27 @@ class BurgersProblem:
         )
         return self.u0[x_idx] - u_pred
 
-    def bc_residuals(self, params, t_idx):
-        bc1 = vmap(self.u_net, (None, 0, None))(
-            params, self.t_star[t_idx], self.x_star[0]
-        )
-        bc2 = vmap(self.u_net, (None, 0, None))(
-            params, self.t_star[t_idx], self.x_star[-1]
-        )
-        return bc1, bc2
-
-    def causal_res(self, params, batch):
-        """Sorted-t residuals scaled per point by sqrt(w_chunk), so that
-        mean(out²) == their causal res loss mean(l·w)."""
+    def _causal_l_w(self, params, batch):
         t_sorted = batch[:, 0].sort()
         r = vmap(self.r_net, (None, 0, 0))(params, t_sorted, batch[:, 1])
         rc = r.reshape(self.num_chunks, -1)
         l = jnp.mean(rc**2, axis=1)
         w = jax.lax.stop_gradient(jnp.exp(-self.tol * (self.M @ l)))
+        return rc, l, w
+
+    def causal_res(self, params, batch):
+        """Sorted-t residuals scaled per point by sqrt(w_chunk):
+        mean(out²) == their causal res loss mean(l·w)."""
+        rc, _, w = self._causal_l_w(params, batch)
         return (rc * jnp.sqrt(w)[:, None]).reshape(-1)
 
-    # ----- jaxpi's loss dict (used by grad-norm weighting + baselines) -----
+    # ----- jaxpi's loss dict -----
 
     def losses(self, params, batch):
         ics_r = self.ics_residual(params, jnp.arange(self.x_star.shape[0]))
-        bc1, bc2 = self.bc_residuals(params, jnp.arange(self.t_star.shape[0]))
         res_scaled = self.causal_res(params, batch)
         return {
             "ics": jnp.mean(ics_r**2),
-            "bcs": jnp.mean(bc1**2) + jnp.mean(bc2**2),
             "res": jnp.mean(res_scaled**2),
         }
 
@@ -180,27 +175,59 @@ class BurgersProblem:
         losses = self.losses(params, batch)
         return sum(weights[k] * losses[k] for k in losses)
 
-    def compute_grad_norm_weights(self, params, batch):
-        """jaxpi's grad_norm scheme: w_k = mean_norm / (norm_k + eps·mean)."""
-        norms = {}
-        for k in ("ics", "bcs", "res"):
-            g = grad(lambda p: self.losses(p, batch)[k])(params)
-            flat = jnp.concatenate([x.reshape(-1) for x in tree_leaves(g)])
-            norms[k] = jnp.linalg.norm(flat)
-        mean_norm = jnp.mean(jnp.stack(list(norms.values())))
+    # ----- NTK weighting (their scheme="ntk") -----
+
+    def _pointwise_ntk(self, fn, params, ts, xs):
+        """Per-point NTK diagonal ||∇_θ fn(params, t, x)||², computed in
+        memory-bounded segments via lax.map (the full per-point jacobian
+        over ~400k params would not fit at batch 8192)."""
+        n = ts.shape[0]
+        seg = _segment_size(n)
+
+        def per_point(t, x):
+            g = grad(fn, argnums=0)(params, t, x)
+            return sum(jnp.vdot(v, v).real for v in tree_leaves(g))
+
+        def one_segment(pair):
+            t_s, x_s = pair
+            return vmap(per_point)(t_s, x_s)
+
+        out = jax.lax.map(
+            one_segment, (ts.reshape(-1, seg), xs.reshape(-1, seg))
+        )
+        return out.reshape(n)
+
+    def compute_ntk_weights(self, params, batch):
+        """jaxpi's NTK balancing: per-block mean NTK diagonal, with the
+        res block chunk-averaged and multiplied by the causal weights;
+        w_k = mean_ntk / (ntk_k + 1e-5·mean_ntk)."""
+        ics_ntk = self._pointwise_ntk(
+            self.u_net, params,
+            jnp.full_like(self.x_star, self.t0), self.x_star,
+        )
+
+        t_sorted = batch[:, 0].sort()
+        res_ntk = self._pointwise_ntk(
+            self.r_net, params, t_sorted, batch[:, 1]
+        )
+        res_ntk = res_ntk.reshape(self.num_chunks, -1).mean(axis=1)
+        _, _, causal_w = self._causal_l_w(params, batch)
+        res_ntk = res_ntk * causal_w
+
+        ntk = {"ics": jnp.mean(ics_ntk), "res": jnp.mean(res_ntk)}
+        mean_ntk = jnp.mean(jnp.stack(list(ntk.values())))
         return {
-            k: mean_norm / (n + 1e-5 * mean_norm) for k, n in norms.items()
+            k: mean_ntk / (v + 1e-5 * mean_ntk) for k, v in ntk.items()
         }
 
     # ----- Gnome's stacked view of the same weighted loss -----
 
-    def stacked_residuals(self, params, weights, batch, x_idx, t_idx):
+    def stacked_residuals(self, params, weights, batch, x_idx):
         ics_r = self.ics_residual(params, x_idx)
-        bc1, bc2 = self.bc_residuals(params, t_idx)
         res_scaled = self.causal_res(params, batch)
         return gnome_jax.stack_residuals(
-            [ics_r, bc1, bc2, res_scaled],
-            [weights["ics"], weights["bcs"], weights["bcs"], weights["res"]],
+            [ics_r, res_scaled],
+            [weights["ics"], weights["res"]],
         )
 
     # ----- eval -----
@@ -215,8 +242,6 @@ class BurgersProblem:
 
 
 def sample_res_batch(key, dom, n):
-    """Uniform collocation draws over the (t, x) domain, like jaxpi's
-    UniformSampler."""
     return jax.random.uniform(
         key, (n, 2), minval=dom[:, 0], maxval=dom[:, 1]
     )
@@ -229,39 +254,37 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--optimizer", required=True,
                    choices=["gnome", "soap", "adam"])
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--steps", type=int, default=100000,
-                   help="jaxpi sota budget.")
+    p.add_argument("--steps", type=int, default=300000,
+                   help="jaxpi's Allen-Cahn budget.")
     p.add_argument("--batch-size", type=int, default=8192,
-                   help="Res collocation batch (jaxpi sota: 8192). Must be "
+                   help="Res collocation batch (jaxpi: 8192). Must be "
                         "divisible by --num-chunks.")
     p.add_argument("--aux-batch-size", type=int, default=256,
                    help="Gnome aux res batch. Must be divisible by "
                         "--num-chunks.")
     p.add_argument("--aux-stride", type=int, default=8,
-                   help="Stride subsampling the ics/bc grids for Gnome's "
-                        "aux closure.")
+                   help="Stride subsampling the ics grid for Gnome's aux "
+                        "closure.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.999,
-                   help="Baseline beta2 (jaxpi sota). Gnome uses "
-                        "--gnome-beta2.")
-    p.add_argument("--gnome-beta2", type=float, default=0.99,
-                   help="Gnome second-moment / shampoo EMA.")
+                   help="Baseline beta2 (jaxpi). Gnome uses --gnome-beta2.")
+    p.add_argument("--gnome-beta2", type=float, default=0.99)
     p.add_argument("--eps", type=float, default=1e-6,
                    help="Gnome curvature damping (baselines keep 1e-8).")
-    p.add_argument("--warmup-steps", type=int, default=5000,
-                   help="Baseline linear warmup (jaxpi sota). Gnome uses "
-                        "--gnome-warmup.")
+    p.add_argument("--warmup-steps", type=int, default=5000)
     p.add_argument("--gnome-warmup", type=int, default=200)
     p.add_argument("--decay-rate", type=float, default=0.9)
-    p.add_argument("--decay-steps", type=int, default=1000)
-    p.add_argument("--schedule-free", action="store_true",
-                   help="Wrap the baseline in optax.contrib.schedule_free + "
-                        "global-norm clip 1.0 (jaxpi pirate_soap treatment).")
+    p.add_argument("--decay-steps", type=int, default=5000,
+                   help="jaxpi's AC config decays 0.9 per 5000 (Burgers "
+                        "used 1000).")
+    p.add_argument("--schedule-free", action="store_true")
     p.add_argument("--hidden", type=int, default=256)
     p.add_argument("--num-layers", type=int, default=4)
     p.add_argument("--rwf-mean", type=float, default=1.0)
     p.add_argument("--rwf-stddev", type=float, default=0.1)
+    p.add_argument("--fourier-scale", type=float, default=2.0)
+    p.add_argument("--fourier-dim", type=int, default=256)
     p.add_argument("--causal-tol", type=float, default=1.0)
     p.add_argument("--num-chunks", type=int, default=32)
     p.add_argument("--weight-update-every", type=int, default=1000)
@@ -284,8 +307,10 @@ def train(args: argparse.Namespace) -> str:
         in_dim=2, hidden=args.hidden, out_dim=1,
         num_layers=args.num_layers,
         rwf_mean=args.rwf_mean, rwf_stddev=args.rwf_stddev,
+        period=(math.pi,), period_axes=(1,),
+        fourier_scale=args.fourier_scale, fourier_dim=args.fourier_dim,
     )
-    prob = BurgersProblem(
+    prob = AllenCahnProblem(
         u_ref, t_star, x_star, args.causal_tol, args.num_chunks, apply_fn
     )
 
@@ -294,8 +319,7 @@ def train(args: argparse.Namespace) -> str:
     params = init_fn(k_model)
     n_params = sum(p.size for p in tree_leaves(params))
 
-    weights = {"ics": jnp.asarray(1.0), "bcs": jnp.asarray(1.0),
-               "res": jnp.asarray(1.0)}
+    weights = {"ics": jnp.asarray(1.0), "res": jnp.asarray(1.0)}
 
     # ----- optimizers -----
     schedule = None
@@ -321,9 +345,7 @@ def train(args: argparse.Namespace) -> str:
         opt_state = opt.init(params)
 
         x_aux = jnp.arange(0, x_star.shape[0], args.aux_stride)
-        t_aux = jnp.arange(0, t_star.shape[0], args.aux_stride)
         x_all = jnp.arange(x_star.shape[0])
-        t_all = jnp.arange(t_star.shape[0])
 
         @jax.jit
         def train_step(params, opt_state, key, weights):
@@ -333,12 +355,11 @@ def train(args: argparse.Namespace) -> str:
                                          args.aux_batch_size)
 
             def main_fn(p):
-                r = prob.stacked_residuals(p, weights, batch, x_all, t_all)
+                r = prob.stacked_residuals(p, weights, batch, x_all)
                 return r, jnp.zeros_like(r)
 
             def aux_fn(p):
-                r = prob.stacked_residuals(p, weights, aux_batch,
-                                           x_aux, t_aux)
+                r = prob.stacked_residuals(p, weights, aux_batch, x_aux)
                 return r, jnp.zeros_like(r)
 
             new_params, loss, new_state, key = opt.step(
@@ -347,8 +368,6 @@ def train(args: argparse.Namespace) -> str:
             return new_params, loss, new_state, key
 
     else:
-        # jaxpi's baseline schedule: linear warmup joined to exponential
-        # decay (their _create_optimizer).
         exp_decay = optax.exponential_decay(
             init_value=args.lr,
             transition_steps=args.decay_steps,
@@ -370,7 +389,7 @@ def train(args: argparse.Namespace) -> str:
             opt_cfg = dict(
                 lr=args.lr, weight_decay=0.0,
                 betas=(args.beta1, args.beta2), eps=1e-8,
-                precondition_frequency=2,  # jaxpi hardcodes 2 for SOAP
+                precondition_frequency=2,
                 precondition_1d=False,
             )
             tx = soap(
@@ -410,7 +429,7 @@ def train(args: argparse.Namespace) -> str:
             return new_params, loss, new_state, key
 
     update_weights = jax.jit(
-        lambda params, batch: prob.compute_grad_norm_weights(params, batch)
+        lambda params, batch: prob.compute_ntk_weights(params, batch)
     )
     eval_rel_l2 = jax.jit(prob.rel_l2)
 
@@ -418,20 +437,23 @@ def train(args: argparse.Namespace) -> str:
         "optimizer": args.optimizer,
         "framework": "jax",
         "jax_version": jax.__version__,
-        "protocol": "jaxpi sota.py (pirate branch)",
+        "protocol": "jaxpi allen_cahn default.py (pirate branch)",
         "steps": args.steps,
         "arch": "modified_mlp",
         "hidden": args.hidden,
         "num_layers": args.num_layers,
         "rwf_mean": args.rwf_mean,
         "rwf_stddev": args.rwf_stddev,
+        "fourier_scale": args.fourier_scale,
+        "fourier_dim": args.fourier_dim,
+        "period": "pi (x axis)",
         "n_params": n_params,
         "batch_size": args.batch_size,
         "aux_batch_size": args.aux_batch_size,
         "aux_stride": args.aux_stride,
         "causal_tol": args.causal_tol,
         "num_chunks": args.num_chunks,
-        "weighting": "grad_norm",
+        "weighting": "ntk",
         "weight_update_every": args.weight_update_every,
         "weight_momentum": args.weight_momentum,
         "device": str(jax.devices()[0]),
@@ -448,11 +470,11 @@ def train(args: argparse.Namespace) -> str:
     if not args.quiet:
         print(
             f"[{EXPERIMENT}] {args.optimizer} | modified_mlp "
-            f"{args.num_layers}x{args.hidden} (RWF) | params={n_params:,} | "
-            f"device={jax.devices()[0]}\n"
+            f"{args.num_layers}x{args.hidden} (RWF+RFF+periodic) | "
+            f"params={n_params:,} | device={jax.devices()[0]}\n"
             f"  batch={args.batch_size} aux={args.aux_batch_size} | "
             f"causal(tol={args.causal_tol}, chunks={args.num_chunks}) + "
-            f"grad_norm | steps={args.steps}"
+            f"ntk weighting | steps={args.steps}"
             + (" | schedule_free" if args.schedule_free else ""),
             flush=True,
         )
@@ -496,8 +518,7 @@ def train(args: argparse.Namespace) -> str:
             )
             run.log_val(
                 step + 1, loss=last_avg, lr=lr_now, rel_l2=rl2,
-                w_ics=float(weights["ics"]), w_bcs=float(weights["bcs"]),
-                w_res=float(weights["res"]),
+                w_ics=float(weights["ics"]), w_res=float(weights["res"]),
             )
             if not args.quiet:
                 ms_per = (time.perf_counter() - t_start) / (step + 1) * 1000
@@ -505,7 +526,6 @@ def train(args: argparse.Namespace) -> str:
                     f"  step {step + 1:6d}/{args.steps}  "
                     f"avg_train={last_avg:.4e}  rel_l2={rl2:.3e}  "
                     f"w=({float(weights['ics']):.2f},"
-                    f"{float(weights['bcs']):.2f},"
                     f"{float(weights['res']):.2f})  {ms_per:.1f} ms/step",
                     flush=True,
                 )
