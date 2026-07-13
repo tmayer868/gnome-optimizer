@@ -37,6 +37,11 @@ import math
 import time
 
 import jax
+
+# On Ampere+ GPUs JAX defaults f32 matmuls to TF32 (~3 decimal digits),
+# which degrades second-derivative PDE residuals and the curvature
+# machinery. Force true float32; no-op on CPU.
+jax.config.update("jax_default_matmul_precision", "highest")
 import jax.numpy as jnp
 import optax
 

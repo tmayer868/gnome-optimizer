@@ -55,6 +55,11 @@ import time
 import urllib.request
 
 import jax
+
+# On Ampere+ GPUs JAX defaults f32 matmuls to TF32 (~3 decimal digits),
+# which degrades second-derivative PDE residuals and the curvature
+# machinery. Force true float32; no-op on CPU.
+jax.config.update("jax_default_matmul_precision", "highest")
 import jax.numpy as jnp
 import optax
 from jax import grad, vmap
@@ -237,9 +242,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--aux-batch-size", type=int, default=256,
                    help="Gnome aux res batch. Must be divisible by "
                         "--num-chunks.")
-    p.add_argument("--aux-stride", type=int, default=8,
-                   help="Stride subsampling the ics/bc grids for Gnome's "
-                        "aux closure.")
+    p.add_argument("--aux-ics", type=int, default=64,
+                   help="Fresh random ics-grid points resampled per aux "
+                        "step for Gnome's surrogate.")
+    p.add_argument("--aux-bcs", type=int, default=32,
+                   help="Fresh random bc t-grid points resampled per aux "
+                        "step for Gnome's surrogate.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--beta1", type=float, default=0.9)
     p.add_argument("--beta2", type=float, default=0.999,
@@ -320,17 +328,22 @@ def train(args: argparse.Namespace) -> str:
         )
         opt_state = opt.init(params)
 
-        x_aux = jnp.arange(0, x_star.shape[0], args.aux_stride)
-        t_aux = jnp.arange(0, t_star.shape[0], args.aux_stride)
         x_all = jnp.arange(x_star.shape[0])
         t_all = jnp.arange(t_star.shape[0])
 
         @jax.jit
         def train_step(params, opt_state, key, weights):
-            key, k_main, k_aux = jax.random.split(key, 3)
+            key, k_main, k_aux, k_ic, k_bc = jax.random.split(key, 5)
             batch = sample_res_batch(k_main, prob.dom, args.batch_size)
             aux_batch = sample_res_batch(k_aux, prob.dom,
                                          args.aux_batch_size)
+            # Fresh random ics/bc grid subsets every step (the reference is
+            # gridded, so indices rather than coordinates), not a fixed
+            # stride — coverage accumulates through the curvature EMA.
+            x_aux = jax.random.permutation(k_ic, x_star.shape[0])[
+                :args.aux_ics]
+            t_aux = jax.random.permutation(k_bc, t_star.shape[0])[
+                :args.aux_bcs]
 
             def main_fn(p):
                 r = prob.stacked_residuals(p, weights, batch, x_all, t_all)
@@ -428,7 +441,8 @@ def train(args: argparse.Namespace) -> str:
         "n_params": n_params,
         "batch_size": args.batch_size,
         "aux_batch_size": args.aux_batch_size,
-        "aux_stride": args.aux_stride,
+        "aux_ics": args.aux_ics,
+        "aux_bcs": args.aux_bcs,
         "causal_tol": args.causal_tol,
         "num_chunks": args.num_chunks,
         "weighting": "grad_norm",

@@ -436,8 +436,8 @@ def gnome(
             # region in both bases.
             def newton_update(m, v, q):
                 upd = (m / bc1) / (v / bc2 + eps)
-                if clip is not None:
-                    upd = jnp.clip(upd, -clip, clip)
+                # if clip is not None:
+                #     upd = jnp.clip(upd, -clip, clip)
                 upd = _project_back(upd, q)
                 if clip is not None:
                     upd = jnp.clip(upd, -clip, clip)
