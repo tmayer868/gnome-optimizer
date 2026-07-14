@@ -15,12 +15,17 @@ problem we replicate).
 
 Protocol = jaxpi wave sota.py / paper appendix G.4: ModifiedMlp 4x256 +
 RWF + trainable Random Fourier features (scale 10 — both sources agree;
-wave's high frequencies need it), NO periodic embedding; four loss blocks
-{u0, u_t0, bcs, res} with causal weighting + grad-norm balancing; SOAP
-β1=0.99 with their warmup + exponential-decay schedule; Gnome at a FIXED
-lr. Repo/paper splits: causal tol 1e-2 (repo sota) vs 1.0 (paper Table 6)
-— default 1e-2 because wave residual amplitudes are O((4cπ)²)≈630 and
-tol 1.0 collapses the causal gate at cold init; chunks 16 (paper) vs 32
+wave's high frequencies need it), NO periodic embedding. Four SOFT loss
+blocks {u0, u_t0, bcs, res} (paper-faithful) with causal weighting +
+grad-norm balancing. The residual is normalized by (4cπ)² so per-chunk
+causal losses are O(1) and causal tol = 1.0 (paper Table 6) behaves as
+designed — the repo's 1e-2 was only a scale-compensation for the
+un-normalized O(630) residual; this is a pure reparametrization (the
+zero set is unchanged), shared by both optimizers. Gnome needs eps=1e-3
+here, not the 1e-6 that worked on Poisson/Burgers — wave's curvature
+estimate is unreliable in many directions and eps is the LM trust floor
+(see the eps note in the repo). SOAP β1=0.99 with their warmup +
+exponential-decay schedule; Gnome at a FIXED lr. Chunks 16 (paper) vs 32
 (repo); steps 1e5 (paper) vs 2e5 (repo).
 
 Paper reference: Table 1 (PirateNet-assisted): Adam 5.15e-5 |
@@ -41,22 +46,22 @@ OPTIMIZERS = ("gnome", "soap")   # run order
 MATMUL_PRECISION = "highest"
 
 # --- Gnome (fixed lr, no schedule) ---
-GNOME_LR = 5e-3                  # gnome likes the largest stable lr —
+GNOME_LR = 1e-2                  # gnome likes the largest stable lr —
                                  # crank it (with more warmup) once a
                                  # baseline run survives
-GNOME_BETAS = (0.99, 0.999)      # β1 0.99 = ~10x noise averaging
-GNOME_EPS = 1e-6                 # curvature damping in m̂/(v̂+eps)
+GNOME_BETAS = (0.9, 0.99)      # β1 0.99 = ~10x noise averaging
+GNOME_EPS = 1e-3                 # curvature damping in m̂/(v̂+eps)
 GNOME_CLIP = 1.0                 # trust-region clip
 GNOME_CLIP_MODE = "param"        # "both" | "rotated" | "param";
                                  # "param" won the Burgers 3-way ablation
-GNOME_WARMUP = 5_000              # internal linear lr warmup (steps)
+GNOME_WARMUP = 2_000              # internal linear lr warmup (steps)
 GNOME_PRECOND_FREQ = 10          # eigenbasis refresh interval
 GNOME_AUX_BATCH = 256            # aux (surrogate) res points per step
-GNOME_AUX_ICS = 64               # fresh IC points resampled per aux step
+GNOME_AUX_ICS = 64               # fresh IC x-points resampled per aux step
 GNOME_AUX_BCS = 64               # fresh BC t-points resampled per aux step
 
 # --- SOAP (paper protocol) ---
-SOAP_LR = 1e-3
+SOAP_LR = 1e-2
 # Paper appendix G.4: β1=0.99, β2=0.999 for SOAP (their ablation optimum).
 SOAP_BETAS = (0.99, 0.999)
 SOAP_WARMUP = 5_000              # linear warmup steps
@@ -71,8 +76,9 @@ HIDDEN = 256
 NUM_LAYERS = 4
 RWF_MEAN, RWF_STDDEV = 1.0, 0.1
 FOURIER_SCALE, FOURIER_DIM = 10.0, 256  # scale 10: paper + repo agree
-CAUSAL_TOL = 1e-2                # repo sota (paper Table 6: 1.0 — see
-                                 # docstring; likely too strict here)
+CAUSAL_TOL = 1.0                 # paper Table 6; valid because r_net is
+                                 # normalized by (4cπ)² so per-chunk causal
+                                 # losses are O(1) (see RES_SCALE)
 NUM_CHUNKS = 16                  # paper Table 6 (repo sota: 32)
 WEIGHT_UPDATE_EVERY = 1_000      # grad-norm refresh (paper+repo agree on
 WEIGHT_MOMENTUM = 0.9            # the grad_norm scheme for wave)
@@ -445,19 +451,27 @@ DOM = jnp.array([[0.0, 1.0], [0.0, 1.0]])
 M_CAUSAL = jnp.triu(jnp.ones((NUM_CHUNKS, NUM_CHUNKS)), k=1).T
 
 
+# Wave 2nd derivatives peak at O((4cπ)²·A); normalize the residual by this
+# so per-chunk causal losses are O(1) and CAUSAL_TOL=1.0 (paper) behaves.
+RES_SCALE = (4.0 * C_SPEED * math.pi) ** 2
+
+
 def u_net(params, t, x):
     return apply_model(params, jnp.stack([t, x]))[0]
 
 
 def r_net(params, t, x):
-    """Wave residual, matching jaxpi: u_tt − c²·u_xx."""
+    """Wave residual, matching jaxpi: (u_tt − c²·u_xx), normalized by
+    RES_SCALE so per-chunk causal losses are O(1) and CAUSAL_TOL=1.0
+    behaves (a scale reparametrization — the zero set is unchanged)."""
     u_tt = grad(grad(u_net, argnums=1), argnums=1)(params, t, x)
     u_xx = grad(grad(u_net, argnums=2), argnums=2)(params, t, x)
-    return u_tt - C_SPEED**2 * u_xx
+    return (u_tt - C_SPEED**2 * u_xx) / RES_SCALE
 
 
-# ICs/BCs are analytic, so these take coordinate arrays directly — the
-# aux closure resamples fresh points every step (no fixed stride).
+# Soft IC/BC loss blocks (paper protocol). The aux closure resamples fresh
+# IC x-points and BC t-points every step (coverage through the curvature
+# EMA); ICs/BCs are analytic so these take coordinates directly.
 
 def u0_residual(params, xs):
     u_pred = vmap(u_net, (None, None, 0))(params, T0, xs)
@@ -570,9 +584,8 @@ for opt_name in OPTIMIZERS:
             key, k_main, k_aux, k_ic, k_bc = jax.random.split(key, 5)
             batch = sample_batch(k_main, BATCH_SIZE)
             aux_batch = sample_batch(k_aux, GNOME_AUX_BATCH)
-            # Fresh analytic IC/BC points every step: the curvature along
-            # the residual's null space (d'Alembert modes) comes only from
-            # these blocks, so coverage-through-time matters.
+            # Fresh analytic IC x-points and BC t-points every aux step
+            # (coverage through the curvature EMA).
             xs_ic_aux = jax.random.uniform(k_ic, (GNOME_AUX_ICS,))
             ts_bc_aux = jax.random.uniform(k_bc, (GNOME_AUX_BCS,))
 
@@ -633,12 +646,10 @@ for opt_name in OPTIMIZERS:
             hist["rel_l2"].append(rl2)
             hist["loss"].append(loss_v)
             ms = (time.time() - t_start) / (step + 1) * 1000
+            wstr = ",".join(f"{k}={float(v):.1f}"
+                            for k, v in weights.items())
             print(f"  step {step + 1:6d}/{STEPS}  loss={loss_v:.3e}  "
-                  f"rel_l2={rl2:.3e}  "
-                  f"w=({float(weights['u0']):.1f},"
-                  f"{float(weights['u_t0']):.1f},"
-                  f"{float(weights['bcs']):.1f},"
-                  f"{float(weights['res']):.2f})  {ms:.1f} ms/step",
+                  f"rel_l2={rl2:.3e}  w=({wstr})  {ms:.1f} ms/step",
                   flush=True)
 
     histories[opt_name] = hist

@@ -41,7 +41,7 @@ MATMUL_PRECISION = "highest"
 # verified stable; if you want to try 1e-2, raise GNOME_WARMUP to ~1000.
 GNOME_LR = 1e-2
 GNOME_BETAS = (0.9, 0.99)        # (grad EMA, curvature/shampoo EMA)
-GNOME_EPS = 1e-6                 # curvature damping in m̂/(v̂+eps)
+GNOME_EPS = 1e-3                 # curvature damping in m̂/(v̂+eps)
 GNOME_CLIP = 1.0                 # trust-region clip
 # Where the trust-region clip applies:
 #   "both"    — eigenbasis AND after rotating back (original Gnome rule).
@@ -56,7 +56,7 @@ GNOME_CLIP = 1.0                 # trust-region clip
 #               clip becomes a crash barrier (localized/tail events) rather
 #               than an always-on speed limit. Same worst-case step norm
 #               as "rotated".
-GNOME_CLIP_MODE = "both"         # "both" | "rotated" | "param"
+GNOME_CLIP_MODE = "param"         # "both" | "rotated" | "param"
 GNOME_WARMUP = 2000               # internal linear lr warmup (steps)
 GNOME_PRECOND_FREQ = 10          # eigenbasis refresh interval
 GNOME_AUX_BATCH = 256            # aux (surrogate) res points per step

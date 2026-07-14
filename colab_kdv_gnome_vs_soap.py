@@ -36,7 +36,7 @@ STEPS = 100_000         # paper Table 6 (repo config: 200_000)
 BATCH_SIZE = 8192       # paper Table 6 (repo config: 4096); divide NUM_CHUNKS
 SEED = 0
 LOG_EVERY = 100
-OPTIMIZERS = ("gnome", "soap")   # run order
+OPTIMIZERS = ("soap", "gnome")   # run order
 
 # "highest" = true float32 everywhere. "default" = TF32 model matmuls on
 # Ampere+ GPUs; optimizer internals stay exact either way.
