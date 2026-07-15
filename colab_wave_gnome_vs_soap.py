@@ -49,7 +49,7 @@ MATMUL_PRECISION = "highest"
 GNOME_LR = 1e-2                  # gnome likes the largest stable lr —
                                  # crank it (with more warmup) once a
                                  # baseline run survives
-GNOME_BETAS = (0.9, 0.99)      # β1 0.99 = ~10x noise averaging
+GNOME_BETAS = (0.99, 0.999)      # β1 0.99 = ~10x noise averaging
 # EXPERIMENT: relative (condition-number) damping — the denominator floor
 # is eps·λ_max (per param tensor's largest curvature) instead of a fixed
 # absolute eps. So eps is now a scale-free ratio: directions flatter than
@@ -81,10 +81,14 @@ HIDDEN = 256
 NUM_LAYERS = 4
 RWF_MEAN, RWF_STDDEV = 1.0, 0.1
 FOURIER_SCALE, FOURIER_DIM = 10.0, 256  # scale 10: paper + repo agree
-CAUSAL_TOL = 1.0                 # paper Table 6; valid because r_net is
+CAUSAL_TOL = 0.0                 # paper Table 6; valid because r_net is
                                  # normalized by (4cπ)² so per-chunk causal
-                                 # losses are O(1) (see RES_SCALE)
+                                 # losses are O(1) (see RES_SCALE).
+                                 # SET 0.0 TO DISABLE causal weighting
+                                 # (w=exp(0)=1 for all chunks → plain res MSE).
 NUM_CHUNKS = 16                  # paper Table 6 (repo sota: 32)
+USE_GRAD_NORM = False             # False → equal block weights (all 1.0),
+                                 # no adaptive rebalancing.
 WEIGHT_UPDATE_EVERY = 1_000      # grad-norm refresh (paper+repo agree on
 WEIGHT_MOMENTUM = 0.9            # the grad_norm scheme for wave)
 
@@ -641,7 +645,7 @@ for opt_name in OPTIMIZERS:
     for step in range(STEPS):
         params, loss, opt_state, key = train_step(params, opt_state, key,
                                                   weights)
-        if step % WEIGHT_UPDATE_EVERY == 0:
+        if USE_GRAD_NORM and step % WEIGHT_UPDATE_EVERY == 0:
             key, k_w = jax.random.split(key)
             new_w = update_weights_fn(params, sample_batch(k_w, BATCH_SIZE))
             weights = tree_map(
