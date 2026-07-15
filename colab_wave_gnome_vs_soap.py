@@ -50,7 +50,12 @@ GNOME_LR = 1e-2                  # gnome likes the largest stable lr —
                                  # crank it (with more warmup) once a
                                  # baseline run survives
 GNOME_BETAS = (0.9, 0.99)      # β1 0.99 = ~10x noise averaging
-GNOME_EPS = 1e-3                 # curvature damping in m̂/(v̂+eps)
+# EXPERIMENT: relative (condition-number) damping — the denominator floor
+# is eps·λ_max (per param tensor's largest curvature) instead of a fixed
+# absolute eps. So eps is now a scale-free ratio: directions flatter than
+# eps·λ_max get GD-fallback, stiffer ones get Newton. The old absolute
+# 1e-3 does NOT transfer (it was ~1e-7 of λ_max); this is a fresh knob.
+GNOME_EPS = 1e-6                 # relative damping ratio (1/eps ≈ condition cap)
 GNOME_CLIP = 1.0                 # trust-region clip
 GNOME_CLIP_MODE = "param"        # "both" | "rotated" | "param";
                                  # "param" won the Burgers 3-way ablation
@@ -312,7 +317,13 @@ def gnome(lr=1e-3, betas=(0.9, 0.999), shampoo_beta=0.95, eps=1e-4,
             bc2 = 1.0 - beta2**eff
 
             def newton(m, v, q):
-                upd = (m / bc1) / (v / bc2 + eps)
+                # Relative (Levenberg-Marquardt) damping: floor the curvature
+                # denominator at eps·λ_max (this param's largest bias-corrected
+                # curvature), so eps is a scale-free condition-number cap
+                # rather than an absolute number that tracks residual scaling.
+                vhat = v / bc2
+                eff_eps = eps * jnp.max(vhat) + 1e-30  # +tiny: guard all-zero
+                upd = (m / bc1) / (vhat + eff_eps)
                 if clip is not None and clip_mode in ("both", "rotated"):
                     upd = jnp.clip(upd, -clip, clip)
                 upd = _project_back(upd, q)
