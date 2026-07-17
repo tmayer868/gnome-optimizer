@@ -831,8 +831,8 @@ class Gnome(Optimizer):
 
         # Adam/GNOME-style step in the rotated basis.
         update_rot = grad_hat / gnd_hat.add(group["eps"])
-        if clip is not None:
-            update_rot = update_rot.clamp(min=-clip, max=clip)
+        # if clip is not None:
+        #     update_rot = update_rot.clamp(min=-clip, max=clip)
 
         # Rotate back into the parameter basis.
         update = self._project_back(
