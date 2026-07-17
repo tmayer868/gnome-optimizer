@@ -102,15 +102,16 @@ class ModifiedMLP(nn.Module):
     def __init__(self, hidden: int = 256, depth: int = 4):
         super().__init__()
         assert depth >= 1
-        self.enc_u = nn.Linear(2, hidden)
-        self.enc_v = nn.Linear(2, hidden)
+        self.enc_u = nn.Linear(3, hidden)
+        self.enc_v = nn.Linear(3, hidden)
         self.layers = nn.ModuleList(
-            [nn.Linear(2 if i == 0 else hidden, hidden) for i in range(depth)]
+            [nn.Linear(3 if i == 0 else hidden, hidden) for i in range(depth)]
         )
         self.out = nn.Linear(hidden, 1)
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        z = torch.cat([t, x], dim=1)
+        # z = torch.cat([t, x], dim=1)
+        z = torch.cat([t, torch.cos(torch.pi * x), torch.sin(torch.pi * x)], dim=1)
         u = torch.tanh(self.enc_u(z))
         v = torch.tanh(self.enc_v(z))
         h = z
