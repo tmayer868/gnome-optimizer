@@ -79,14 +79,14 @@ class MLP(nn.Module):
     def __init__(self, hidden: int = 256, depth: int = 4):
         super().__init__()
         assert depth >= 2
-        layers: list[nn.Module] = [nn.Linear(2, hidden), nn.Tanh()]
+        layers: list[nn.Module] = [nn.Linear(3, hidden), nn.Tanh()]
         for _ in range(depth - 2):
             layers += [nn.Linear(hidden, hidden), nn.Tanh()]
         layers += [nn.Linear(hidden, 1)]
         self.net = nn.Sequential(*layers)
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([t, x], dim=1))
+        return self.net(torch.cat([t, torch.sin(x * torch.pi), torch.cos(x*torch.pi)], dim=1))
 
 
 class ModifiedMLP(nn.Module):
