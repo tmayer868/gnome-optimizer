@@ -93,7 +93,7 @@ class PeriodicEmbed(nn.Module):
     out_dim = 2 + 4 * (n_freq - 1)
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        in_features = [t * torch.sin(math.pi * t), x * torch.sin(math.pi * x)]
+        in_features = [t, x]
         in_features += [torch.sin(n * math.pi * x) for n in range(1, self.n_freq)]
         in_features += [torch.cos(n * math.pi * x) * x * (1.0 - x) for n in range(1, self.n_freq)]
         in_features += [torch.cos(n * math.pi * t) * t * (1.0 - t) for n in range(1, self.n_freq)]
@@ -355,7 +355,7 @@ def build_optimizer(
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
-            precondition_frequency=10,
+            precondition_frequency=20,
             clip=1.0, warmup=warmup,
             loss="mse", precondition_1d=True,
         )
@@ -364,7 +364,7 @@ def build_optimizer(
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
-            precondition_frequency=10, precondition_1d=True,
+            precondition_frequency=20, precondition_1d=True,
         )
         opt = SOAP(params, **cfg)
     elif name == "adamw":
