@@ -103,22 +103,26 @@ class PeriodicEmbed(nn.Module):
 
 class FourierEmbed(nn.Module):
     """Random Fourier features (Tancik et al. 2020): embeds ``(t, x)`` as
-    ``[sin(zB), cos(zB)]`` with ``B ~ N(0, scale²)``. ``B`` is a trainable
-    parameter (``scale`` sets its initialization spread); ``embed_dim`` must
-    be even.
+    ``[sin(zB), cos(zB), t, x]``. Total output dimension matches ``embed_dim``.
     """
 
     def __init__(self, embed_dim: int = 128, scale: float = 2.0):
         super().__init__()
         assert embed_dim % 2 == 0, "fourier embed_dim must be even"
         self.out_dim = embed_dim
-        B = torch.randn(2, embed_dim // 2) * scale
-        self.B = nn.Parameter(B)
+
+        # Calculate the size needed for the projection
+        # We subtract 2 because t and x (2 features) are concatenated at the end
+        proj_dim = (embed_dim - 2) // 2
+
+        # 1. Correct logic: Pass string name first, do NOT assign the function output to a variable
+        B_tensor = torch.randn(2, proj_dim) * scale
+        self.register_buffer('B', B_tensor)
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        p = torch.cat([t, x], dim=1) @ self.B
-        return torch.cat([torch.sin(p), torch.cos(p)], dim=1)
-
+        # Assuming t and x have shape (batch_size, 1)
+        p = torch.cat([t, x], dim=1) @ self.B  # self.B is now safely available
+        return torch.cat([torch.sin(p), torch.cos(p), t, x], dim=1)
 
 def build_embedding(embed: str, fourier_dim: int, fourier_scale: float
                     ) -> nn.Module:
@@ -396,7 +400,7 @@ def parse_args() -> argparse.Namespace:
                         "features (the spectral aid wave wants).")
     p.add_argument("--fourier-dim", type=int, default=128,
                    help="Fourier embedding output dim (even). --embed fourier.")
-    p.add_argument("--fourier-scale", type=float, default=2.0,
+    p.add_argument("--fourier-scale", type=float, default=8.0,
                    help="Fourier frequency spread (B ~ N(0, scale²)). THE knob "
                         "— jaxpi uses ~10 for wave; sweep it. --embed fourier.")
     p.add_argument("--hard-bc", action="store_true",
