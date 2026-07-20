@@ -92,14 +92,20 @@ class MLP(nn.Module):
     def __init__(self, hidden: int = 256, depth: int = 4):
         super().__init__()
         assert depth >= 2
-        layers: list[nn.Module] = [nn.Linear(3, hidden), nn.Tanh()]
+        layers: list[nn.Module] = [nn.Linear(2, hidden), nn.Tanh()]
         for _ in range(depth - 2):
             layers += [nn.Linear(hidden, hidden), nn.Tanh()]
         layers += [nn.Linear(hidden, 1)]
         self.net = nn.Sequential(*layers)
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        z = torch.cat([t, torch.cos(math.pi * x), torch.sin(math.pi * x)], dim=1)
+        z = torch.cat([t,
+                       x,
+                       # torch.cos(math.pi * x),
+                       # torch.sin(math.pi * x),
+                       # torch.cos(math.pi * t),
+                       # torch.sin(math.pi * t),
+                       ], dim=1)
         return self.net(z)
 
 
