@@ -827,8 +827,6 @@ class Gnome(Optimizer):
             shape = gnd_hat.shape
             prop = (gnd_hat < group["eps"]).float().mean().item()
             print(f"Layer Shape: {shape} || Proportion < eps {prop:.5f}")
-        if clip is not None:
-            update_rot = update_rot.clamp(min=-clip, max=clip)
 
         # Rotate back into the parameter basis.
         update = self._project_back(
