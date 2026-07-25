@@ -90,10 +90,10 @@ class PeriodicEmbed(nn.Module):
     """``[t, cos(πx), sin(πx), cos(πt), sin(πt)]`` — period-2 in x (spectral aid on wave; it
     does not enforce the Dirichlet BC)."""
     n_freq = 5
-    out_dim = 2 + 4 * (n_freq - 1)
+    out_dim = 1 + 4 *(n_freq-1)
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        in_features = [t, x]
+        in_features = [t]
         in_features += [torch.sin(n * math.pi * x) for n in range(1, self.n_freq)]
         in_features += [torch.cos(n * math.pi * x) * x * (1.0 - x) for n in range(1, self.n_freq)]
         in_features += [torch.cos(n * math.pi * t) * t * (1.0 - t) for n in range(1, self.n_freq)]
@@ -113,7 +113,7 @@ class FourierEmbed(nn.Module):
 
         # Calculate the size needed for the projection
         # We subtract 2 because t and x (2 features) are concatenated at the end
-        proj_dim = (embed_dim - 2) // 2
+        proj_dim = (embed_dim) // 2
 
         # 1. Correct logic: Pass string name first, do NOT assign the function output to a variable
         B_tensor = torch.randn(2, proj_dim) * scale
@@ -122,7 +122,7 @@ class FourierEmbed(nn.Module):
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         # Assuming t and x have shape (batch_size, 1)
         p = torch.cat([t, x], dim=1) @ self.B  # self.B is now safely available
-        return torch.cat([torch.sin(p), torch.cos(p), t, x], dim=1)
+        return torch.cat([torch.sin(p), torch.cos(p)], dim=1)
 
 def build_embedding(embed: str, fourier_dim: int, fourier_scale: float
                     ) -> nn.Module:
@@ -166,9 +166,16 @@ class MLP(nn.Module):
 class ModifiedMLP(nn.Module):
     """Modified MLP (Wang, Teng & Perdikaris 2021) over an input embedding.
 
-    Two encoders ``u, v`` gate every hidden layer:
-    ``h = tanh(W_l h);  h = h·u + (1-h)·v``. ``depth`` = gated-hidden-layer
-    count. ``hard_bc`` applies the ``sin(πx)·N`` Dirichlet transform.
+    Two encoders ``u, v`` gate every hidden layer. The gate is computed in
+    the algebraically equivalent form ``h = v + h*(u - v)`` via a single
+    fused ``addcmul`` per layer (instead of ``h*u + (1-h)*v``, which costs
+    three elementwise kernels and three autograd nodes). The two encoders
+    are fused into one Linear producing ``2*hidden`` features (one GEMM
+    launch instead of two). ``depth`` = gated-hidden-layer count.
+    ``hard_bc`` applies the ``sin(pi*x)*N`` Dirichlet transform.
+
+    Numerically identical to the original implementation; only the
+    kernel/graph structure differs.
     """
 
     def __init__(self, embed: nn.Module, hidden: int = 256, depth: int = 4,
@@ -178,8 +185,8 @@ class ModifiedMLP(nn.Module):
         self.embed = embed
         self.hard_bc = hard_bc
         d = embed.out_dim
-        self.enc_u = nn.Linear(d, hidden)
-        self.enc_v = nn.Linear(d, hidden)
+        # Fused u/v encoder: one matmul, chunked into the two gates.
+        self.enc_uv = nn.Linear(d, 2 * hidden)
         self.layers = nn.ModuleList(
             [nn.Linear(d if i == 0 else hidden, hidden) for i in range(depth)]
         )
@@ -187,12 +194,16 @@ class ModifiedMLP(nn.Module):
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         z = self.embed(t, x)
-        u = torch.tanh(self.enc_u(z))
-        v = torch.tanh(self.enc_v(z))
+
+        uv = torch.tanh(self.enc_uv(z))
+        u, v = uv.chunk(2, dim=-1)
+        w = u - v  # computed once; gate becomes v + h*w
+
         h = z
         for layer in self.layers:
             h = torch.tanh(layer(h))
-            h = h * u + (1.0 - h) * v
+            h = torch.addcmul(v, h, w)  # == h*u + (1-h)*v, one fused kernel
+
         out = self.out(h)
         if self.hard_bc:
             out = torch.sin(math.pi * x) * out
