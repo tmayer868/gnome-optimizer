@@ -209,6 +209,7 @@ def build_optimizer(
     name: str, params, lr: float, weight_decay: float,
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
     beta1: float = 0.9, beta2: float = 0.99,
+    trust_region: float = 1.0,
 ):
     """Construct the optimizer and its LR schedule.
 
@@ -223,7 +224,8 @@ def build_optimizer(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10,
-            clip=1.0, warmup=warmup,
+            clip=None, warmup=warmup,
+            trust_radius=(trust_region if trust_region > 0 else None),
             loss="mse", precondition_1d=True,
         )
         return Gnome(params, **cfg), cfg, None
@@ -264,6 +266,13 @@ def parse_args() -> argparse.Namespace:
                    help="Boundary points per edge (total BC sample is 4× this).")
     p.add_argument("--aux-frac", type=float, default=0.05)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--trust-region", type=float, default=1.0,
+                   help="Gnome per-coordinate update bound: lambda is set to "
+                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
+                        "so no coordinate moves more than lr*trust_region in "
+                        "a step. Larger -> weaker bound -> longer steps. "
+                        "0 disables it, falling back to plain m̂/(v̂+eps) "
+                        "damping.")
     p.add_argument("--eps", type=float, default=1e-6,
                    help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
                         "-> more gradient-descent-like, smaller -> fuller Newton "
@@ -283,6 +292,14 @@ def parse_args() -> argparse.Namespace:
                    help="Final-LR fraction for the baseline cosine decay: 0.0 "
                         "decays to zero (standard treatment), 1.0 disables "
                         "decay. Gnome (MSE) never decays regardless.")
+    p.add_argument("--float64", action="store_true",
+                   help="Run in double precision on CPU. float32 floors "
+                        "rel_L2 around 1e-5..1e-6; the ENGD high-accuracy "
+                        "benchmark (Müller & Zeinhofer) reaches ~1e-7, which "
+                        "is only reproducible in float64. Forces device=cpu "
+                        "(MPS has no float64) and sets the global default "
+                        "dtype to float64 so params, samples and the "
+                        "reference are all double.")
     p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--quiet", action="store_true")
@@ -290,14 +307,22 @@ def parse_args() -> argparse.Namespace:
 
 
 def train(args: argparse.Namespace) -> str:
+    # float64 must come before any tensor/model construction so params,
+    # samples and the reference grid are all double. MPS has no float64
+    # support, so double precision forces CPU.
+    if args.float64:
+        torch.set_default_dtype(torch.float64)
+        device = torch.device("cpu")
+    else:
+        device = pick_device()
     torch.manual_seed(args.seed)
-    device = pick_device()
     model = PINN(hidden=args.hidden, depth=args.depth).to(device)
     opt, opt_cfg, scheduler = build_optimizer(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
         warmup=args.warmup_steps, total_steps=args.steps,
         cosine_decay=args.cosine_decay, eps=args.eps,
         beta1=args.beta1, beta2=args.beta2,
+        trust_region=args.trust_region,
     )
 
     n_pde_aux = max(1, int(args.n_pde * args.aux_frac))
@@ -315,6 +340,7 @@ def train(args: argparse.Namespace) -> str:
         "n_pde_aux": n_pde_aux,
         "n_bc_aux_per_edge": n_bc_aux_per_edge,
         "device": str(device),
+        "dtype": str(torch.get_default_dtype()),
         **{f"opt.{k}": v for k, v in opt_cfg.items()},
     }
     run = RunLogger(
@@ -328,7 +354,7 @@ def train(args: argparse.Namespace) -> str:
     if not args.quiet:
         print(
             f"[{EXPERIMENT}] {args.optimizer} | params={n_params:,} | "
-            f"device={device}\n"
+            f"device={device} | dtype={torch.get_default_dtype()}\n"
             f"  N_pde={args.n_pde} N_bc_per_edge={args.n_bc_per_edge} | "
             f"aux={n_pde_aux}/{n_bc_aux_per_edge} | steps={args.steps}",
             flush=True,

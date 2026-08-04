@@ -5,5 +5,6 @@ from ``torch.optim`` and is not re-exported.
 """
 
 from experiments.baselines.soap import SOAP
+from experiments.baselines.engd import ENGD
 
-__all__ = ["SOAP"]
+__all__ = ["SOAP", "ENGD"]

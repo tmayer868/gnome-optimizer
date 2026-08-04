@@ -334,6 +334,7 @@ def build_optimizer(
     name: str, params, lr: float, weight_decay: float,
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
     beta1: float = 0.9, beta2: float = 0.99,
+    trust_region: float = 1.0,
 ):
     """Construct the optimizer and its LR schedule.
 
@@ -348,8 +349,9 @@ def build_optimizer(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10,
-            clip=1.0, warmup=warmup,
-            loss="mse", precondition_1d=True,
+            clip=None, warmup=warmup,
+            trust_radius=(trust_region if trust_region > 0 else None),
+            loss="mse", precondition_1d=True, norm_free=False
         )
         return Gnome(params, **cfg), cfg, None
     if name == "soap":
@@ -391,6 +393,13 @@ def parse_args() -> argparse.Namespace:
                         "higher-order residual eval, so this is not free — "
                         "keep small.")
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--trust-region", type=float, default=1.0,
+                   help="Gnome per-coordinate update bound: lambda is set to "
+                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
+                        "so no coordinate moves more than lr*trust_region in "
+                        "a step. Larger -> weaker bound -> longer steps. "
+                        "0 disables it, falling back to plain m̂/(v̂+eps) "
+                        "damping.")
     p.add_argument("--eps", type=float, default=1e-6,
                    help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
                         "-> more gradient-descent-like, smaller -> fuller Newton "
@@ -433,6 +442,7 @@ def train(args: argparse.Namespace) -> str:
         warmup=args.warmup_steps, total_steps=args.steps,
         cosine_decay=args.cosine_decay, eps=args.eps,
         beta1=args.beta1, beta2=args.beta2,
+        trust_region=args.trust_region,
     )
 
     n_pde_aux = max(8, int(args.n_pde * args.aux_frac))
