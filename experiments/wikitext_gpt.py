@@ -208,7 +208,8 @@ def load_wikitext103(seq_len: int, batch_size: int, seed: int):
 
 # ========================= Optimizer factory =========================
 
-def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float):
+def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float,
+                               trust_region: float = 1.0):
     """Construct one of the four supported optimizers.
 
     Both Gnome variants share every hyperparameter except ``loss=`` so the
@@ -230,6 +231,7 @@ def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float
         betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-4,
         precondition_frequency=10,
         clip=1.0, warmup=0,
+        trust_radius=(trust_region if trust_region > 0 else None),
         precondition_1d=False,
     )
     # aux_batch_size sizes the auxiliary batch the caller builds for
@@ -303,6 +305,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=48,
                    help="Batch size per optimizer step. Raise this to scale "
                         "the effective batch (single-batch steps here).")
+    p.add_argument("--trust-region", type=float, default=1.0,
+                   help="Gnome per-coordinate update bound: lambda is set to "
+                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
+                        "so no coordinate moves more than lr*trust_region in "
+                        "a step. Larger -> weaker bound -> longer steps. "
+                        "0 disables it, falling back to plain m̂/(v̂+eps) "
+                        "damping.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--lr-min-frac", type=float, default=0.1,
                    help="Cosine schedule floor as a fraction of lr (final lr).")
@@ -362,6 +371,7 @@ def main():
 
     opt, opt_cfg = build_optimizer_and_config(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
+        trust_region=args.trust_region,
     )
     K = opt_cfg.get("aux_batch_size", 4) if args.optimizer.startswith("gnome") else 0
 

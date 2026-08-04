@@ -132,7 +132,7 @@ def augment_batch(
         contrast: float = 0.15,
         geo_prob: float = 0.5,
         photo_prob: float = 0.5,
-        cutout_prob: float = 0.35,
+        cutout_prob: float = 0.10,
         cutout_ratio: float = 0.10,
 ) -> torch.Tensor:
     """On-device batched train augmentation for face/age estimation.
@@ -243,7 +243,8 @@ def augment_batch(
 # ----------------------------------------------------------------------
 
 def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_decay,
-                    eps=1e-6, beta1=0.9, beta2=0.99):
+                    eps=1e-6, beta1=0.9, beta2=0.99,
+                    trust_region=1.0):
     """Return ``(optimizer, config, scheduler)``.
 
     MSE regression, so the repo protocol applies: Gnome runs at a fixed
@@ -255,8 +256,9 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10,
-            clip=1.0, warmup=warmup,
-            loss="mse", precondition_1d=False,
+            clip=None, warmup=warmup,
+            trust_radius=(trust_region if trust_region > 0 else None),
+            loss="mse", precondition_1d=False, norm_free=False
         )
         opt = Gnome(params, **cfg)
         # aux_batch_size sizes the auxiliary batch the caller builds for
@@ -309,6 +311,7 @@ def main():
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
         args.warmup_steps, total_steps, args.cosine_decay, eps=args.eps,
         beta1=args.beta1, beta2=args.beta2,
+        trust_region=args.trust_region,
     )
     K = opt_cfg.get("aux_batch_size", 20) if args.optimizer == "gnome" else 0
 
@@ -344,8 +347,8 @@ def main():
             perm = torch.randperm(n_train)
             for i in range(0, n_train, args.batch_size):
                 idx = perm[i:i + args.batch_size]
-                x_batch = x_train_cpu[idx].to(device, non_blocking=True)
-                y_batch = y_train_dev[idx.to(device, non_blocking=True)]
+                x_batch = x_train_cpu[idx].to(device)
+                y_batch = y_train_dev[idx.to(device)]
                 if args.augment:
                     x_batch = augment_batch(
                         x_batch, args.aug_max_rotation_deg, args.aug_max_scale,
@@ -433,6 +436,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--trust-region", type=float, default=1.0,
+                   help="Gnome per-coordinate update bound: lambda is set to "
+                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
+                        "so no coordinate moves more than lr*trust_region in "
+                        "a step. Larger -> weaker bound -> longer steps. "
+                        "0 disables it, falling back to plain m̂/(v̂+eps) "
+                        "damping.")
     p.add_argument("--eps", type=float, default=1e-6,
                    help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
                         "-> more gradient-descent-like, smaller -> fuller Newton "
@@ -441,7 +451,7 @@ def parse_args() -> argparse.Namespace:
                    help="First-moment (momentum) EMA for Gnome and SOAP.")
     p.add_argument("--beta2", type=float, default=0.99,
                    help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
-    p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--model", choices=MODEL_NAMES, default="resnet12",
                    help="Architecture. resnet12 (default) is a custom net "
                         "between resnet8 and resnet18.")
@@ -454,7 +464,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=100,
                    help="LR warmup steps. Baselines warmup then cosine-decay; "
                         "Gnome uses this as its internal warmup only.")
-    p.add_argument("--cosine-decay", type=float, default=0.0,
+    p.add_argument("--cosine-decay", type=float, default=1.0,
                    help="Final-LR fraction for the SOAP/AdamW cosine decay: "
                         "0.0 decays to zero (default), 1.0 disables decay. "
                         "Gnome (MSE) never decays regardless.")
