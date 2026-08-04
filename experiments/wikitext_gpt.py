@@ -230,7 +230,7 @@ def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float
         lr=lr, weight_decay=weight_decay,
         betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-4,
         precondition_frequency=10,
-        clip=1.0, warmup=0,
+        warmup=0,
         trust_radius=(trust_region if trust_region > 0 else None),
         precondition_1d=False,
     )
@@ -319,7 +319,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--max-grad-norm", type=float, default=1.0,
                    help="Global-norm gradient clipping for non-Gnome paths. "
-                        "Gnome uses its own per-coordinate clip (clip=1.0).")
+                        "Gnome uses its own l2 trust region instead.")
     p.add_argument("--seq-len", type=int, default=128)
     p.add_argument("--n-layer", type=int, default=10)
     p.add_argument("--n-head", type=int, default=8)

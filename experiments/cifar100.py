@@ -167,7 +167,7 @@ def build_optimizer(
         lr=lr, weight_decay=weight_decay,
         betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
         precondition_frequency=10,
-        clip=None, warmup=0,
+        warmup=0,
         trust_radius=(trust_region if trust_region > 0 else None),
         # CIFAR-100 moves 4.6 -> 2.6 loss inside ~200 steps, which is ~2 EMA
         # windows at beta2=0.99. Without this the curvature EMA is dominated by

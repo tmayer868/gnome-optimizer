@@ -194,7 +194,7 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10,
-            clip=None, warmup=warmup, loss="mse", precondition_1d=False,
+            warmup=warmup, loss="mse", precondition_1d=False,
             trust_radius=(trust_region if trust_region > 0 else None),
             norm_free=False,
         )

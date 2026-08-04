@@ -10,17 +10,19 @@ into a second-order method:
    therefore aligned with curvature directions of the loss surface rather
    than with the directions of past gradients.
 
-2. **Newton step in the rotated basis, clip as trust region.** SOAP runs an
-   Adam update inside the rotated basis (gradient divided by ``sqrt`` of a
-   second-moment EMA). Gnome runs a Newton step instead — the rotated
+2. **Newton step in the rotated basis, with an l2 trust region.** SOAP runs
+   an Adam update inside the rotated basis (gradient divided by ``sqrt`` of
+   a second-moment EMA). Gnome runs a Newton step instead — the rotated
    gradient divided by the *un-square-rooted* curvature EMA — which is the
    diagonal Gauss-Newton update inside the eigenbasis. A pure Newton step
-   has no built-in step-size control, so Gnome bounds the per-coordinate
-   update with ``clip`` (default ``1.0``) in both the rotated and
-   rotated-back bases. The clip acts as a trust region, not a band-aid:
-   when curvature is well-conditioned it never binds, but it prevents
-   blow-ups from small denominators while the eigenbasis is still warming
-   up.
+   has no built-in step-size control, so Gnome damps it with a
+   Levenberg-Marquardt ``lambda`` chosen as the smallest value satisfying
+   ``||m / (v + lambda)||_2 <= trust_radius * sqrt(P)``, with ``P`` the
+   element count of the parameter tensor. Because ``Q_L`` and ``Q_R`` are
+   orthonormal the l2 norm survives the rotation back, so the bound holds
+   in parameter space too. It is a trust region, not a band-aid: when
+   curvature is well-conditioned it never binds, but it prevents blow-ups
+   from small denominators while the eigenbasis is still warming up.
 
 Gnome supports three explicit loss types — chosen via the ``loss`` constructor
 arg — so that the curvature scaling is unambiguous and reduction-independent:
@@ -79,8 +81,6 @@ import torch
 import torch.nn.functional as F
 from torch.optim.optimizer import Optimizer
 import math
-import numpy as np
-
 
 ClosureReturn = Tuple[torch.Tensor, torch.Tensor]
 
@@ -139,9 +139,9 @@ class Gnome(Optimizer):
     are built from a Hutchinson estimate of the **Generalized Gauss-Newton**
     matrix (not the loss-gradient outer products SOAP uses), and the update
     inside the rotated basis is a **Newton step** — rotated gradient divided
-    by the curvature EMA, no ``sqrt`` — bounded by ``clip`` as a
-    trust-region safeguard rather than tuned by an Adam-style epsilon. See
-    the module docstring for the full design.
+    by the curvature EMA, no ``sqrt`` — bounded by an **l2 trust region**
+    rather than tuned by an Adam-style epsilon. See the module docstring for
+    the full design.
 
     Args:
         params: Iterable of parameters or parameter groups.
@@ -167,31 +167,32 @@ class Gnome(Optimizer):
         precondition_frequency: Steps between eigenbasis refreshes.
         max_precond_dim: Modes larger than this are skipped (no Kronecker
             factor maintained along that dimension).
-        clip: If not None, clamp the per-coordinate update magnitude to
-            ``[-clip, +clip]`` in both the rotated and the rotated-back
-            bases. Acts as a trust-region safeguard: at sensible learning
-            rates it does nothing, but it prevents blow-ups from pathological
-            denominators (e.g. early steps with a noisy eigenbasis estimate).
-            Pass ``None`` to disable.
-        trust_radius: Per-coordinate bound on the update in the rotated
-            basis. ``lambda`` is set to the smallest value (floored at
-            ``eps``) for which ``max_i |m_i / (v_i + lambda)| <=
-            trust_radius``, so the most any one coordinate may move in a step
-            is ``lr * trust_radius``. Closed form, no iteration. Larger =
-            weaker bound = longer steps; ``None`` disables it and falls back
-            to plain ``m / (v + eps)`` damping. Default 1.0, which reproduces
-            Adam's per-coordinate step guarantee while keeping the
-            un-square-rooted Newton denominator wherever the bound is slack.
-            Supersedes ``clip``: same feasible set, but reached by uniform
-            damping rather than per-coordinate projection, so the step
-            direction is not distorted.
+        trust_radius: l2 trust region on the update in the rotated basis.
+            ``lambda`` is set to the smallest value (floored at ``eps``) for
+            which ``||m / (v + lambda)||_2 <= trust_radius * sqrt(P)``, with
+            ``P = p.numel()``. The ``sqrt(P)`` scaling is what makes a single
+            value work across layers of different width: the l2 norm of the
+            step grows as ``sqrt(P)``, so dividing it out leaves
+            ``trust_radius`` as a dimensionless RMS-per-coordinate bound —
+            roughly the typical per-element update magnitude, in units of
+            ``lr``. Typical values are 0.1 to 1.0. Larger = weaker bound =
+            longer steps; ``None`` disables the solve and falls back to plain
+            ``m / (v + eps)`` damping.
+
+            Because the bound is on the l2 norm and the ``Q`` matrices are
+            orthonormal, it transfers exactly to the parameter basis. A
+            uniform ``lambda`` also shrinks the step along the
+            Newton-to-gradient-descent continuum without distorting its
+            direction, unlike a per-coordinate clamp, and no single
+            coordinate with a spuriously small ``v_i`` can set the damping
+            for a whole tensor.
         max_grad_norm: If not None, clip the global L2 norm of the main
             gradient (across all parameters, à la
             ``torch.nn.utils.clip_grad_norm_``) to this value each step before
             it enters the update. Applies only to the main loss gradient, not
-            the curvature surrogate. Default None; the per-coordinate ``clip``
-            trust region is the usual safeguard, but a global norm clip can
-            help on steps where the raw gradient spikes.
+            the curvature surrogate. Default None; the ``trust_radius`` region
+            is the usual safeguard, but a global norm clip can help on steps
+            where the raw gradient spikes.
         warmup: Number of steps over which the learning rate is linearly
             ramped from zero to ``lr``. At step ``k`` (1-indexed) the
             effective learning rate is ``lr * min(k / warmup, 1.0)``. Pass
@@ -222,7 +223,6 @@ class Gnome(Optimizer):
         weight_decay: float = 0.01,
         precondition_frequency: int = 10,
         max_precond_dim: int = 10000,
-        clip: Optional[float] = 1.0,
         max_grad_norm: Optional[float] = None,
         trust_radius: Optional[float] = 1.0,
         norm_free: bool = False,
@@ -240,8 +240,6 @@ class Gnome(Optimizer):
             raise ValueError(f"Invalid beta2: {betas[1]}")
         if eps < 0.0:
             raise ValueError(f"Invalid eps: {eps}")
-        if clip is not None and clip <= 0.0:
-            raise ValueError(f"Invalid clip: {clip}")
         if max_grad_norm is not None and max_grad_norm <= 0.0:
             raise ValueError(f"Invalid max_grad_norm: {max_grad_norm}")
         if trust_radius is not None and trust_radius <= 0.0:
@@ -266,7 +264,6 @@ class Gnome(Optimizer):
             max_precond_dim=max_precond_dim,
             merge_dims=merge_dims,
             precondition_1d=precondition_1d,
-            clip=clip,
             trust_radius=trust_radius,
             warmup=warmup,
         )
@@ -618,120 +615,30 @@ class Gnome(Optimizer):
     # Step
     # ------------------------------------------------------------------
     @staticmethod
-    def _lm_lambda(m, v, rho, eps):
-        """Smallest ``lambda >= eps`` with ``max_i |m_i / (v_i + lambda)| <= rho``.
-
-        Closed form, no iteration. The constraint is per-coordinate:
-
-            |m_i| / (v_i + lambda) <= rho   <=>   lambda >= |m_i| / rho - v_i
-
-        so the binding coordinate is simply the largest right-hand side and
-
-            lambda* = max(eps, max_i(|m_i| / rho - v_i))
-
-        is exact rather than a Newton approximation to a secular equation.
-
-        Why an l-infinity bound on the *update* rather than an l2 trust region
-        on the step length: a length in parameter space has no natural scale,
-        so it has to be manufactured from the curvature estimate (the Cauchy
-        step this replaced used ``||m||^3 / (m' diag(v) m)``). That is
-        self-referential -- when ``v`` is under-estimated the Newton step
-        inflates and the radius inflates with it, so the region cannot bind in
-        exactly the regime it exists for. Here the radius is an absolute
-        number in update space and owes nothing to ``v``.
-
-        The consequences fall out of the formula. As ``v -> 0``,
-        ``lambda* -> ||m||_inf / rho`` and the update tends to
-        ``rho * m / ||m||_inf`` -- normalized gradient descent in the rotated
-        basis, bounded by construction. Misestimated curvature therefore
-        degrades toward GD instead of toward divergence.
-
-        This is also exactly the guarantee Adam gets from its square root
-        (``|m / sqrt(v)| ~ 1``, hence per-coordinate motion ~ ``lr``), but
-        obtained by damping, so the un-square-rooted Newton scaling survives
-        wherever the constraint does not bind. It makes ``clip`` redundant:
-        same feasible set, reached by uniform damping along the Newton->GD
-        family instead of by per-coordinate projection, which distorts the
-        step direction.
-
-        Not the exact argmin of the quadratic model over an l-infinity ball --
-        that minimizer *is* coordinatewise clipping. This is the smallest
-        uniform damping that lands inside the ball, which keeps the step in
-        the right family at the cost of not being the constrained optimum.
-        """
-        return (m.abs() / rho - v).max().clamp_min(eps)
-
-    # ------------------------------------------------------------------
-    # l2 trust region -- NOT WIRED UP. Kept for future work; ``_lm_lambda``
-    # above is what ``_param_step`` calls. See ``_lm_lambda_l2`` for why this
-    # was replaced and how to switch back.
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _cauchy_length(m, v):
-        """``||s_C||``, the length of the exact minimizer of the quadratic
-        model along the steepest-descent ray ``s = -t*m``.
-
-            t*      = m'm / (m' diag(v) m)
-            ||s_C|| = t* * ||m|| = ||m||^3 / (m' diag(v) m)
-
-        The reference length that makes an l2 ``trust_radius`` dimensionless.
-        Invariant to the loss scale: under ``L -> cL`` we get ``m -> cm`` and
-        ``v -> cv``, so ``num/den`` picks up ``c^2/c^3`` and ``sqrt(num)``
-        picks up ``c``, which cancel. It scales as ``sqrt(P)`` in the tensor
-        size -- matching the Newton step's own ``sqrt(P)`` scaling, so the
-        ratio ``T / ||s_N||`` transfers across widths.
-
-        Equivalently ``||s_C|| = ||m|| / v_bar`` with ``v_bar = m'Vm / ||m||^2``
-        the ``m^2``-weighted arithmetic mean curvature. That form makes the
-        failure mode obvious: ``v_bar`` is dominated by the *largest* ``v``,
-        so anything that moves ``m``'s mass onto low-curvature coordinates
-        collapses it and ``||s_C||`` explodes.
-        """
-        m2 = m * m
-        num = m2.sum()                            # ||m||^2
-        den = (v * m2).sum().clamp_min(1e-30)     # m' diag(v) m
-        return (num / den) * num.sqrt()
-
-    @staticmethod
-    def _lm_lambda_l2(m, v, T, eps, lam_prev=None, iters=3):
+    def _lm_lambda(m, v, T, eps, lam_prev=None, iters=3):
         """Smallest lambda >= eps with ``|| m / (v + lambda) ||_2 <= T``.
 
+        The l2 trust-region solve. ``T`` is ``trust_radius * sqrt(P)`` (see
+        the ``trust_radius`` docstring for why ``sqrt(P)``); the caller is
+        ``_param_step``, which runs this once per parameter tensor in the
+        rotated basis.
+
         ``phi(lambda) = || m / (v + lambda) ||_2`` is strictly decreasing, so
-        the root is unique when ``phi(eps) > T``; otherwise ``lambda = eps``
-        (undamped). Newton is run on Hebden's reciprocal form ``1/T - 1/phi``,
-        which is nearly linear in lambda and converges in 2-3 steps. All ops
+        the root is unique when ``phi(eps) > T``; otherwise the constraint is
+        slack and the bracket floor keeps ``lambda = eps`` (an undamped
+        Newton step). Newton is run on Hebden's reciprocal form
+        ``1/T - 1/phi``, which is nearly linear in lambda and converges in
+        2-3 iterations, warm-started from the previous step's lambda inside
+        an analytic bracket derived from ``min(v)`` and ``max(v)``. All ops
         stay on device -- no ``.item()``, no convergence check, no sync.
 
-        Typical wiring, for whoever brings this back::
-
-            T = (trust_radius * self._cauchy_length(grad_hat, gnd_hat)
-                 ).clamp_min(1e-30)      # clamp guards grad_hat == 0 -> 0/0
-            lam = self._lm_lambda_l2(grad_hat, gnd_hat, T, eps,
-                                     lam_prev=state.get("lm_lambda"))
-            state["lm_lambda"] = lam
-
-        Note the radius is a *multiple of the Cauchy length*, so a
-        ``trust_radius`` for this solver is not remotely comparable to the
-        l-infinity one -- the tuned values under this scheme were ~100 for
-        Poisson and ~1e4 for wave, versus ~1 now.
-
-        **Why it was replaced.** ``T`` is derived from ``v`` via the Cauchy
-        length, so the radius inflates exactly when ``v`` is under-estimated
-        and the Newton step inflates -- the region cannot bind in the regime
-        it exists for. It is also badly behaved early in training: ``v_bar``
-        is an ``m^2``-weighted mean whose weights concentrate on few
-        coordinates, and ``grad_m``/``gnd_m`` are stored in the rotated basis
-        without being re-rotated on eigenbasis refresh, so the ``m'Vm``
-        pairing goes stale (``m``'s EMA window is ~1 refresh period,
-        ``v``'s ~10). Both push ``v_bar`` down and ``||s_C||`` up, one-sided.
-
-        **What it still has over the l-infinity rule.** ``phi`` aggregates all
-        P coordinates, so ``lambda(T)`` is globally smooth by the implicit
-        function theorem -- no argmax kinks, and no single coordinate can set
-        the damping for a whole tensor. If the l-infinity rule's outlier
-        sensitivity ever bites, the principled middle ground is an ``l_p``
-        secular equation with large p, which is this solver with the exponent
-        changed.
+        Aggregating over all P coordinates is what keeps ``lambda(T)``
+        smooth: by the implicit function theorem there are no argmax kinks,
+        and no single coordinate with a spuriously small ``v_i`` can set the
+        damping for a whole tensor. (An l-infinity bound would give a closed
+        form instead of this solve, but has exactly that outlier
+        sensitivity; ``l_p`` for large p is the middle ground, and is this
+        solver with the exponent changed.)
 
         **Do not "simplify" the dphi line.** ``.clamp_max`` binds to ``.sum()``
         before the unary minus, so ``-(q/d).sum().clamp_max(-1e-30)`` clamps a
@@ -973,7 +880,6 @@ class Gnome(Optimizer):
 
         state["step"] += 1
         beta1, beta2 = group["betas"]
-        clip = group["clip"]
         warmup = group["warmup"]
         lr = group["lr"]
         if warmup > 0:
@@ -1022,47 +928,40 @@ class Gnome(Optimizer):
         grad_hat = grad_m / bc1
         gnd_hat = gnd_m / bc2
 
-        # Damping in the rotated basis. The bound is per-coordinate and is
-        # imposed here, in the basis where the curvature is diagonal and a
-        # coordinatewise statement is meaningful.
+        # Trust-region damping, solved here in the rotated basis where the
+        # curvature is diagonal and the constraint is therefore a statement
+        # about a diagonal quadratic model.
         #
         #   trust_radius is None -> lam = eps, the plain fixed-damping step
         #   otherwise            -> smallest lam >= eps with
-        #                           max|update| <= trust_radius, in closed form
+        #                           ||update||_2 <= trust_radius * sqrt(P)
         #
-        # Larger trust_radius = weaker bound = longer steps. Since the bound is
-        # on the update itself, ||delta_theta||_inf <= lr * trust_radius in the
-        # rotated basis: the knob is "the most any one coordinate may move, in
-        # units of lr".
+        # Larger trust_radius = weaker bound = longer steps. The bound is on
+        # the update itself, so ||delta_theta||_2 <= lr * trust_radius *
+        # sqrt(P), and since the Q matrices are orthonormal that survives the
+        # projection back: the knob is an RMS-per-coordinate budget, in units
+        # of lr.
         eps = group["eps"]
-        trust_radius = group["trust_radius"] * math.sqrt(p.numel())
+        trust_radius = group["trust_radius"]
         if trust_radius is None:
             lam = eps
         else:
-            # lam = self._lm_lambda(grad_hat, gnd_hat, trust_radius, eps)
-            lam = self._lm_lambda_l2(grad_hat, gnd_hat, trust_radius, eps,
-                                     lam_prev=state.get("lm_lambda"))
+            T = trust_radius * math.sqrt(p.numel())
+            lam = self._lm_lambda(grad_hat, gnd_hat, T, eps,
+                                  lam_prev=state.get("lm_lambda"))
             state["lm_lambda"] = lam
-            # if np.random.rand() < .001:
-            #     print(f"lambda: {lam:.15f}")
 
-        # Adam/GNOME-style step in the rotated basis.
+        # Newton step in the rotated basis, damped by lam.
         update_rot = grad_hat / gnd_hat.add(lam)
-        # if np.random.rand() < .01:
-        #     print(f"lambda: {lam}")
 
-        # Rotate back into the parameter basis.
+        # Rotate back into the parameter basis. Orthonormal Q means the l2
+        # norm — and hence the trust-region bound — carries over exactly, so
+        # no further per-coordinate safeguard is applied here.
         update = self._project_back(
             update_rot, state,
             merge_dims=group["merge_dims"],
             max_precond_dim=group["max_precond_dim"],
         )
-        if clip is not None:
-            # if np.random.rand() < .001:
-            #     was_clipped = (update < -clip) | (update > clip)
-            #     clip_pct = was_clipped.float().mean().item() * 100
-            #     print(f"Clipped: {clip_pct:.5f}% of updates || lambda: {lam:.5f}")
-            update = update.clamp(min=-clip, max=clip)
 
         p.add_(update, alpha=-lr)
         if group["weight_decay"] > 0.0:
