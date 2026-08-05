@@ -4,7 +4,7 @@ Apples-to-apples with the 5-D benchmark of "Improving Energy Natural Gradient
 Descent through Woodbury, Momentum, and Randomization" (arXiv:2505.12149,
 Appendix A.2), restructured into this repo's experiment format.
 
-PDE:  -Δu = f(x),    x ∈ (0, 1)^5
+PDE:  -Δu = f(x),    x ∈ (0, 1)^d
 BC:   u = u*  on  ∂Ω    (Dirichlet)
 
 Manufactured solution::
