@@ -22,25 +22,57 @@ Compared to Burgers, the PINN residual costs roughly 2× more (four
 the headline difficulty is the same family of PDE/IC/BC residual
 stiffness — handled here by the same ``gnome.stack_residuals`` pattern
 with equal block weights (no causal training, no grad-norm weighting).
-Periodicity is enforced as soft constraints on ``u`` and ``u_x`` at the
-endpoints.
 
 Reference: ETDRK4 spectral integrator (Kassam & Trefethen 2005). RK4
 would need a CFL of ``O(dx⁴ / 1)`` because of the 4th-order linear
 operator; ETDRK4 handles the linear part exactly per step and lets us
 take ``dt ≈ 0.025`` even on the large-L domain.
 
-All three optimizers share one plain tanh MLP so the only variable is the
-optimizer. The baselines (SOAP, AdamW) get a linear-warmup + cosine-decay
-schedule (``--cosine-decay`` sets the final-lr fraction; 1.0 disables it);
-Gnome runs at a fixed lr — its Gauss-Newton step self-anneals as the residual
-shrinks.
+Two architectures, selectable via ``--arch``:
+
+* ``mlp`` — a plain tanh MLP (the original setup here).
+* ``modified`` — the modified MLP of Wang, Teng & Perdikaris (2021): two
+  input encoders gate every hidden layer via
+  ``h = tanh(W h); h = h·u + (1-h)·v``. This is the *architecture only* —
+  none of the rest of the jaxpi pipeline (random weight factorization,
+  Fourier features, causal weighting, grad-norm balancing) is ported.
+
+``--embed`` chooses the input representation, and it changes the block
+structure:
+
+* ``none`` (default) feeds raw ``[t, x]``, and periodicity is enforced as
+  *soft* constraints on ``u`` and ``u_x`` at the endpoints — a third
+  residual block. For a 4th-order spatial PDE we would ideally match
+  derivatives up to third order, but C¹ periodicity is the standard PINN
+  treatment for KS and leaves the network enough freedom for the higher
+  derivatives to agree with interior values.
+* ``periodic`` feeds ``[t, cos(2πx/L), sin(2πx/L)]``, which makes the
+  network **exactly** period-L in x. Periodicity then holds to machine
+  precision for every derivative, so the BC block is redundant and is
+  dropped — the loss becomes two blocks (PDE, IC) instead of three. This
+  matches how the Allen-Cahn and KdV experiments here handle their
+  periodic domains, and how jaxpi imposes exact periodic BCs.
+
+All optimizers share the chosen network so the only variable is the
+optimizer. Every optimizer gets the same linear-warmup + cosine-decay schedule
+(``--cosine-decay`` sets the final-lr fraction; 1.0 gives warmup then constant,
+which suits Gnome on MSE since its step self-anneals as the residual shrinks).
+
+``--optimizer adamw+lbfgs`` is the classic PINN recipe (and the SOAP-PINN
+paper's real first-order baseline — nobody runs Adam alone): the AdamW phase
+runs for ``--steps`` as usual, then an L-BFGS phase (``--lbfgs-steps``)
+refines on a *fixed, full-batch* collocation set. L-BFGS builds a curvature
+history from a sequence of (grad, step) pairs, which is only meaningful if
+the objective is the same function each iteration — so, unlike the AdamW
+phase, its points are drawn once and held constant.
 
 Usage:
 
     uv run -m experiments.kuramoto_sivashinsky_pinn --optimizer gnome --seed 0
     uv run -m experiments.kuramoto_sivashinsky_pinn --optimizer soap  --seed 0
-    uv run -m experiments.kuramoto_sivashinsky_pinn --optimizer adamw --seed 0
+    uv run -m experiments.kuramoto_sivashinsky_pinn --optimizer adamw+lbfgs
+    uv run -m experiments.kuramoto_sivashinsky_pinn --optimizer gnome \\
+        --arch modified --embed periodic
 """
 
 from __future__ import annotations
@@ -60,7 +92,7 @@ from experiments.common import (
     DIVERGED_EXIT,
     diverged,
     RunLogger,
-    baseline_cosine_scheduler,
+    cosine_scheduler,
     current_lr,
     pick_device,
 )
@@ -74,24 +106,105 @@ L_DOMAIN = X_MAX - X_MIN
 
 
 # ========================= Model =========================
-class SineActivation(nn.Module):
-    def forward(self, x):
-        return torch.sin(x)
 
-class PINN(nn.Module):
-    """Maps ``(t, x) → u`` via a plain tanh MLP."""
+class RawEmbed(nn.Module):
+    """``[t, x]`` — the raw coordinates. Periodicity must be imposed softly."""
+    out_dim = 2
 
-    def __init__(self, hidden: int = 128, depth: int = 6):
+    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        return torch.cat([t, x], dim=1)
+
+
+class PeriodicEmbed(nn.Module):
+    """``[t, cos(2πx/L), sin(2πx/L)]`` — exactly period-L in x.
+
+    Any function of these features repeats with period ``L = X_MAX - X_MIN``
+    by construction, so ``u`` and *all* of its x-derivatives match at the
+    endpoints to machine precision. That makes the soft BC block redundant.
+    """
+    out_dim = 3
+
+    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        k = 2.0 * math.pi / L_DOMAIN
+        return torch.cat([t, torch.cos(k * x), torch.sin(k * x)], dim=1)
+
+
+def build_embedding(embed: str) -> nn.Module:
+    if embed == "none":
+        return RawEmbed()
+    if embed == "periodic":
+        return PeriodicEmbed()
+    raise ValueError(f"unknown embedding: {embed}")
+
+
+class MLP(nn.Module):
+    """Plain tanh MLP over an input embedding: ``(t, x) → u``.
+
+    ``depth`` = number of Linear layers.
+    """
+
+    def __init__(self, embed: nn.Module, hidden: int = 128, depth: int = 6):
         super().__init__()
         assert depth >= 2
-        layers: list[nn.Module] = [nn.Linear(2, hidden), nn.Tanh()]
+        self.embed = embed
+        d = embed.out_dim
+        layers: list[nn.Module] = [nn.Linear(d, hidden), nn.Tanh()]
         for _ in range(depth - 2):
             layers += [nn.Linear(hidden, hidden), nn.Tanh()]
         layers += [nn.Linear(hidden, 1)]
         self.net = nn.Sequential(*layers)
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([t, x], dim=1))
+        return self.net(self.embed(t, x))
+
+
+class ModifiedMLP(nn.Module):
+    """Modified MLP (Wang, Teng & Perdikaris 2021) over an input embedding.
+
+    Two encoders gate every hidden layer. The gate is written in the
+    algebraically equivalent form ``h = v + h·(u - v)`` via one fused
+    ``addcmul`` (rather than ``h·u + (1-h)·v``, three elementwise kernels and
+    three autograd nodes), and the two encoders are fused into a single
+    Linear producing ``2·hidden`` features. ``depth`` = gated-hidden-layer
+    count.
+
+    Architecture only — no random weight factorization, Fourier features or
+    causal weighting (jaxpi-pipeline pieces, deliberately not ported).
+    """
+
+    def __init__(self, embed: nn.Module, hidden: int = 128, depth: int = 6):
+        super().__init__()
+        assert depth >= 1
+        self.embed = embed
+        d = embed.out_dim
+        # Fused u/v encoder: one matmul, chunked into the two gates.
+        self.enc_uv = nn.Linear(d, 2 * hidden)
+        self.layers = nn.ModuleList(
+            [nn.Linear(d if i == 0 else hidden, hidden) for i in range(depth)]
+        )
+        self.out = nn.Linear(hidden, 1)
+
+    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        z = self.embed(t, x)
+
+        uv = torch.tanh(self.enc_uv(z))
+        enc_a, enc_b = uv.chunk(2, dim=-1)
+        w = enc_a - enc_b  # computed once; gate becomes enc_b + h*w
+
+        h = z
+        for layer in self.layers:
+            h = torch.tanh(layer(h))
+            h = torch.addcmul(enc_b, h, w)  # == h*enc_a + (1-h)*enc_b
+        return self.out(h)
+
+
+def build_model(arch: str, embed: nn.Module, hidden: int, depth: int
+                ) -> nn.Module:
+    if arch == "mlp":
+        return MLP(embed, hidden=hidden, depth=depth)
+    if arch == "modified":
+        return ModifiedMLP(embed, hidden=hidden, depth=depth)
+    raise ValueError(f"unknown arch: {arch}")
 
 
 # ========================= Residuals =========================
@@ -132,6 +245,9 @@ def bc_residual(model: nn.Module, t: torch.Tensor) -> torch.Tensor:
     the third derivative, but C¹ periodicity is the standard PINN
     treatment for KS and gives the network enough freedom for the
     higher derivatives to match interior values.
+
+    Only used with ``--embed none``; the periodic embedding makes this
+    identically zero (see ``PeriodicEmbed``).
     """
     x_l = torch.full_like(t, X_MIN, requires_grad=True)
     x_r = torch.full_like(t, X_MAX, requires_grad=True)
@@ -155,24 +271,36 @@ def sample_batch(
     return t_pde, x_pde, x_ic, t_bc
 
 
-def stacked_residuals(model: nn.Module, batch) -> torch.Tensor:
-    """Per-block residuals stacked via ``stack_residuals`` (equal weights)."""
+def stacked_residuals(
+    model: nn.Module, batch, use_bc: bool = True
+) -> torch.Tensor:
+    """Per-block residuals stacked via ``stack_residuals`` (equal weights).
+
+    ``use_bc=False`` drops the soft periodicity block, which the periodic
+    embedding satisfies exactly — computing it would just append a vector of
+    zeros at the cost of two more backward passes per step.
+    """
     t_pde, x_pde, x_ic, t_bc = batch
-    return stack_residuals([
+    blocks = [
         pde_residual(model, t_pde, x_pde),
         ic_residual(model, x_ic),
-        bc_residual(model, t_bc),
-    ])
+    ]
+    if use_bc:
+        blocks.append(bc_residual(model, t_bc))
+    return stack_residuals(blocks)
 
 
-def term_losses(model: nn.Module, batch) -> dict[str, float]:
+def term_losses(model: nn.Module, batch, use_bc: bool = True
+                ) -> dict[str, float]:
     """Per-term MSE for diagnostic logging."""
     t_pde, x_pde, x_ic, t_bc = batch
-    return {
+    terms = {
         "pde": pde_residual(model, t_pde, x_pde).pow(2).mean().item(),
         "ic": ic_residual(model, x_ic).pow(2).mean().item(),
-        "bc": bc_residual(model, t_bc).pow(2).mean().item(),
     }
+    if use_bc:
+        terms["bc"] = bc_residual(model, t_bc).pow(2).mean().item()
+    return terms
 
 
 # ========================= Reference solution + eval =========================
@@ -314,32 +442,35 @@ def build_optimizer(
     name: str, params, lr: float, weight_decay: float,
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
     beta1: float = 0.9, beta2: float = 0.99,
+    trust_region: float = 1.0,
 ):
     """Construct the optimizer and its LR schedule.
 
-    Returns ``(optimizer, config, scheduler_or_None)``. Gnome runs at a fixed
-    lr (its Gauss-Newton step self-anneals as the residual shrinks) so it gets
-    no scheduler — only its own internal warmup. SOAP and AdamW get the
-    standard linear-warmup + cosine-decay treatment; ``cosine_decay`` is the
-    final-lr fraction (0.0 → decay to zero, 1.0 → decay disabled).
+    Returns ``(optimizer, config, scheduler)``. Every optimizer gets the same
+    linear-warmup + cosine-decay schedule; ``cosine_decay`` is the final-lr
+    fraction (0.0 -> decay to zero, 1.0 -> warmup then constant). On MSE, 1.0
+    is the natural setting for Gnome -- its Gauss-Newton step self-anneals as
+    the residual shrinks -- where the gradient-RMS baselines do want the decay.
     """
     if name == "gnome":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10,
-            clip=1.0, warmup=warmup,
+            trust_radius=(trust_region if trust_region > 0 else None),
             loss="mse", precondition_1d=True,
         )
-        return Gnome(params, **cfg), cfg, None
-    if name == "soap":
+        opt = Gnome(params, **cfg)
+    elif name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
             precondition_frequency=10, precondition_1d=True,
         )
         opt = SOAP(params, **cfg)
-    elif name == "adamw":
+    elif name in ("adamw", "adamw+lbfgs"):
+        # adamw+lbfgs uses plain AdamW for phase 1; the L-BFGS refinement is
+        # a separate phase appended after the main loop (see lbfgs_phase).
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(0.9, 0.999), eps=1e-8,
@@ -348,10 +479,97 @@ def build_optimizer(
     else:
         raise ValueError(f"unknown optimizer: {name}")
 
-    scheduler = baseline_cosine_scheduler(opt, warmup, total_steps, cosine_decay)
+    scheduler = cosine_scheduler(opt, warmup, total_steps, cosine_decay)
     cfg["warmup"] = warmup
     cfg["cosine_decay_floor"] = cosine_decay
     return opt, cfg, scheduler
+
+
+# ========================= L-BFGS refinement phase =========================
+
+def lbfgs_phase(
+    model: nn.Module, device: torch.device, args: argparse.Namespace,
+    run: RunLogger, t_ref: torch.Tensor, x_ref: torch.Tensor,
+    u_ref: torch.Tensor, use_bc: bool, start_step: int, best_rel_l2: float,
+) -> dict:
+    """Full-batch L-BFGS refinement, run after the AdamW phase.
+
+    L-BFGS approximates curvature from a history of (grad, step) pairs, which
+    is only valid if the objective is a fixed function — so we draw ONE
+    collocation set here and reuse it for every iteration (unlike the AdamW
+    phase, which resamples each step). ``torch.optim.LBFGS`` re-evaluates the
+    closure several times per ``.step()`` for its strong-Wolfe line search;
+    each outer step runs ``--lbfgs-max-iter`` inner iterations (must be >1 —
+    the line search cannot recover from a cold identity Hessian in a single
+    iteration and stalls). Returns the final/best metrics for the run summary.
+    """
+    fixed_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
+    opt = torch.optim.LBFGS(
+        model.parameters(), lr=args.lbfgs_lr, max_iter=args.lbfgs_max_iter,
+        history_size=args.lbfgs_history, line_search_fn="strong_wolfe",
+        tolerance_grad=1e-12, tolerance_change=1e-12,
+    )
+    # Log at roughly the same iteration cadence as the AdamW phase: one outer
+    # step is lbfgs_max_iter inner iterations.
+    log_every = max(1, args.log_every // args.lbfgs_max_iter)
+
+    if not args.quiet:
+        total_iters = args.lbfgs_steps * args.lbfgs_max_iter
+        print(
+            f"[{EXPERIMENT}] L-BFGS refinement: {args.lbfgs_steps} outer steps "
+            f"x {args.lbfgs_max_iter} = {total_iters} iters on a fixed batch "
+            f"(N_pde={args.n_pde} N_ic={args.n_ic} N_bc={args.n_bc}, "
+            f"history={args.lbfgs_history}, lr={args.lbfgs_lr})",
+            flush=True,
+        )
+
+    t_start = time.perf_counter()
+    last_loss = last_rel_l2 = float("nan")
+    last_terms: dict[str, float] = {}
+
+    for i in range(args.lbfgs_steps):
+        def closure():
+            opt.zero_grad()
+            r = stacked_residuals(model, fixed_batch, use_bc)
+            loss = (r ** 2).sum() / r.shape[0]
+            loss.backward()
+            return loss
+
+        loss = opt.step(closure)
+        last_loss = float(loss.detach().item())
+        step = start_step + i
+        if diverged(last_loss):
+            run.finish(completed=False, diverged=True, diverged_step=step)
+            print(f"[{EXPERIMENT}] L-BFGS diverged at step {step} — stopping.",
+                  flush=True)
+            raise SystemExit(DIVERGED_EXIT)
+        run.log_train(step, loss=last_loss)
+
+        # Always evaluate on the last iteration, so a short phase (fewer outer
+        # steps than the log cadence) still reports a final rel_l2.
+        if (i + 1) % log_every == 0 or i == args.lbfgs_steps - 1:
+            tl = term_losses(model, fixed_batch, use_bc)
+            rl2 = eval_rel_l2(model, t_ref, x_ref, u_ref, device)
+            last_terms, last_rel_l2 = tl, rl2
+            best_rel_l2 = min(best_rel_l2, rl2)
+            run.log_val(step + 1, loss=last_loss, lr=args.lbfgs_lr,
+                        rel_l2=rl2, **tl)
+            if not args.quiet:
+                ms_per = (time.perf_counter() - t_start) / (i + 1) * 1000
+                terms = "  ".join(f"{k}={v:.3e}" for k, v in tl.items())
+                print(
+                    f"  L-BFGS {i + 1:5d}/{args.lbfgs_steps}  "
+                    f"loss={last_loss:.4e}  {terms}  "
+                    f"rel_l2={rl2:.3e}  {ms_per:.1f} ms/step",
+                    flush=True,
+                )
+
+    return {
+        "last_avg": last_loss,
+        "last_rel_l2": last_rel_l2,
+        "best_rel_l2": best_rel_l2,
+        "last_terms": last_terms,
+    }
 
 
 # ========================= CLI / training =========================
@@ -359,19 +577,38 @@ def build_optimizer(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--optimizer", required=True,
-                   choices=["gnome", "soap", "adamw"])
+                   choices=["gnome", "soap", "adamw", "adamw+lbfgs"])
+    p.add_argument("--arch", choices=["mlp", "modified"], default="mlp",
+                   help="Network: plain tanh MLP or the gated modified MLP "
+                        "(Wang et al. 2021). --hidden / --depth control both. "
+                        "Defaults to mlp — the original setup for this "
+                        "experiment, so existing runs stay comparable.")
+    p.add_argument("--embed", choices=["none", "periodic"], default="none",
+                   help="Input embedding. 'none' feeds raw [t, x] and keeps "
+                        "the soft periodic BC block. 'periodic' feeds "
+                        "[t, cos(2pi x/L), sin(2pi x/L)], making the network "
+                        "exactly period-L in x — periodicity then holds for "
+                        "every derivative and the BC block is DROPPED (two "
+                        "blocks instead of three).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--steps", type=int, default=20000)
     p.add_argument("--n-pde", type=int, default=4000)
     p.add_argument("--n-ic", type=int, default=200)
     p.add_argument("--n-bc", type=int, default=200)
-    p.add_argument("--aux-frac", type=float, default=0.03,
+    p.add_argument("--aux-frac", type=float, default=0.10,
                    help="Aux batch sizes for Gnome are max(K_min, int(N * "
                         "aux_frac)) per block. Each aux pass is a full "
                         "higher-order residual eval, so this is not free — "
                         "keep small. KS's 4th-order PDE makes the aux pass "
                         "~2x more expensive than Burgers per point.")
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--trust-region", type=float, default=1.0,
+                   help="Gnome per-coordinate update bound: lambda is set to "
+                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
+                        "so no coordinate moves more than lr*trust_region in "
+                        "a step. Larger -> weaker bound -> longer steps. "
+                        "0 disables it, falling back to plain m̂/(v̂+eps) "
+                        "damping.")
     p.add_argument("--eps", type=float, default=1e-6,
                    help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
                         "-> more gradient-descent-like, smaller -> fuller Newton "
@@ -382,17 +619,34 @@ def parse_args() -> argparse.Namespace:
                    help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
     p.add_argument("--weight-decay", type=float, default=1e-8)
     p.add_argument("--hidden", type=int, default=128,
-                   help="MLP width. The stiff KS operator needs more capacity than "
-                        "Burgers; 128 is a reasonable default.")
-    p.add_argument("--depth", type=int, default=6, help="MLP depth.")
+                   help="Network width. The stiff KS operator needs more "
+                        "capacity than Burgers; 128 is a reasonable default.")
+    p.add_argument("--depth", type=int, default=6,
+                   help="Network depth: Linear-layer count for --arch mlp, "
+                        "number of gated hidden layers for --arch modified.")
     p.add_argument("--warmup-steps", type=int, default=200,
-                   help="Linear LR warmup steps. For the SOAP/AdamW baselines "
-                        "this is the schedule warmup; for Gnome it is passed "
-                        "as its internal `warmup=`.")
+                   help="Linear LR warmup steps, applied to every optimizer.")
     p.add_argument("--cosine-decay", type=float, default=0.0,
                    help="Final-LR fraction for the baseline cosine decay: 0.0 "
                         "decays to zero (standard treatment), 1.0 disables "
                         "decay. Gnome (MSE) never decays regardless.")
+    p.add_argument("--lbfgs-steps", type=int, default=500,
+                   help="L-BFGS OUTER steps after the AdamW phase "
+                        "(--optimizer adamw+lbfgs only). Each outer step runs "
+                        "up to --lbfgs-max-iter inner iterations, so the total "
+                        "L-BFGS budget is lbfgs_steps * lbfgs_max_iter. Runs "
+                        "full-batch on a fixed collocation set.")
+    p.add_argument("--lbfgs-max-iter", type=int, default=20,
+                   help="Inner L-BFGS iterations per outer step. Must be >1: "
+                        "the strong-Wolfe line search cannot recover from a "
+                        "cold (identity) Hessian in a single iteration and "
+                        "stalls. adamw+lbfgs only.")
+    p.add_argument("--lbfgs-history", type=int, default=50,
+                   help="L-BFGS history size (number of stored curvature "
+                        "pairs). adamw+lbfgs only.")
+    p.add_argument("--lbfgs-lr", type=float, default=1.0,
+                   help="L-BFGS learning rate; with the strong-Wolfe line "
+                        "search 1.0 is standard. adamw+lbfgs only.")
     p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--quiet", action="store_true")
@@ -402,12 +656,17 @@ def parse_args() -> argparse.Namespace:
 def train(args: argparse.Namespace) -> str:
     torch.manual_seed(args.seed)
     device = pick_device()
-    model = PINN(hidden=args.hidden, depth=args.depth).to(device)
+    # The periodic embedding satisfies the BC block exactly, so it is dropped.
+    use_bc = args.embed == "none"
+    model = build_model(
+        args.arch, build_embedding(args.embed), args.hidden, args.depth
+    ).to(device)
     opt, opt_cfg, scheduler = build_optimizer(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
         warmup=args.warmup_steps, total_steps=args.steps,
         cosine_decay=args.cosine_decay, eps=args.eps,
         beta1=args.beta1, beta2=args.beta2,
+        trust_region=args.trust_region,
     )
 
     n_pde_aux = max(8, int(args.n_pde * args.aux_frac))
@@ -417,6 +676,9 @@ def train(args: argparse.Namespace) -> str:
 
     hyperparameters = {
         "optimizer": args.optimizer,
+        "arch": args.arch,
+        "embed": args.embed,
+        "blocks": ["pde", "ic", "bc"] if use_bc else ["pde", "ic"],
         "steps": args.steps,
         "hidden": args.hidden,
         "depth": args.depth,
@@ -441,11 +703,14 @@ def train(args: argparse.Namespace) -> str:
     )
 
     if not args.quiet:
+        blocks = "pde+ic+bc" if use_bc else "pde+ic (exact periodic BC)"
         print(
-            f"[{EXPERIMENT}] {args.optimizer} | params={n_params:,} | "
-            f"device={device}\n"
+            f"[{EXPERIMENT}] {args.optimizer} | arch={args.arch} "
+            f"{args.depth}x{args.hidden} | embed={args.embed} | "
+            f"params={n_params:,} | device={device}\n"
             f"  N_pde={args.n_pde} N_ic={args.n_ic} N_bc={args.n_bc} | "
-            f"aux={n_pde_aux}/{n_ic_aux}/{n_bc_aux} | steps={args.steps}",
+            f"aux={n_pde_aux}/{n_ic_aux}/{n_bc_aux} | steps={args.steps} | "
+            f"blocks={blocks}",
             flush=True,
         )
         print("  loading / building reference solution...", flush=True)
@@ -454,7 +719,7 @@ def train(args: argparse.Namespace) -> str:
     t_start = time.perf_counter()
     window: list[float] = []
     last_avg = last_rel_l2 = float("nan")
-    last_pde = last_ic = last_bc = float("nan")
+    last_terms: dict[str, float] = {}
     best_avg = best_rel_l2 = float("inf")
 
     for step in range(args.steps):
@@ -463,17 +728,17 @@ def train(args: argparse.Namespace) -> str:
             aux_batch = sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device)
 
             def main_closure():
-                r = stacked_residuals(model, main_batch)
+                r = stacked_residuals(model, main_batch, use_bc)
                 return r, torch.zeros_like(r)
 
             def aux_closure():
-                r = stacked_residuals(model, aux_batch)
+                r = stacked_residuals(model, aux_batch, use_bc)
                 return r, torch.zeros_like(r)
 
             loss = opt.step(main_closure, aux_closure)
         else:
             opt.zero_grad()
-            r = stacked_residuals(model, main_batch)
+            r = stacked_residuals(model, main_batch, use_bc)
             loss = (r ** 2).sum() / r.shape[0]
             loss.backward()
             opt.step()
@@ -491,27 +756,37 @@ def train(args: argparse.Namespace) -> str:
 
         if args.log_every and (step + 1) % args.log_every == 0:
             tl = term_losses(
-                model, sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
+                model, sample_batch(args.n_pde, args.n_ic, args.n_bc, device),
+                use_bc,
             )
             rl2 = eval_rel_l2(model, t_ref, x_ref, u_ref, device)
             last_avg = sum(window) / len(window)
-            last_pde, last_ic, last_bc = tl["pde"], tl["ic"], tl["bc"]
-            last_rel_l2 = rl2
+            last_terms, last_rel_l2 = tl, rl2
             best_avg = min(best_avg, last_avg)
             best_rel_l2 = min(best_rel_l2, rl2)
             run.log_val(step + 1, loss=last_avg, lr=current_lr(opt),
-                        pde=tl["pde"], ic=tl["ic"], bc=tl["bc"], rel_l2=rl2)
+                        rel_l2=rl2, **tl)
             if not args.quiet:
                 ms_per = (time.perf_counter() - t_start) / (step + 1) * 1000
+                terms = "  ".join(f"{k}={v:.3e}" for k, v in tl.items())
                 print(
                     f"  step {step + 1:5d}/{args.steps}  "
-                    f"avg_train={last_avg:.4e}  "
-                    f"pde={tl['pde']:.3e}  ic={tl['ic']:.3e}  "
-                    f"bc={tl['bc']:.3e}  rel_l2={rl2:.3e}  "
-                    f"{ms_per:.1f} ms/step",
+                    f"avg_train={last_avg:.4e}  {terms}  "
+                    f"rel_l2={rl2:.3e}  {ms_per:.1f} ms/step",
                     flush=True,
                 )
             window.clear()
+
+    if args.optimizer == "adamw+lbfgs" and args.lbfgs_steps > 0:
+        res = lbfgs_phase(
+            model, device, args, run, t_ref, x_ref, u_ref, use_bc,
+            start_step=args.steps, best_rel_l2=best_rel_l2,
+        )
+        last_avg = res["last_avg"]
+        best_avg = min(best_avg, res["last_avg"])
+        last_rel_l2 = res["last_rel_l2"]
+        best_rel_l2 = res["best_rel_l2"]
+        last_terms = res["last_terms"] or last_terms
 
     path = run.finish(
         completed=True,
@@ -520,7 +795,9 @@ def train(args: argparse.Namespace) -> str:
     )
     print(f"[{EXPERIMENT}] saved → {path}")
     print(f"  final avg_train={last_avg:.4e}  best={best_avg:.4e}")
-    print(f"  final pde={last_pde:.3e}  ic={last_ic:.3e}  bc={last_bc:.3e}")
+    if last_terms:
+        print("  final " + "  ".join(
+            f"{k}={v:.3e}" for k, v in last_terms.items()))
     print(f"  final rel_l2={last_rel_l2:.3e}  best rel_l2={best_rel_l2:.3e}")
     return path
 

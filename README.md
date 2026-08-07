@@ -64,7 +64,10 @@ Key arguments:
 
 - `loss` — `"mse"` (regression), `"cce"` (softmax cross-entropy, Fisher surrogate), or
   `"cce_hutchinson"` (cross-entropy, lower-variance Rademacher surrogate).
-- `lr` — for MSE, Gnome self-anneals, so a fixed learning rate is expected (no schedule).
+- `lr` — Gnome owns no schedule; it is a stock `torch.optim.Optimizer`, so any
+  `torch.optim.lr_scheduler` drives it as it would AdamW. On MSE the Gauss-Newton step
+  self-anneals as the residual shrinks, so decay is optional there in a way it isn't for
+  gradient-RMS methods — a warmup is still worth having while the eigenbasis is cold.
 - `K` (auxiliary batch size) — the number of samples in the aux slice you pass to
   `aux_closure` (10 in the example above). Controls the curvature estimate's variance, not
   bias. It is *not* a constructor argument — Gnome reads K from the aux batch you provide.
@@ -100,11 +103,12 @@ uv run python -m experiments.kuramoto_sivashinsky_pinn   --optimizer gnome --ste
 uv run python -m experiments.navier_stokes_pinn          --optimizer gnome --steps 200000
 ```
 
-Each takes `--optimizer gnome|soap|adamw`. **Schedule protocol:** Gnome runs at a fixed
-learning rate on these MSE losses (it self-anneals, so `--cosine-decay` is ignored for it).
-The SOAP/AdamW baselines get the standard treatment through `--cosine-decay`, a final-LR
-fraction that defaults to `0.0` — decay all the way to zero. So a plain baseline run already
-gets the standard cosine decay:
+Each takes `--optimizer gnome|soap|adamw`. **Schedule protocol:** every optimizer, Gnome
+included, gets the same linear-warmup + cosine-decay schedule, so the comparison is over the
+update rule and not over who was handed a schedule. `--cosine-decay` is the final-LR
+fraction and defaults to `0.0` — decay all the way to zero. Pass `--cosine-decay 1.0` for
+warmup-then-constant, which is where Gnome is happiest on MSE since its step already
+self-anneals. So a plain run already gets the standard cosine decay:
 
 ```bash
 uv run python -m experiments.poisson_pinn --optimizer soap --steps 50000

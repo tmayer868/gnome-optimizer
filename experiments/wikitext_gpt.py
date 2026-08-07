@@ -16,11 +16,11 @@ Optimizer choices:
     * ``soap``               — empirical-Fisher SOAP baseline
     * ``adamw``              — first-order baseline
 
-Unlike the MSE experiments (where Gnome runs a fixed lr), this CCE run gives
-*every* optimizer — Gnome included — a shared linear-warmup + cosine-decay
-schedule: cross-entropy gradients don't self-anneal the way an MSE residual
-does. Gnome's internal warmup is disabled (``warmup=0``) so the two ramps don't
-compound. ``--lr-min-frac`` is the cosine floor (final lr as a fraction of peak).
+This CCE run gives *every* optimizer — Gnome included — a shared linear-warmup
++ cosine-decay schedule. Decay earns its keep here in a way it does not on the
+MSE experiments: cross-entropy gradients don't self-anneal the way an MSE
+residual does. ``--lr-min-frac`` is the cosine floor (final lr as a fraction of
+peak).
 
 Requires ``datasets`` + ``transformers`` (the ``llm`` extra):
 
@@ -208,17 +208,16 @@ def load_wikitext103(seq_len: int, batch_size: int, seed: int):
 
 # ========================= Optimizer factory =========================
 
-def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float):
+def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float,
+                               trust_region: float = 1.0):
     """Construct one of the four supported optimizers.
 
     Both Gnome variants share every hyperparameter except ``loss=`` so the
     A/B between Fisher sampling and Hutchinson is on the surrogate only.
 
-    Gnome's internal warmup is disabled (warmup=0): this experiment owns the
-    LR schedule via ``cosine_with_warmup``, applied to every optimizer's
-    ``group["lr"]`` each step. Leaving Gnome's internal warmup on would compound
-    the two ramps (Gnome multiplies its own warmup factor onto the already-
-    cosined lr), handicapping it vs SOAP/AdamW which have no internal warmup.
+    This experiment owns the LR schedule via ``cosine_with_warmup``, applied to
+    every optimizer's ``group["lr"]`` each step. No optimizer here transforms
+    ``lr`` internally, so that write is what the update actually uses.
 
     aux_batch_size is small (5) because the Hutchinson surrogate's per-token
     tensors are ``(aux*seq_len, vocab)`` ≈ ``(aux*seq_len, 50k)`` — at aux=10
@@ -229,7 +228,7 @@ def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float
         lr=lr, weight_decay=weight_decay,
         betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-4,
         precondition_frequency=10,
-        clip=1.0, warmup=0,
+        trust_radius=(trust_region if trust_region > 0 else None),
         precondition_1d=False,
     )
     # aux_batch_size sizes the auxiliary batch the caller builds for
@@ -303,6 +302,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=48,
                    help="Batch size per optimizer step. Raise this to scale "
                         "the effective batch (single-batch steps here).")
+    p.add_argument("--trust-region", type=float, default=1.0,
+                   help="Gnome per-coordinate update bound: lambda is set to "
+                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
+                        "so no coordinate moves more than lr*trust_region in "
+                        "a step. Larger -> weaker bound -> longer steps. "
+                        "0 disables it, falling back to plain m̂/(v̂+eps) "
+                        "damping.")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--lr-min-frac", type=float, default=0.1,
                    help="Cosine schedule floor as a fraction of lr (final lr).")
@@ -310,7 +316,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--max-grad-norm", type=float, default=1.0,
                    help="Global-norm gradient clipping for non-Gnome paths. "
-                        "Gnome uses its own per-coordinate clip (clip=1.0).")
+                        "Gnome uses its own l2 trust region instead.")
     p.add_argument("--seq-len", type=int, default=128)
     p.add_argument("--n-layer", type=int, default=10)
     p.add_argument("--n-head", type=int, default=8)
@@ -327,10 +333,9 @@ def parse_args() -> argparse.Namespace:
 def cosine_with_warmup(step: int, warmup: int, total: int, min_frac: float) -> float:
     """LR multiplier: linear warmup → cosine decay to ``min_frac``.
 
-    Note: this CCE schedule ramps warmup from ``min_frac`` up to 1.0 (not from
-    0), and is applied to every optimizer including Gnome — distinct from the
-    MSE baselines' ``experiments.common.baseline_cosine_scheduler`` (warmup from
-    0, applied only to SOAP/AdamW). Kept local to preserve the tuned LM run.
+    Note: this CCE schedule ramps warmup from ``min_frac`` up to 1.0, where the
+    shared ``experiments.common.cosine_scheduler`` ramps from 0. Kept local to
+    preserve the tuned LM run.
     """
     if step < warmup:
         return min_frac + (1.0 - min_frac) * step / max(warmup, 1)
@@ -362,6 +367,7 @@ def main():
 
     opt, opt_cfg = build_optimizer_and_config(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
+        trust_region=args.trust_region,
     )
     K = opt_cfg.get("aux_batch_size", 4) if args.optimizer.startswith("gnome") else 0
 

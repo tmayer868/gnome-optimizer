@@ -1,31 +1,40 @@
-"""CIFAR-100 rotation regression: AdamW vs SOAP vs Gnome on real images.
+"""Grating-frequency regression: AdamW vs SOAP vs Gnome on real images.
 
-A real-image regression benchmark to bookend the synthetic OLS example.
-Each CIFAR-100 image is rotated by a random angle sampled from U(-45°, +45°),
-and the model must regress that angle back. The target is
-``angle / ANGLE_RANGE_DEG`` (normalized to [-1, 1]); the loss is MSE on that
-target, and ``mae_deg`` un-normalizes the validation error into degrees for a
-human-readable readout.
+A 2D sinusoidal grating is added on top of a CIFAR-100 image and the model must
+regress the grating's spatial frequency in cycles per image. The target is
+``freq`` mapped to [-1, 1] over ``[FREQ_MIN, FREQ_MAX]``; the loss is MSE on
+that target, and ``mae_cycles`` un-normalizes the validation error back into
+cycles for a human-readable readout.
 
-The rotated image is cropped to the inscribed disc. Without that, the black
-corners left by zero padding trace a rotated square whose orientation *is* the
-label, and the task can be solved without looking at image content at all.
+Structurally this is a cleaner regression than ``cifar_rotation``: the target is
+drawn independently of the image, so unlike a rotation angle -- which is only
+defined relative to whatever orientation the dataset happened to store, and is
+genuinely ambiguous for content with no canonical "up" -- the frequency label
+carries no per-image irreducible error. The image is *clutter*, and the noise
+floor is set by how well the grating stands out from it, which ``--amp-min/max``
+controls directly.
 
-Training angles are resampled fresh every batch, so the model never sees the
-same (image, angle) pair twice — the rotation is its own on-the-fly
-augmentation, which keeps the task well-conditioned. Validation angles are
-frozen per seed, so val metrics are comparable across runs and epochs.
+Grating parameters are resampled fresh every batch, so the model never sees the
+same (image, grating) pair twice. Validation gratings are frozen per seed, so
+val metrics are comparable across runs and epochs.
 
-This is a genuine conv-net regression (Gnome runs on ``[C, C, 3, 3]`` conv
-kernels, not just Linear layers) on real data, without a fragile external
-dataset — CIFAR-100 downloads once via torchvision and is cached. The class
-labels are discarded: only the pixels matter, since the target is the rotation
-angle. (This used to pull CIFAR-10; same images at heart, and CIFAR-100 shares
-the cache with ``experiments/cifar100.py``.)
+Three things are randomized per sample, each closing a specific shortcut:
 
-    uv run python -m experiments.cifar_rotation --optimizer gnome --seed 0
-    uv run python -m experiments.cifar_rotation --optimizer soap  --seed 0 --cosine-decay 0
-    uv run python -m experiments.cifar_rotation --optimizer adamw --seed 0 --cosine-decay 0
+  phase        Without it the grating is a fixed function of frequency, so the
+               value at any single pixel decodes the label outright.
+  orientation  Forces an orientation-invariant frequency estimate rather than a
+               readout along one image axis.
+  amplitude    The important one. Total variation scales as A*f, so at fixed A
+               it is a near-perfect proxy for the label: measured on real CIFAR
+               clutter, the best 1-D predictor of TV explains R2 = 0.94 of the
+               target variance, and a net can win without ever locating a
+               spectral peak. Drawing A log-uniformly over a 20x range confounds
+               the product and brings that to ~0.15, so most of the task now
+               requires estimating *where* the energy sits, not how much.
+
+    uv run python -m experiments.grating_freq --optimizer gnome --seed 0
+    uv run python -m experiments.grating_freq --optimizer soap  --seed 0 --cosine-decay 0
+    uv run python -m experiments.grating_freq --optimizer adamw --seed 0 --cosine-decay 0
 """
 
 from __future__ import annotations
@@ -50,77 +59,104 @@ from experiments.common import (
 from experiments.common.resnet import build_model, MODEL_NAMES
 
 
-EXPERIMENT = "cifar_rotation"
+EXPERIMENT = "grating_freq"
 DEFAULT_DATA_DIR = "experiments/data"
 
-# Rotations are sampled uniformly from [-ANGLE_RANGE_DEG, +ANGLE_RANGE_DEG];
-# the regression target is angle / ANGLE_RANGE_DEG, so it lands in [-1, 1].
-# mae_deg un-normalizes the validation residual back into degrees.
-ANGLE_RANGE_DEG = 45.0
+# Frequency band in cycles per image. The 32x32 sampling lattice puts Nyquist
+# at 16 cycles/image per axis; an oriented grating at f cycles has axis
+# components |f*cos| , |f*sin| <= f, so FREQ_MAX = 8 keeps a 2x margin and no
+# sample can alias to a *different* apparent frequency (which would make the
+# label unrecoverable rather than merely hard). Below ~1 cycle the grating is
+# barely a full period across the frame and degenerates into a DC shift.
+FREQ_MIN = 1.0
+FREQ_MAX = 8.0
+
+# Per-sample grating amplitude, on the same [-1, 1] scale as the image, drawn
+# log-uniformly. This range is the difficulty knob and the main defence against
+# the energy-magnitude shortcut — see ``sample_grating_params``. Widening it
+# lowers the shortcut but raises the clutter-limited noise floor, since a
+# grating at amp 0.05 sits well under CIFAR's own contrast.
+AMP_MIN = 0.05
+AMP_MAX = 1.0
 
 
 # ----------------------------------------------------------------------
-# Data + rotation
+# Data + grating
 # ----------------------------------------------------------------------
 
-_MASK_CACHE: dict = {}
+def sample_grating_params(n, generator=None, device=None,
+                          amp_min=AMP_MIN, amp_max=AMP_MAX):
+    """Draw ``(freq, orient, phase, amp)``, each ``[n]``, for a batch.
 
+    Amplitude is drawn *log*-uniformly. Measured on real CIFAR clutter, the
+    variance of the target recoverable by the best 1-D predictor of total
+    variation, as the amplitude range widens:
 
-def _disc_mask(h, w, device, dtype):
-    """Cached ``[1,1,h,w]`` 0/1 mask of the disc inscribed in the image.
+        range        dynamic   uniform   log-uniform
+        [1.0, 1.0]      1.0x     0.940      --
+        [0.30, 1.0]     3.3x     0.604     0.566
+        [0.15, 1.0]     6.6x     0.442     0.324
+        [0.08, 1.0]    12.5x     0.373     0.217
+        [0.04, 1.0]    25.0x     0.339     0.136
 
-    The disc is the largest rotation-invariant subset of the frame: a point at
-    radius r maps to radius r under rotation, so every pixel inside the disc is
-    sourced from inside the disc — and therefore from inside the image — for
-    *every* angle. That is what kills the label leak (see ``rotate_batch``).
+    Log-uniform wins everywhere and the gap grows with the range, because
+    uniform sampling piles mass near ``amp_max`` and so buys much less
+    effective dynamic range than its endpoints suggest.
     """
-    key = (h, w, device, dtype)
-    m = _MASK_CACHE.get(key)
-    if m is None:
-        ys = (torch.arange(h, device=device, dtype=dtype) * 2 + 1) / h - 1
-        xs = (torch.arange(w, device=device, dtype=dtype) * 2 + 1) / w - 1
-        r2 = ys[:, None] ** 2 + xs[None, :] ** 2
-        # shrink by one pixel so bilinear taps stay inside the source
-        m = (r2 <= (1.0 - 2.0 / min(h, w)) ** 2).to(dtype)[None, None]
-        _MASK_CACHE[key] = m
-    return m
+    def u(lo, hi):
+        r = torch.rand(n, generator=generator, device=device)
+        return lo + (hi - lo) * r
+
+    freq = u(FREQ_MIN, FREQ_MAX)
+    orient = u(0.0, math.pi)        # a grating is pi-periodic in orientation
+    phase = u(0.0, 2.0 * math.pi)
+    amp = torch.exp(u(math.log(amp_min), math.log(amp_max)))
+    return freq, orient, phase, amp
 
 
-def rotate_batch(x: torch.Tensor, angles_deg: torch.Tensor,
-                 mask: bool = True) -> torch.Tensor:
-    """Per-sample rotation of an image batch about its center (one batched op).
+def add_grating(x, freq, orient, phase, amp):
+    """Add a luminance grating ``amp * sin(2pi(fx*u + fy*v) + phase)`` to ``x``.
 
-    Builds a per-sample 2×3 affine matrix from the angles and applies it via
-    ``affine_grid`` + ``grid_sample`` — no Python loop over the batch.
+    ``x`` is ``[B,3,H,W]``; the four parameter tensors are ``[B]``. Coordinates
+    ``u, v`` run over [-0.5, 0.5) at pixel centers, so ``freq`` reads directly
+    as cycles per image and is independent of resolution.
 
-    ``mask`` crops the result to the inscribed disc, and is not cosmetic: it
-    closes a label leak. Rotating a square frame with zero padding leaves black
-    corners whose boundary *is* a rotated square outline, so the angle is
-    recoverable from the padding geometry alone, with no reference to image
-    content. A net can solve the stated task by measuring a corner. The disc is
-    rotation-invariant, so its zero/non-zero pattern is identical at every
-    angle and carries no information about the target.
+    The same grating goes on all three channels (a luminance grating, not a
+    chromatic one), and the result is deliberately *not* clipped back into
+    range: clipping a sinusoid generates harmonics whose structure depends on
+    amplitude and frequency together, which both distorts the target and hands
+    the model an edge-density cue that scales with f.
     """
-    theta = angles_deg * (math.pi / 180.0)
-    cos_t, sin_t = torch.cos(theta), torch.sin(theta)
-    zero = torch.zeros_like(cos_t)
-    rot = torch.stack([
-        torch.stack([cos_t, -sin_t, zero], dim=-1),
-        torch.stack([sin_t,  cos_t, zero], dim=-1),
-    ], dim=-2)  # [B, 2, 3]
-    grid = F.affine_grid(rot, list(x.shape), align_corners=False)
-    out = F.grid_sample(x, grid, align_corners=False, padding_mode="zeros")
-    if mask:
-        out = out * _disc_mask(x.shape[-2], x.shape[-1], out.device, out.dtype)
-    return out
+    h, w = x.shape[-2], x.shape[-1]
+    dev, dt = x.device, x.dtype
+    v = (torch.arange(h, device=dev, dtype=dt) + 0.5) / h - 0.5
+    u = (torch.arange(w, device=dev, dtype=dt) + 0.5) / w - 0.5
+
+    fx = (freq * torch.cos(orient)).view(-1, 1, 1)
+    fy = (freq * torch.sin(orient)).view(-1, 1, 1)
+    ph = 2.0 * math.pi * (fx * u[None, None, :] + fy * v[None, :, None])
+    g = amp.view(-1, 1, 1) * torch.sin(ph + phase.view(-1, 1, 1))
+    return x + g.unsqueeze(1)       # [B,1,H,W] broadcasts over channels
+
+
+def freq_to_target(freq):
+    """Map cycles-per-image onto the [-1, 1] regression target."""
+    return 2.0 * (freq - FREQ_MIN) / (FREQ_MAX - FREQ_MIN) - 1.0
+
+
+# ``mae_cycles = mae_target * TARGET_TO_CYCLES``. Always predicting the band
+# center gives mae = (FREQ_MAX - FREQ_MIN) / 4 = 1.75 cycles, which is the
+# chance baseline to read the metric against.
+TARGET_TO_CYCLES = 0.5 * (FREQ_MAX - FREQ_MIN)
 
 
 def load_cifar100_tensors(data_dir: str = DEFAULT_DATA_DIR):
     """Load CIFAR-100 train+test as float32 ``[N,3,32,32]`` tensors in [-1, 1].
 
-    Downloads once via torchvision (cached under ``data_dir``). The unverified
-    SSL context is a standard workaround for intermittent cert failures on the
-    upstream CIFAR host.
+    Downloads once via torchvision (cached under ``data_dir``). Labels are
+    discarded -- only the pixels matter, since the target is the grating
+    frequency. The unverified SSL context is a standard workaround for
+    intermittent cert failures on the upstream CIFAR host.
     """
     import ssl
     from torchvision import datasets, transforms
@@ -160,7 +196,7 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
             precondition_frequency=10,
             loss="mse", precondition_1d=False,
             trust_radius=(trust_region if trust_region > 0 else None),
-            norm_free=False
+            norm_free=False,
         )
         opt = Gnome(params, **cfg)
         # aux_batch_size sizes the auxiliary batch the caller builds for
@@ -197,13 +233,16 @@ def main():
     x_train_cpu, x_val_cpu = load_cifar100_tensors()
     n_train = int(x_train_cpu.shape[0])
 
-    # Frozen val rotations (deterministic per seed) so val metrics are
+    # Frozen val gratings (deterministic per seed) so val metrics are
     # comparable across runs, optimizers, and epochs.
     val_gen = torch.Generator().manual_seed(args.seed)
-    val_angles = (torch.rand(x_val_cpu.shape[0], generator=val_gen) * 2 - 1) * ANGLE_RANGE_DEG
+    v_freq, v_orient, v_phase, v_amp = sample_grating_params(
+        x_val_cpu.shape[0], generator=val_gen,
+        amp_min=args.amp_min, amp_max=args.amp_max,
+    )
     with torch.no_grad():
-        x_val = rotate_batch(x_val_cpu, val_angles).to(device)
-    y_val = (val_angles / ANGLE_RANGE_DEG).unsqueeze(-1).to(device)
+        x_val = add_grating(x_val_cpu, v_freq, v_orient, v_phase, v_amp).to(device)
+    y_val = freq_to_target(v_freq).unsqueeze(-1).to(device)
 
     model = build_model(args.model, num_outputs=1, norm=args.norm).to(device)
     steps_per_epoch = math.ceil(n_train / args.batch_size)
@@ -224,7 +263,10 @@ def main():
         "total_steps": total_steps,
         "n_train": n_train,
         "n_val": int(x_val.shape[0]),
-        "angle_range_deg": ANGLE_RANGE_DEG,
+        "freq_min": FREQ_MIN,
+        "freq_max": FREQ_MAX,
+        "amp_min": args.amp_min,
+        "amp_max": args.amp_max,
         "model": args.model,
         "norm": args.norm,
         "warmup_steps": args.warmup_steps,
@@ -237,7 +279,7 @@ def main():
     with RunLogger(EXPERIMENT, args.optimizer, args.seed, hyperparameters,
                    runs_dir=args.runs_dir) as run:
         step = 0
-        best_mae_deg = float("inf")
+        best_mae_cycles = float("inf")
         window_sum, window_n = 0.0, 0
         for epoch in range(args.epochs):
             model.train()
@@ -252,16 +294,17 @@ def main():
                 # the cached one). Nothing here overlaps with the copy anyway.
                 x_batch = x_train_cpu[idx].to(device)
                 b = x_batch.shape[0]
-                # Fresh random rotation for every image each time it's seen.
-                angles = (torch.rand(b, device=device) * 2 - 1) * ANGLE_RANGE_DEG
-                x_rot = rotate_batch(x_batch, angles)
-                y_batch = (angles / ANGLE_RANGE_DEG).unsqueeze(-1)
+                # Fresh random grating for every image each time it's seen.
+                freq, orient, phase, amp = sample_grating_params(
+                    b, device=device, amp_min=args.amp_min, amp_max=args.amp_max)
+                x_grt = add_grating(x_batch, freq, orient, phase, amp)
+                y_batch = freq_to_target(freq).unsqueeze(-1)
 
                 if args.optimizer == "gnome":
                     k = min(K, max(1, b - 1))
                     a_idx = torch.randperm(b, device=device)[:k]
-                    x_main, y_main = x_rot, y_batch
-                    x_aux, y_aux = x_rot[a_idx], y_batch[a_idx]
+                    x_main, y_main = x_grt, y_batch
+                    x_aux, y_aux = x_grt[a_idx], y_batch[a_idx]
 
                     def main_closure():
                         return model(x_main), y_main
@@ -272,7 +315,7 @@ def main():
                     loss = opt.step(main_closure, aux_closure)
                 else:
                     opt.zero_grad()
-                    loss = F.mse_loss(model(x_rot), y_batch)
+                    loss = F.mse_loss(model(x_grt), y_batch)
                     loss.backward()
                     opt.step()
                 if scheduler is not None:
@@ -290,12 +333,12 @@ def main():
 
                 if (not args.quiet) and args.log_every > 0 and step % args.log_every == 0:
                     avg = window_sum / max(window_n, 1)
-                    # loss is MSE on the [-1,1] angle target, so sqrt(avg)*90 is
-                    # a human-readable train RMSE in degrees.
-                    rmse_deg = (avg ** 0.5) * ANGLE_RANGE_DEG
+                    # loss is MSE on the [-1,1] frequency target, so
+                    # sqrt(avg) * TARGET_TO_CYCLES is a train RMSE in cycles.
+                    rmse_cyc = (avg ** 0.5) * TARGET_TO_CYCLES
                     print(f"    step {step:6d}  epoch {epoch:3d}  "
                           f"train_loss[last {window_n}]={avg:.4f}  "
-                          f"(~{rmse_deg:.1f}° RMSE)", flush=True)
+                          f"(~{rmse_cyc:.2f} cyc RMSE)", flush=True)
                     window_sum, window_n = 0.0, 0
 
             # ---- validation ----
@@ -308,18 +351,18 @@ def main():
                 ss_res = ((val_pred - y_val) ** 2).sum().item()
                 ss_tot = ((y_val - y_val.mean()) ** 2).sum().item()
                 r2 = 1.0 - ss_res / max(ss_tot, 1e-12)
-                mae_deg = (val_pred - y_val).abs().mean().item() * ANGLE_RANGE_DEG
-            best_mae_deg = min(best_mae_deg, mae_deg)
+                mae_cycles = (val_pred - y_val).abs().mean().item() * TARGET_TO_CYCLES
+            best_mae_cycles = min(best_mae_cycles, mae_cycles)
             run.log_val(step, epoch=epoch, loss=val_loss, r2=r2,
-                        mae_deg=mae_deg, lr=current_lr(opt))
+                        mae_cycles=mae_cycles, lr=current_lr(opt))
             if not args.quiet:
                 print(f"  epoch {epoch:3d}/{args.epochs}  val_loss={val_loss:.4f}  "
-                      f"r2={r2:.4f}  mae_deg={mae_deg:.2f}", flush=True)
+                      f"r2={r2:.4f}  mae_cycles={mae_cycles:.3f}", flush=True)
 
-        run.finish(completed=True, final_mae_deg=mae_deg,
-                   best_mae_deg=best_mae_deg, final_val_loss=val_loss)
-    print(f"[{EXPERIMENT}] done → final_mae_deg={mae_deg:.2f}  "
-          f"best_mae_deg={best_mae_deg:.2f}", flush=True)
+        run.finish(completed=True, final_mae_cycles=mae_cycles,
+                   best_mae_cycles=best_mae_cycles, final_val_loss=val_loss)
+    print(f"[{EXPERIMENT}] done → final_mae_cycles={mae_cycles:.3f}  "
+          f"best_mae_cycles={best_mae_cycles:.3f}", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -329,6 +372,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--amp-min", type=float, default=AMP_MIN,
+                   help="Lower end of the per-sample grating amplitude (drawn "
+                        "log-uniformly), on the same [-1,1] scale as the image. "
+                        "The amplitude range is the difficulty knob: widening it "
+                        "confounds the energy-magnitude shortcut but lowers SNR "
+                        "against image clutter. amp_min == amp_max makes the "
+                        "task ~94%% solvable by total variation alone.")
+    p.add_argument("--amp-max", type=float, default=AMP_MAX,
+                   help="Upper end of the per-sample grating amplitude.")
     p.add_argument("--trust-region", type=float, default=1.0,
                    help="Gnome per-coordinate update bound: lambda is set to "
                         "the smallest value with max|m̂/(v̂+lambda)| <= this, "

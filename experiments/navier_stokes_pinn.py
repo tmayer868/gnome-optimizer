@@ -28,9 +28,9 @@ Network outputs ``(u, v, p)`` directly (no streamfunction parameterization),
 so continuity enters as an explicit residual block — giving Gnome the harder
 4-conflicting-block test rather than the streamfunction's 3.
 
-The baselines (SOAP, AdamW) get a linear-warmup + cosine-decay schedule
-(``--cosine-decay`` sets the final-lr fraction; 1.0 disables it); Gnome runs at
-a fixed lr — its Gauss-Newton step self-anneals as the residual shrinks.
+Every optimizer gets the same linear-warmup + cosine-decay schedule
+(``--cosine-decay`` sets the final-lr fraction; 1.0 gives warmup then constant,
+which suits Gnome since its step self-anneals as the residual shrinks).
 
 Usage:
 
@@ -56,7 +56,7 @@ from experiments.common import (
     DIVERGED_EXIT,
     diverged,
     RunLogger,
-    baseline_cosine_scheduler,
+    cosine_scheduler,
     current_lr,
     pick_device,
 )
@@ -376,25 +376,26 @@ def build_optimizer(
     name: str, params, lr: float, weight_decay: float,
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
     beta1: float = 0.9, beta2: float = 0.99,
+    trust_region: float = 1.0,
 ):
     """Construct the optimizer and its LR schedule.
 
-    Returns ``(optimizer, config, scheduler_or_None)``. Gnome runs at a fixed
-    lr (its Gauss-Newton step self-anneals as the residual shrinks) so it gets
-    no scheduler — only its own internal warmup. SOAP and AdamW get the
-    standard linear-warmup + cosine-decay treatment; ``cosine_decay`` is the
-    final-lr fraction (0.0 → decay to zero, 1.0 → decay disabled).
+    Returns ``(optimizer, config, scheduler)``. Every optimizer gets the same
+    linear-warmup + cosine-decay schedule; ``cosine_decay`` is the final-lr
+    fraction (0.0 -> decay to zero, 1.0 -> warmup then constant). On MSE, 1.0
+    is the natural setting for Gnome -- its Gauss-Newton step self-anneals as
+    the residual shrinks -- where the gradient-RMS baselines do want the decay.
     """
     if name == "gnome":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10,
-            clip=1.0, warmup=warmup,
+            trust_radius=(trust_region if trust_region > 0 else None),
             loss="mse", precondition_1d=True,
         )
-        return Gnome(params, **cfg), cfg, None
-    if name == "soap":
+        opt = Gnome(params, **cfg)
+    elif name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
@@ -410,7 +411,7 @@ def build_optimizer(
     else:
         raise ValueError(f"unknown optimizer: {name}")
 
-    scheduler = baseline_cosine_scheduler(opt, warmup, total_steps, cosine_decay)
+    scheduler = cosine_scheduler(opt, warmup, total_steps, cosine_decay)
     cfg["warmup"] = warmup
     cfg["cosine_decay_floor"] = cosine_decay
     return opt, cfg, scheduler
@@ -431,6 +432,13 @@ def parse_args() -> argparse.Namespace:
                    help="Fresh collocation points per step.")
     p.add_argument("--aux-frac", type=float, default=0.03)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--trust-region", type=float, default=1.0,
+                   help="Gnome per-coordinate update bound: lambda is set to "
+                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
+                        "so no coordinate moves more than lr*trust_region in "
+                        "a step. Larger -> weaker bound -> longer steps. "
+                        "0 disables it, falling back to plain m̂/(v̂+eps) "
+                        "damping.")
     p.add_argument("--eps", type=float, default=1e-6,
                    help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
                         "-> more gradient-descent-like, smaller -> fuller Newton "
@@ -444,9 +452,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hidden", type=int, default=128)
     p.add_argument("--depth", type=int, default=8)
     p.add_argument("--warmup-steps", type=int, default=200,
-                   help="Linear LR warmup steps. For the SOAP/AdamW baselines "
-                        "this is the schedule warmup; for Gnome it is passed "
-                        "as its internal `warmup=`.")
+                   help="Linear LR warmup steps, applied to every optimizer.")
     p.add_argument("--cosine-decay", type=float, default=0.0,
                    help="Final-LR fraction for the baseline cosine decay: 0.0 "
                         "decays to zero (standard treatment), 1.0 disables "
@@ -483,6 +489,7 @@ def train(args: argparse.Namespace) -> str:
         warmup=args.warmup_steps, total_steps=args.steps,
         cosine_decay=args.cosine_decay, eps=args.eps,
         beta1=args.beta1, beta2=args.beta2,
+        trust_region=args.trust_region,
     )
 
     n_pde_aux = max(8, int(args.n_pde * args.aux_frac))

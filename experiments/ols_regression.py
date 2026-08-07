@@ -18,10 +18,11 @@ loss); in ``||beta_hat - beta_true||`` it is plain. The one-line version:
 *AdamW can't fit a linear regression — so why trust it on any regression
 problem?*
 
-To give the baselines their standard strong treatment they get a linear-warmup
-+ cosine-decay schedule (``--cosine-decay`` sets the final-lr fraction; ``0.0``
-decays to zero, ``1.0`` disables decay to show the raw hovering failure). Gnome
-runs at a fixed lr regardless. Decaying the baselines to zero lets them *settle*
+Every optimizer gets the same linear-warmup + cosine-decay schedule
+(``--cosine-decay`` sets the final-lr fraction; ``0.0`` decays to zero, ``1.0``
+gives warmup then constant). ``1.0`` is the setting that shows the point of
+this experiment: with no decay to lean on, the baselines hover and Gnome still
+walks onto the exact solution. Decaying the baselines to zero lets them *settle*
 — but at whatever point the hovering ball froze, which still sits above the
 exact solution Gnome reaches on its own. That is the honest, harder-to-rebut
 framing: not "the baselines can't converge," but "the baselines need a
@@ -59,7 +60,7 @@ from experiments.common import (
     DIVERGED_EXIT,
     diverged,
     RunLogger,
-    baseline_cosine_scheduler,
+    cosine_scheduler,
     current_lr,
     pick_device,
 )
@@ -72,21 +73,22 @@ def build_optimizer(
     name: str, params, lr: float, weight_decay: float,
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
     beta1: float = 0.9, beta2: float = 0.99,
+    trust_region: float = 1.0,
 ):
     """Construct the optimizer and its LR schedule.
 
-    Returns ``(optimizer, config, scheduler_or_None)``. Gnome (MSE) runs at a
-    fixed lr — its Gauss-Newton step self-anneals as the residual shrinks — so
-    it gets no scheduler (just its own internal warmup). SOAP and AdamW get the
-    standard linear-warmup + cosine-decay treatment; ``cosine_decay`` is the
-    final-lr fraction (``0.0`` → decay to zero, ``1.0`` → decay disabled).
+    Returns ``(optimizer, config, scheduler)``. Every optimizer gets the same
+    linear-warmup + cosine-decay treatment; ``cosine_decay`` is the final-lr
+    fraction (``0.0`` → decay to zero, ``1.0`` → warmup then constant). Gnome
+    needs no decay to converge here — its Gauss-Newton step self-anneals as the
+    residual shrinks — which is what ``1.0`` is for.
     """
     if name == "gnome":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10,
-            clip=1.0, warmup=warmup,
+            trust_radius=(trust_region if trust_region > 0 else None),
             loss="mse", precondition_1d=True,
         )
         opt = Gnome(params, **cfg)
@@ -94,8 +96,7 @@ def build_optimizer(
         # opt.step(...); it is not a Gnome constructor arg. Recorded in the
         # returned config for logging and to set K below.
         cfg["aux_batch_size"] = 10
-        return opt, cfg, None
-    if name == "soap":
+    elif name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
@@ -111,7 +112,7 @@ def build_optimizer(
     else:
         raise ValueError(f"unknown optimizer: {name}")
 
-    scheduler = baseline_cosine_scheduler(opt, warmup, total_steps, cosine_decay)
+    scheduler = cosine_scheduler(opt, warmup, total_steps, cosine_decay)
     cfg["warmup"] = warmup
     cfg["cosine_decay_floor"] = cosine_decay
     return opt, cfg, scheduler
@@ -151,6 +152,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-2)
+    p.add_argument("--trust-region", type=float, default=1.0,
+                   help="Gnome per-coordinate update bound: lambda is set to "
+                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
+                        "so no coordinate moves more than lr*trust_region in "
+                        "a step. Larger -> weaker bound -> longer steps. "
+                        "0 disables it, falling back to plain m̂/(v̂+eps) "
+                        "damping.")
     p.add_argument("--eps", type=float, default=1e-6,
                    help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
                         "-> more gradient-descent-like, smaller -> fuller Newton "
@@ -172,8 +180,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--noise-std", type=float, default=0.1,
                    help="Standard deviation of additive Gaussian label noise.")
     p.add_argument("--warmup-steps", type=int, default=200,
-                   help="Linear LR warmup steps for the SOAP/AdamW baselines "
-                        "(Gnome uses its own internal warmup).")
+                   help="Linear LR warmup steps, applied to every optimizer.")
     p.add_argument("--cosine-decay", type=float, default=0.0,
                    help="Final-LR fraction for the baseline cosine decay: 0.0 "
                         "decays to zero (standard treatment), 1.0 disables "
@@ -263,6 +270,7 @@ def main():
     opt, opt_cfg, scheduler = build_optimizer(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
         args.warmup_steps, total_steps, args.cosine_decay, args.eps, args.beta1, args.beta2,
+        args.trust_region,
     )
 
     K = opt_cfg.get("aux_batch_size", 10) if args.optimizer == "gnome" else 0

@@ -10,17 +10,19 @@ into a second-order method:
    therefore aligned with curvature directions of the loss surface rather
    than with the directions of past gradients.
 
-2. **Newton step in the rotated basis, clip as trust region.** SOAP runs an
-   Adam update inside the rotated basis (gradient divided by ``sqrt`` of a
-   second-moment EMA). Gnome runs a Newton step instead — the rotated
+2. **Newton step in the rotated basis, with an l2 trust region.** SOAP runs
+   an Adam update inside the rotated basis (gradient divided by ``sqrt`` of
+   a second-moment EMA). Gnome runs a Newton step instead — the rotated
    gradient divided by the *un-square-rooted* curvature EMA — which is the
    diagonal Gauss-Newton update inside the eigenbasis. A pure Newton step
-   has no built-in step-size control, so Gnome bounds the per-coordinate
-   update with ``clip`` (default ``1.0``) in both the rotated and
-   rotated-back bases. The clip acts as a trust region, not a band-aid:
-   when curvature is well-conditioned it never binds, but it prevents
-   blow-ups from small denominators while the eigenbasis is still warming
-   up.
+   has no built-in step-size control, so Gnome damps it with a
+   Levenberg-Marquardt ``lambda`` chosen as the smallest value satisfying
+   ``||m / (v + lambda)||_2 <= trust_radius * sqrt(P)``, with ``P`` the
+   element count of the parameter tensor. Because ``Q_L`` and ``Q_R`` are
+   orthonormal the l2 norm survives the rotation back, so the bound holds
+   in parameter space too. It is a trust region, not a band-aid: when
+   curvature is well-conditioned it never binds, but it prevents blow-ups
+   from small denominators while the eigenbasis is still warming up.
 
 Gnome supports three explicit loss types — chosen via the ``loss`` constructor
 arg — so that the curvature scaling is unambiguous and reduction-independent:
@@ -67,6 +69,28 @@ own graph immediately — no ``retain_graph``, no held activations between
 passes. The optimizer never writes into ``p.grad``; gradients are
 obtained via ``torch.autograd.grad`` and applied directly.
 
+**Learning-rate schedules.** Gnome does not own a schedule. ``group["lr"]``
+is read fresh on every step and multiplies the update *after* the
+trust-region solve, so it scales step length linearly and any stock
+``torch.optim.lr_scheduler`` drives Gnome exactly as it drives AdamW::
+
+    opt = Gnome(model.parameters(), lr=1e-3, loss='mse')
+    sched = torch.optim.lr_scheduler.SequentialLR(
+        opt,
+        [torch.optim.lr_scheduler.LinearLR(opt, 0.01, 1.0, total_iters=200),
+         torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total - 200)],
+        milestones=[200],
+    )
+
+    for ...:
+        opt.step(main_closure, aux_closure)
+        sched.step()
+
+On MSE the Gauss-Newton step self-anneals as the residual shrinks, so a
+decay schedule is optional there in a way it is not for gradient-RMS
+methods; a warmup is still usually worth having while the eigenbasis is
+cold.
+
 .. _SOAP: https://arxiv.org/abs/2409.11321
 """
 
@@ -78,7 +102,7 @@ from typing import Callable, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch.optim.optimizer import Optimizer
-import numpy as np
+import math
 
 ClosureReturn = Tuple[torch.Tensor, torch.Tensor]
 
@@ -137,9 +161,9 @@ class Gnome(Optimizer):
     are built from a Hutchinson estimate of the **Generalized Gauss-Newton**
     matrix (not the loss-gradient outer products SOAP uses), and the update
     inside the rotated basis is a **Newton step** — rotated gradient divided
-    by the curvature EMA, no ``sqrt`` — bounded by ``clip`` as a
-    trust-region safeguard rather than tuned by an Adam-style epsilon. See
-    the module docstring for the full design.
+    by the curvature EMA, no ``sqrt`` — bounded by an **l2 trust region**
+    rather than tuned by an Adam-style epsilon. See the module docstring for
+    the full design.
 
     Args:
         params: Iterable of parameters or parameter groups.
@@ -153,27 +177,44 @@ class Gnome(Optimizer):
             how aggressively curvature is used. Larger values pull the update
             toward gradient descent; smaller values toward a pure Newton step.
         weight_decay: Decoupled weight decay coefficient.
+        norm_free: Normalize each squared-surrogate contribution to unit norm
+            before it enters the curvature EMA, so ``betas[1]`` controls
+            recency rather than being overridden by a decaying ``||g_s||``.
+            Off by default: it also removes the residual-driven self-annealing
+            that lets Gnome hold a fixed lr on MSE. Turn it on for
+            fast-learning objectives (classification), where the loss moves a
+            long way inside one EMA window and there is no annealing to lose.
+            Note it rescales ``v_hat``, so ``lr`` generally needs retuning
+            when toggled.
         precondition_frequency: Steps between eigenbasis refreshes.
         max_precond_dim: Modes larger than this are skipped (no Kronecker
             factor maintained along that dimension).
-        clip: If not None, clamp the per-coordinate update magnitude to
-            ``[-clip, +clip]`` in both the rotated and the rotated-back
-            bases. Acts as a trust-region safeguard: at sensible learning
-            rates it does nothing, but it prevents blow-ups from pathological
-            denominators (e.g. early steps with a noisy eigenbasis estimate).
-            Pass ``None`` to disable.
+        trust_radius: l2 trust region on the update in the rotated basis.
+            ``lambda`` is set to the smallest value (floored at ``eps``) for
+            which ``||m / (v + lambda)||_2 <= trust_radius * sqrt(P)``, with
+            ``P = p.numel()``. The ``sqrt(P)`` scaling is what makes a single
+            value work across layers of different width: the l2 norm of the
+            step grows as ``sqrt(P)``, so dividing it out leaves
+            ``trust_radius`` as a dimensionless RMS-per-coordinate bound —
+            roughly the typical per-element update magnitude, in units of
+            ``lr``. Typical values are 0.1 to 1.0. Larger = weaker bound =
+            longer steps; ``None`` disables the solve and falls back to plain
+            ``m / (v + eps)`` damping.
+
+            Because the bound is on the l2 norm and the ``Q`` matrices are
+            orthonormal, it transfers exactly to the parameter basis. A
+            uniform ``lambda`` also shrinks the step along the
+            Newton-to-gradient-descent continuum without distorting its
+            direction, unlike a per-coordinate clamp, and no single
+            coordinate with a spuriously small ``v_i`` can set the damping
+            for a whole tensor.
         max_grad_norm: If not None, clip the global L2 norm of the main
             gradient (across all parameters, à la
             ``torch.nn.utils.clip_grad_norm_``) to this value each step before
             it enters the update. Applies only to the main loss gradient, not
-            the curvature surrogate. Default None; the per-coordinate ``clip``
-            trust region is the usual safeguard, but a global norm clip can
-            help on steps where the raw gradient spikes.
-        warmup: Number of steps over which the learning rate is linearly
-            ramped from zero to ``lr``. At step ``k`` (1-indexed) the
-            effective learning rate is ``lr * min(k / warmup, 1.0)``. Pass
-            ``0`` to disable internal warmup (e.g. when using an external
-            scheduler).
+            the curvature surrogate. Default None; the ``trust_radius`` region
+            is the usual safeguard, but a global norm clip can help on steps
+            where the raw gradient spikes.
         loss: One of ``"mse"`` (mean-squared error for regression),
             ``"cce"`` (softmax cross-entropy with Fisher-sampling surrogate),
             or ``"cce_hutchinson"`` (softmax cross-entropy with a Rademacher
@@ -199,9 +240,9 @@ class Gnome(Optimizer):
         weight_decay: float = 0.01,
         precondition_frequency: int = 10,
         max_precond_dim: int = 10000,
-        clip: Optional[float] = 1.0,
         max_grad_norm: Optional[float] = None,
-        warmup: int = 200,
+        trust_radius: Optional[float] = 1.0,
+        norm_free: bool = False,
         loss: str = "mse",
         merge_dims: bool = False,
         precondition_1d: bool = False,
@@ -215,12 +256,10 @@ class Gnome(Optimizer):
             raise ValueError(f"Invalid beta2: {betas[1]}")
         if eps < 0.0:
             raise ValueError(f"Invalid eps: {eps}")
-        if clip is not None and clip <= 0.0:
-            raise ValueError(f"Invalid clip: {clip}")
         if max_grad_norm is not None and max_grad_norm <= 0.0:
             raise ValueError(f"Invalid max_grad_norm: {max_grad_norm}")
-        if warmup < 0:
-            raise ValueError(f"Invalid warmup: {warmup}")
+        if trust_radius is not None and trust_radius <= 0.0:
+            raise ValueError(f"Invalid trust_radius: {trust_radius}")
         if loss not in ("mse", "cce", "cce_hutchinson"):
             raise ValueError(
                 f"Invalid loss mode: {loss!r}; "
@@ -239,15 +278,46 @@ class Gnome(Optimizer):
             max_precond_dim=max_precond_dim,
             merge_dims=merge_dims,
             precondition_1d=precondition_1d,
-            clip=clip,
-            warmup=warmup,
+            trust_radius=trust_radius,
         )
         super().__init__(params, defaults)
         self._data_format = data_format
         self._loss_mode = loss
         # Global (all-parameter) main-gradient norm clip; None disables it.
         self._max_grad_norm = max_grad_norm
+        # Optimizer-level (not per-group): normalize each squared-surrogate
+        # contribution to unit norm before it enters the curvature EMA. See
+        # _param_step for why, and why it is off by default.
+        self._norm_free = norm_free
+        # Global step counter: one increment per step() call, regardless of how
+        # many micro-batch closures it was given. Distinct from the per-tensor
+        # state["step"], which lags it by one (the first step builds the
+        # eigenbasis and returns without updating).
         self._step_count = 0
+
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+
+    def state_dict(self) -> dict:
+        """``Optimizer.state_dict`` plus Gnome's optimizer-level counters.
+
+        ``_step_count`` is a plain instance attribute rather than per-parameter
+        state, so the base implementation would silently drop it and a resumed
+        run would restart the counter from zero.
+        """
+        sd = super().state_dict()
+        sd["gnome"] = {"step_count": self._step_count}
+        return sd
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        extra = state_dict.get("gnome")
+        if extra is not None:
+            # Hand the base implementation only the keys it knows about.
+            state_dict = {k: v for k, v in state_dict.items() if k != "gnome"}
+        super().load_state_dict(state_dict)
+        if extra is not None:
+            self._step_count = int(extra["step_count"])
 
     # ------------------------------------------------------------------
     # SOAP machinery: dim merging, Kronecker factor maintenance, projection
@@ -319,7 +389,10 @@ class Gnome(Optimizer):
             grad = self._merge_dims(grad, max_precond_dim)
         for mat in state["Q"]:
             if len(mat) > 0:
-                grad = torch.tensordot(grad, mat, dims=[[0], [0]])
+                # Q is stored in the eigen-decomposition's float32 working
+                # precision; align it to grad's dtype (a no-op for float32
+                # params, an upcast for float64) so the projection matches.
+                grad = torch.tensordot(grad, mat.to(grad.dtype), dims=[[0], [0]])
             else:
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
@@ -345,7 +418,7 @@ class Gnome(Optimizer):
             grad = self._merge_dims(grad, max_precond_dim)
         for mat in state["Q"]:
             if len(mat) > 0:
-                grad = torch.tensordot(grad, mat, dims=[[0], [1]])
+                grad = torch.tensordot(grad, mat.to(grad.dtype), dims=[[0], [1]])
             else:
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
@@ -381,8 +454,13 @@ class Gnome(Optimizer):
 
         if G_s.dim() == 1:
             if precondition_1d and G_s.shape[0] <= max_precond_dim:
-                state["GG"][0].lerp_(
-                    G_s.unsqueeze(1) @ G_s.unsqueeze(0),
+                gg = state["GG"][0]
+                # GG is kept in float32 (the preconditioner's internal working
+                # precision, matching _eigh_safe); cast the contribution to its
+                # dtype so higher-precision (e.g. float64) grads accumulate. For
+                # float32 grads this .to() is a no-op and behaviour is unchanged.
+                gg.lerp_(
+                    (G_s.unsqueeze(1) @ G_s.unsqueeze(0)).to(gg.dtype),
                     1 - state["shampoo_beta"],
                 )
         else:
@@ -395,7 +473,8 @@ class Gnome(Optimizer):
                             [*chain(range(idx), range(idx + 1, len(ref.shape)))]
                         ] * 2,
                     )
-                    state["GG"][idx].lerp_(outer, 1 - state["shampoo_beta"])
+                    gg = state["GG"][idx]
+                    gg.lerp_(outer.to(gg.dtype), 1 - state["shampoo_beta"])
 
         if state["Q"] is None:
             state["Q"] = self._eigvecs_descending(state["GG"])
@@ -576,6 +655,58 @@ class Gnome(Optimizer):
     # ------------------------------------------------------------------
     # Step
     # ------------------------------------------------------------------
+    @staticmethod
+    def _lm_lambda(m, v, T, eps, lam_prev=None, iters=3):
+        """Smallest lambda >= eps with ``|| m / (v + lambda) ||_2 <= T``.
+
+        The l2 trust-region solve. ``T`` is ``trust_radius * sqrt(P)`` (see
+        the ``trust_radius`` docstring for why ``sqrt(P)``); the caller is
+        ``_param_step``, which runs this once per parameter tensor in the
+        rotated basis.
+
+        ``phi(lambda) = || m / (v + lambda) ||_2`` is strictly decreasing, so
+        the root is unique when ``phi(eps) > T``; otherwise the constraint is
+        slack and the bracket floor keeps ``lambda = eps`` (an undamped
+        Newton step). Newton is run on Hebden's reciprocal form
+        ``1/T - 1/phi``, which is nearly linear in lambda and converges in
+        2-3 iterations, warm-started from the previous step's lambda inside
+        an analytic bracket derived from ``min(v)`` and ``max(v)``. All ops
+        stay on device -- no ``.item()``, no convergence check, no sync.
+
+        Aggregating over all P coordinates is what keeps ``lambda(T)``
+        smooth: by the implicit function theorem there are no argmax kinks,
+        and no single coordinate with a spuriously small ``v_i`` can set the
+        damping for a whole tensor. (An l-infinity bound would give a closed
+        form instead of this solve, but has exactly that outlier
+        sensitivity; ``l_p`` for large p is the middle ground, and is this
+        solver with the exponent changed.)
+
+        **Do not "simplify" the dphi line.** ``.clamp_max`` binds to ``.sum()``
+        before the unary minus, so ``-(q/d).sum().clamp_max(-1e-30)`` clamps a
+        *positive* sum to -1e-30 and negates it to +1e-30 -- wrong sign and
+        wrong magnitude, which makes Newton saturate the bracket instead of
+        solving for the root, silently pinning lambda at the bracket bottom.
+        The parenthesization below is load-bearing.
+        """
+        m2 = m * m
+        gn = m2.sum().sqrt()
+        ratio = gn / T
+
+        # Analytic bracket from vmin <= v_i <= vmax.
+        lo = (ratio - v.max()).clamp_(min=eps)
+        hi = (ratio - v.min()).clamp_(min=eps)
+        hi = torch.maximum(hi, lo)  # guard against v.min ~ v.max
+
+        lam = lo if lam_prev is None else lam_prev.clamp(lo, hi)
+
+        for _ in range(iters):
+            d = v + lam
+            q = m2 / (d * d)
+            phi = q.sum().sqrt().clamp_min(1e-30)
+            dphi = (-(q / d).sum()).clamp_max(-1e-30) / phi
+            lam = (lam - phi * (phi / T - 1.0) / dphi).clamp(lo, hi)
+
+        return lam
 
     def step(  # type: ignore[override]
         self,
@@ -790,11 +921,10 @@ class Gnome(Optimizer):
 
         state["step"] += 1
         beta1, beta2 = group["betas"]
-        clip = group["clip"]
-        warmup = group["warmup"]
+        # Read fresh each step, so an external torch.optim.lr_scheduler that
+        # mutates group["lr"] takes effect immediately. Gnome applies no
+        # schedule of its own.
         lr = group["lr"]
-        if warmup > 0:
-            lr = lr * max(min((self._step_count-1) / warmup, 1.0), .01)
         grad_m, gnd_m = state["grad_m"], state["gnd_m"]
 
         # Project loss gradient and surrogate into the GGN-derived eigenbasis.
@@ -810,7 +940,25 @@ class Gnome(Optimizer):
         )
 
         # GND estimate in the rotated basis: squared surrogate, EMA-aggregated.
-        gnd_m.mul_(beta2).add_(Gs_rot.square(), alpha=(1.0 - beta2))
+        gs_sq = Gs_rot.square()
+        if self._norm_free:
+            # Normalize each contribution to unit norm before it enters the EMA.
+            #
+            # An EMA weights the step k back by beta2**k, but what it weights is
+            # ||g_s||^2, so the effective weight is beta2**k * ||g_s(t-k)||^2.
+            # When the surrogate magnitude decays faster than beta2**k shrinks,
+            # the *oldest* entries still in the window carry the most mass and
+            # the curvature estimate tracks a scale that is already obsolete.
+            # Dividing it out makes beta2 control recency again.
+            #
+            # Off by default because it also removes the self-annealing that
+            # lets Gnome hold a fixed lr on MSE: there, v_hat shrinking with the
+            # residual is the mechanism, not a bug. Turn it on for fast-learning
+            # objectives (classification), where the loss moves a long way
+            # inside one EMA window and there is no residual-driven annealing
+            # to preserve.
+            gs_sq = gs_sq / gs_sq.norm().clamp_min(1e-30)
+        gnd_m.mul_(beta2).add_(gs_sq, alpha=(1.0 - beta2))
 
         # Gradient EMA in the rotated basis.
         grad_m.mul_(beta1).add_(g_rot, alpha=(1.0 - beta1))
@@ -821,23 +969,40 @@ class Gnome(Optimizer):
         grad_hat = grad_m / bc1
         gnd_hat = gnd_m / bc2
 
-        # Adam/GNOME-style step in the rotated basis.
-        update_rot = grad_hat / gnd_hat.add(group["eps"])
-        if np.random.rand() < .00:
-            shape = gnd_hat.shape
-            prop = (gnd_hat < group["eps"]).float().mean().item()
-            print(f"Layer Shape: {shape} || Proportion < eps {prop:.5f}")
-        if clip is not None:
-            update_rot = update_rot.clamp(min=-clip, max=clip)
+        # Trust-region damping, solved here in the rotated basis where the
+        # curvature is diagonal and the constraint is therefore a statement
+        # about a diagonal quadratic model.
+        #
+        #   trust_radius is None -> lam = eps, the plain fixed-damping step
+        #   otherwise            -> smallest lam >= eps with
+        #                           ||update||_2 <= trust_radius * sqrt(P)
+        #
+        # Larger trust_radius = weaker bound = longer steps. The bound is on
+        # the update itself, so ||delta_theta||_2 <= lr * trust_radius *
+        # sqrt(P), and since the Q matrices are orthonormal that survives the
+        # projection back: the knob is an RMS-per-coordinate budget, in units
+        # of lr.
+        eps = group["eps"]
+        trust_radius = group["trust_radius"]
+        if trust_radius is None:
+            lam = eps
+        else:
+            T = trust_radius * math.sqrt(p.numel())
+            lam = self._lm_lambda(grad_hat, gnd_hat, T, eps,
+                                  lam_prev=state.get("lm_lambda"))
+            state["lm_lambda"] = lam
 
-        # Rotate back into the parameter basis.
+        # Newton step in the rotated basis, damped by lam.
+        update_rot = grad_hat / gnd_hat.add(lam)
+
+        # Rotate back into the parameter basis. Orthonormal Q means the l2
+        # norm — and hence the trust-region bound — carries over exactly, so
+        # no further per-coordinate safeguard is applied here.
         update = self._project_back(
             update_rot, state,
             merge_dims=group["merge_dims"],
             max_precond_dim=group["max_precond_dim"],
         )
-        if clip is not None:
-            update = update.clamp(min=-clip, max=clip)
 
         p.add_(update, alpha=-lr)
         if group["weight_decay"] > 0.0:

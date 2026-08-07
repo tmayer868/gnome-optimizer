@@ -17,7 +17,7 @@ $$
 
 periodically diagonalizes them ($L = Q_L \Lambda_L Q_L^\top$, $R = Q_R \Lambda_R Q_R^\top$), rotates the gradient into the joint eigenbasis ($\tilde g = Q_L^\top g \, Q_R$), runs Adam there ($\tilde m$, $\tilde v$ EMAs, update $\tilde m / (\sqrt{\tilde v} + \varepsilon)$), and rotates the result back. The Kronecker structure is what makes the eigendecompositions tractable for large weight matrices; the rotation is what gives Adam a basis in which the curvature is approximately axis-aligned.
 
-The piece of SOAP we want to inherit is the Kronecker-eigenbasis machinery itself. The piece we want to replace is the **signal** it is fed — SOAP's $L_t$ and $R_t$ are built from past loss gradients, i.e. an empirical-Fisher proxy.
+The piece of SOAP we want to inherit is the Kronecker-eigenbasis machinery itself. The piece we want to replace is the **signal** it is fed. SOAP's $L_t$ and $R_t$ are built from past loss gradients, i.e. an empirical-Fisher proxy.
 
 ## 2. From SOAP to Gnome: two changes
 
@@ -35,19 +35,40 @@ where $J_\theta = \partial \hat y / \partial \theta$ is the model Jacobian and $
 
 The factor refresh schedule, eigendecomposition, dim-merging, and projection logic are all carried over from SOAP unchanged.
 
-**(b) Newton step inside the rotated basis; clip as trust region.**
+**(b) Newton step inside the rotated basis, with an l2 trust region.**
 
 SOAP's rotated-basis update is $\tilde m / (\sqrt{\tilde v} + \varepsilon)$. Gnome's is
 
 $$
-\Delta \tilde\theta \;=\; \frac{\hat m}{\hat v + \varepsilon}
+\Delta \tilde\theta \;=\; \frac{\hat m}{\hat v + \lambda}
 $$
 
-— the un-square-rooted denominator. This is the diagonal Gauss-Newton update inside the eigenbasis: $\hat v$ is the second-moment EMA of the rotated surrogate gradient, which in expectation is the diagonal of the GGN in the eigenbasis, so dividing the rotated loss gradient by $\hat v$ is the per-coordinate Newton step.
+with the un-square-rooted denominator. This is the diagonal Gauss-Newton update inside the eigenbasis: $\hat v$ is the second-moment EMA of the rotated surrogate gradient, which in expectation is the diagonal of the GGN in the eigenbasis, so dividing the rotated loss gradient by $\hat v$ is the per-coordinate Newton step.
 
-A pure Newton step has no built-in step-size control. We bound the per-coordinate update with `clip` (default 1.0) in *both* the rotated basis (before un-rotating) and the parameter basis (after un-rotating). At sensible learning rates the clip almost never binds; its role is to prevent blow-ups from small denominators while the eigenbasis is warming up, not to be the primary step-size knob. `eps` retains its physical meaning as a curvature *damping* term (larger pulls toward gradient descent, smaller toward pure Newton), not as Adam's numerical-safety constant.
+A pure Newton step has no built-in step-size control. Gnome imposes an **l2 trust region** on the update in the rotated basis:
 
-The dimensional argument for the un-square-rooted denominator: if we model the rotated gradient as $\tilde g \sim \mathcal{N}(0, \tilde H)$ with $\tilde H$ the rotated GGN, then $\mathbb{E}[\tilde g^2] = \tilde H$. The Newton-rescaled coordinate has units $[\text{grad}] / [\text{curvature}]$ — i.e. $\tilde g / \tilde H$. Adam's $\sqrt{\tilde v}$ has the wrong units ($\sqrt{[\text{curvature}]}$); it is a heuristic for the gradient *norm*, not the curvature. Gnome's $\hat v$ has the right units.
+$$
+\| \Delta\tilde\theta \|_2 \;\le\; T \;=\; c \cdot \sqrt{P},
+$$
+
+where $P$ is the number of elements in the parameter tensor and $c$ is the `trust_radius` hyperparameter (typically $0.1$ to $1.0$). The smallest $\lambda \ge \varepsilon$ that satisfies this constraint is found by solving the secular equation
+
+$$
+\phi(\lambda) \;=\; \left\| \frac{\hat m}{\hat v + \lambda} \right\|_2 \;=\; T,
+$$
+
+via Hebden's reciprocal Newton method. Convergence takes 2 to 3 iterations, warm-started from the previous step's $\lambda$, with an analytic bracket derived from $\min(\hat v)$ and $\max(\hat v)$. All computation stays on-device with no Python scalar syncs.
+
+**Why l2 rather than per-coordinate clipping.** The rotation matrices $Q$ are orthonormal (eigenvectors of real symmetric Kronecker factors), so the L2 norm is preserved: $\|\Delta\tilde\theta\|_2 = \|\Delta\theta\|_2$. The trust region is therefore meaningful in both spaces. An l2 bound has two advantages over per-coordinate clipping:
+
+1. **It preserves the update direction.** Uniform damping shrinks the step along the Newton-to-gradient-descent continuum without distorting which coordinates move relative to each other. Per-coordinate clipping projects onto an l-infinity ball, which can scramble the relative ordering of updates.
+2. **No single coordinate dominates.** The l2 norm aggregates all $P$ coordinates, so an outlier with spuriously small $\hat v_i$ cannot single-handedly set the damping for the entire tensor.
+
+**Why $\sqrt{P}$ scaling.** The L2 norm of the Newton step naturally scales as $\sqrt{P}$ (sum of $P$ squared terms). Without the $\sqrt{P}$ factor, a single $c$ could not work across layers of different widths. The scaling makes $c$ a dimensionless "RMS per-coordinate" bound, roughly the allowed typical per-element update magnitude. This is directly analogous to the old per-coordinate `clip=1.0`, but enforced through the L2 budget rather than by projection.
+
+**Behavior at the extremes.** When curvature is well-estimated and the unconstrained Newton step already satisfies $\|\hat m / \hat v\|_2 \le T$, the constraint is slack: $\lambda = \varepsilon$ and the update is a pure diagonally-preconditioned Newton step. When curvature is unreliable (small $\hat v_i$, e.g. early in training while the eigenbasis is still warming up), $\lambda$ grows and the update degrades smoothly toward $\hat m / \lambda$, which is bounded gradient descent in the rotated basis. The trust region is a safeguard, not the primary step-size control; at sensible learning rates and $c \sim 1$ it rarely binds on well-conditioned steps.
+
+The dimensional argument for the un-square-rooted denominator: if we model the rotated gradient as $\tilde g \sim \mathcal{N}(0, \tilde H)$ with $\tilde H$ the rotated GGN, then $\mathbb{E}[\tilde g^2] = \tilde H$. The Newton-rescaled coordinate has units $[\text{grad}] / [\text{curvature}]$, i.e. $\tilde g / \tilde H$. Adam's $\sqrt{\tilde v}$ has the wrong units ($\sqrt{[\text{curvature}]}$); it is a heuristic for the gradient *norm*, not the curvature. Gnome's $\hat v$ has the right units.
 
 ## 3. The GGN matrix
 
@@ -84,7 +105,7 @@ $$
 \text{GGN} \;=\; J^\top H_y J \;=\; J^\top A \, A^\top J \;=\; (J^\top A)(J^\top A)^\top.
 $$
 
-The crucial observation: for every loss in §5, $H_y$ depends only on the model output $\hat y$ (and the target, in some cases) — *not* on $\theta$. So the square root $A$ inherits the same property and can be written in closed form for each loss family. **No second-order autograd is required at any point**; we never differentiate $H_y$ through $\theta$.
+The crucial observation: for every loss in §5, $H_y$ depends only on the model output $\hat y$ (and the target, in some cases), not on $\theta$. So the square root $A$ inherits the same property and can be written in closed form for each loss family. **No second-order autograd is required at any point**; we never differentiate $H_y$ through $\theta$.
 
 **Step 2: Express $J^\top A$ as a gradient.** Treating $A$ as detached from autograd, define
 
@@ -92,7 +113,7 @@ $$
 z \;=\; \hat y^\top A \quad \text{(a row vector of length $\dim A$)}.
 $$
 
-Then $J^\top A = \partial z / \partial \theta$ — precisely what `autograd.grad` returns when differentiating $z$'s components w.r.t.\ $\theta$.
+Then $J^\top A = \partial z / \partial \theta$, which is precisely what `autograd.grad` returns when differentiating $z$'s components w.r.t.\ $\theta$.
 
 **Step 3: Reduce to a scalar via a random probe.** A single scalar suffices to backward through. Inner-product $z$ with a random vector $R$:
 
@@ -112,14 +133,14 @@ $$
 \mathbb{E}\!\left[g_s\, g_s^\top\right] \;=\; J^\top A \, \mathbb{E}[R R^\top] \, A^\top J.
 $$
 
-This equals the GGN $J^\top A A^\top J$ **if and only if** $\mathbb{E}[R_i R_j] = \delta_{ij}$ — i.e.\ $R$ has uncorrelated unit-variance components. Two cheap distributions satisfy this:
+This equals the GGN $J^\top A A^\top J$ **if and only if** $\mathbb{E}[R_i R_j] = \delta_{ij}$, i.e. $R$ has uncorrelated unit-variance components. Two cheap distributions satisfy this:
 
 - **Rademacher**: $R_i \in \{\pm 1\}$ independently with equal probability.
 - **Unit Gaussian**: $R_i \sim \mathcal{N}(0, 1)$ iid.
 
 Both yield unbiased GGN estimators. The Rademacher choice has strictly lower variance (the standard Hutchinson estimator argument: same first two moments, lowest fourth moment) and is the default in Gnome.
 
-**Step 5: Average over the aux batch.** The aux batch contains $K$ samples; each has its own $\hat y_k$, its own output Hessian factor $A_k$ (which generally depends on $\hat y_k$ and so varies per sample — see §5.3 for the CCE case), and its own independent random vector $R_k$. The surrogate sums them with a $1/\sqrt K$ normalization:
+**Step 5: Average over the aux batch.** The aux batch contains $K$ samples; each has its own $\hat y_k$, its own output Hessian factor $A_k$ (which generally depends on $\hat y_k$ and so varies per sample; see §5.3 for the CCE case), and its own independent random vector $R_k$. The surrogate sums them with a $1/\sqrt K$ normalization:
 
 $$
 S \;=\; \frac{1}{\sqrt K} \sum_{k=1}^{K} \hat y_k^\top A_k R_k,
@@ -127,7 +148,7 @@ S \;=\; \frac{1}{\sqrt K} \sum_{k=1}^{K} \hat y_k^\top A_k R_k,
 g_s \;=\; \frac{1}{\sqrt K} \sum_{k=1}^{K} J_k^\top A_k R_k.
 $$
 
-Taking expectations — with each $R_k$ independent across $k$, so $\mathbb{E}[R_k R_j^\top] = I \cdot \delta_{kj}$ — gives the empirical GGN over the aux batch:
+Taking expectations, with each $R_k$ independent across $k$ so $\mathbb{E}[R_k R_j^\top] = I \cdot \delta_{kj}$, gives the empirical GGN over the aux batch:
 
 $$
 \mathbb{E}_R\!\left[g_s g_s^\top\right] \;=\; \frac{1}{K} \sum_{k=1}^{K} J_k^\top H_{y,k} J_k.
@@ -139,11 +160,11 @@ $$
 \mathbb{E}_{R,\,\text{batch}}\!\left[g_s g_s^\top\right] \;=\; \mathbb{E}_{x,y}\!\left[J^\top H_y J\right] \;=\; \text{GGN}, \qquad \text{for any } K \ge 1.
 $$
 
-The estimator is unbiased at every batch size. $K$ controls **variance**, not bias: with the $1/\sqrt K$ scaling, $\mathbb{E}\|g_s\|^2$ is independent of $K$ but $\mathrm{Var}(g_s)$ decreases as $K$ grows. The $1/\sqrt K$ normalization thus decouples the surrogate's scale from the aux batch size $K$ entirely, so `eps` and `clip` calibrate against a fixed-scale surrogate regardless of $K$. (`tests/test_surrogate_scaling.py` pins this empirically across $K \in \{1,4,16,64\}$.)
+The estimator is unbiased at every batch size. $K$ controls **variance**, not bias: with the $1/\sqrt K$ scaling, $\mathbb{E}\|g_s\|^2$ is independent of $K$ but $\mathrm{Var}(g_s)$ decreases as $K$ grows. The $1/\sqrt K$ normalization thus decouples the surrogate's scale from the aux batch size $K$ entirely, so `eps` and `trust_radius` calibrate against a fixed-scale surrogate regardless of $K$. (`tests/test_surrogate_scaling.py` pins this empirically across $K \in \{1,4,16,64\}$.)
 
-The explicit per-sample sum is the uniform notation that handles all three losses in §5. For MSE and BCE, $A_k$ doesn't depend on $k$ (it's either constant or a per-element function of detached logits), and the sum collapses into a single inner product over `(batch × output_dim)` axes — both losses can be written in batched-tensor form. For CCE, $A_k$ varies per sample through the softmax probabilities $p_k$, so the sum is genuinely a per-sample operation.
+The explicit per-sample sum is the uniform notation that handles all three losses in §5. For MSE and BCE, $A_k$ doesn't depend on $k$ (it's either constant or a per-element function of detached logits), and the sum collapses into a single inner product over `(batch × output_dim)` axes. Both losses can be written in batched-tensor form. For CCE, $A_k$ varies per sample through the softmax probabilities $p_k$, so the sum is genuinely a per-sample operation.
 
-So the entire construction reduces to: **given a loss, write down a closed-form square root $A$ of its output Hessian.** Section 5 collects $A$ for each loss family. The optimizer currently exposes three via the `loss=` argument — `'mse'`, `'cce'`, and `'cce_hutchinson'`; BCE is included below to show the recipe generalizes (it is the diagonal special case of CCE), not as a shipped option.
+So the entire construction reduces to: **given a loss, write down a closed-form square root $A$ of its output Hessian.** Section 5 collects $A$ for each loss family. The optimizer currently exposes three via the `loss=` argument: `'mse'`, `'cce'`, and `'cce_hutchinson'`. BCE is included below to show the recipe generalizes (it is the diagonal special case of CCE), not as a shipped option.
 
 - **MSE**: $H_y = 2I$, so $A = \sqrt 2 \, I$.
 - **BCE**: $H_y = \mathrm{diag}(p(1-p))$, so $A = \mathrm{diag}\!\big(\sqrt{p(1-p)}\big)$.
@@ -172,12 +193,12 @@ $$
 $$
 
 Two notes:
-- The main loss is built internally as `((y_hat - y)**2).sum() / B` (sum over output dim, mean over batch). This matches the per-element $H_y = 2I$ contract — using `mean` over both dims would divide $g_{\text{main}}$ by the output dim while the surrogate scale is per-element, breaking the relative scale that `eps` and `clip` are calibrated against.
-- No double backward is needed. Knowing $H_y = 2I$ in closed form means we don't have to call any second-order autograd primitive — just multiply logits by random signs and `autograd.grad` through.
+- The main loss is built internally as `((y_hat - y)**2).sum() / B` (sum over output dim, mean over batch). This matches the per-element $H_y = 2I$ contract. Using `mean` over both dims would divide $g_{\text{main}}$ by the output dim while the surrogate scale is per-element, breaking the relative scale that `eps` and `trust_radius` are calibrated against.
+- No double backward is needed. Knowing $H_y = 2I$ in closed form means we don't have to call any second-order autograd primitive. Just multiply logits by random signs and `autograd.grad` through.
 
 ### 5.2 BCE (binary cross-entropy with logits)
 
-*Not a shipped `loss=` option — described here for completeness, since it is the diagonal special case of the CCE surrogate in §5.3.*
+*Not a shipped `loss=` option. Described here for completeness, since it is the diagonal special case of the CCE surrogate in §5.3.*
 
 Per-element: predict logit $z$, target $y \in \{0, 1\}$, with $p = \sigma(z)$ and
 
@@ -192,7 +213,7 @@ $$
 \frac{\partial^2 \ell}{\partial z^2} \;=\; p(1-p).
 $$
 
-So $H_y$ is diagonal with entries $p_i(1 - p_i)$ — the per-element Bernoulli variance. The natural square root is $A = \mathrm{diag}(\sqrt{p(1-p)})$. Drawing per-element Rademacher signs $\varepsilon$:
+So $H_y$ is diagonal with entries $p_i(1 - p_i)$, the per-element Bernoulli variance. The natural square root is $A = \mathrm{diag}(\sqrt{p(1-p)})$. Drawing per-element Rademacher signs $\varepsilon$:
 
 $$
 v \;=\; \sqrt{p(1-p)} \odot \varepsilon, \qquad
@@ -206,7 +227,7 @@ $$
 $$
 
 Construction notes:
-- $p$ must be `detach`ed before being used to build $v$. The gradient should flow through $z$ (the logits), not through $p$ — $p$ enters only as a scaling factor for the Rademacher probe. Otherwise we'd be sampling an estimator of $J^\top (\partial_\theta H_y) J + J^\top H_y J$, not the GGN.
+- $p$ must be `detach`ed before being used to build $v$. The gradient should flow through $z$ (the logits), not through $p$. The probabilities enter only as a scaling factor for the Rademacher probe. Otherwise we'd be sampling an estimator of $J^\top (\partial_\theta H_y) J + J^\top H_y J$, not the GGN.
 - Like MSE, no double backward: $H_y$ is known in closed form once we have $p$.
 - The construction is the diagonal special case of the CCE surrogate below (with $K_{\text{classes}} = 2$ and the simplex-projection term vanishing).
 
@@ -218,7 +239,7 @@ $$
 H_y \;=\; \mathrm{diag}(p) - p p^\top,
 $$
 
-which is non-diagonal — but admits a closed-form square root computable in $O(K_c)$:
+which is non-diagonal but admits a closed-form square root computable in $O(K_c)$:
 
 $$
 A \;=\; \mathrm{diag}(\sqrt p)\, \big(I - \sqrt p \, \sqrt p^{\,\top}\big).
@@ -243,41 +264,64 @@ A R \;=\; \mathrm{diag}(\sqrt p) R - \mathrm{diag}(\sqrt p)\, \sqrt p \big(\sqrt
 \;=\; \sqrt p \odot R - (\sqrt p \cdot R) \, p,
 $$
 
-where the second equality uses $\mathrm{diag}(\sqrt p)\, \sqrt p = \sqrt p \odot \sqrt p = p$. This is $O(K_c)$ work per sample (no explicit $K_c \times K_c$ matrix is ever materialized) and plugs straight into the §4 recipe with $\mathbb{E}[(AR)(AR)^\top] = H_y$ *exactly* per sample — not just in expectation over labels.
+where the second equality uses $\mathrm{diag}(\sqrt p)\, \sqrt p = \sqrt p \odot \sqrt p = p$. This is $O(K_c)$ work per sample (no explicit $K_c \times K_c$ matrix is ever materialized) and plugs straight into the §4 recipe with $\mathbb{E}[(AR)(AR)^\top] = H_y$ *exactly* per sample, not just in expectation over labels.
 
-**Aside (MC alternative).** The Fisher / K-FAC tradition replaces the square-root factorization with Monte Carlo label sampling: draw a fake label $\tilde y_k \sim \mathrm{Categorical}(p_k)$ from the model's own predictive distribution and use $\mathtt{F.cross\_entropy}(z_k, \tilde y_k)$ as the surrogate. Its logit gradient is $v = p - e_{\tilde y}$, and since $\mathbb{E}[e_{\tilde y}] = p$,
+Gnome ships two CCE surrogate strategies, selectable via the `loss=` argument:
+
+| `loss=` | Surrogate | Mechanism |
+|---|---|---|
+| `'cce'` | Fisher sampling | Draw $\tilde y \sim \text{Categorical}(p)$, use `cross_entropy(z, \tilde y)` |
+| `'cce_hutchinson'` | Rademacher Hutchinson | Use the $A R$ probe above directly |
+
+**Fisher sampling (`'cce'`).** The classical K-FAC / Fisher approach: draw a fake label $\tilde y_k \sim \mathrm{Categorical}(p_k)$ from the model's own predictive distribution and use $\mathtt{F.cross\_entropy}(z_k, \tilde y_k)$ as the surrogate. Its logit gradient is $v = p - e_{\tilde y}$, and since $\mathbb{E}[e_{\tilde y}] = p$,
 
 $$
 \mathbb{E}_{\tilde y \sim p}\big[v v^\top\big] \;=\; \mathrm{Cov}(e_{\tilde y}) \;=\; \mathrm{diag}(p) - p p^\top \;=\; H_y ,
 $$
 
-so the outer products have the correct GGN expectation with no factorization of $H_y$ involved — the label randomness plays the role of the Rademacher probe, with the softmax's own covariance standing in for $A A^\top$. We use Rademacher Hutchinson instead for consistency with the §4 recipe and for lower variance — Hutchinson's $AR$ uses every class simultaneously, while MC sampling's $p - e_{\tilde y}$ is a rank-1 contribution aligned with a single class direction per sample.
+so the outer products have the correct GGN expectation with no explicit factorization of $H_y$. Simple to implement and understand; the label draw plays the role of the random probe.
 
-**Variance behaviour.** As the model becomes confident ($p$ approaches a one-hot vector), $\sqrt p \odot R$ collapses to a near-one-hot vector and the simplex-projection term $(\sqrt p \cdot R)\, p$ cancels the surviving coordinate. The variance of the estimator decays toward zero with the Gini impurity of $p$, so late in training — exactly when classification gradients are sharp and the MC alternative's single-class probe becomes most wasteful — Hutchinson approaches a noise-free preconditioner.
+**Hutchinson (`'cce_hutchinson'`).** Uses the Rademacher $A R$ probe from the §4 recipe directly. Compared to Fisher sampling:
 
-**Implementation traps.** Two ways to silently break the estimator:
+- **Lower variance.** The $A R$ probe uses every class simultaneously (a dense vector in $\mathbb{R}^{K_c}$), while Fisher sampling's $p - e_{\tilde y}$ is a rank-1 contribution aligned with a single class direction. For a given aux batch size $K$, Hutchinson extracts more information per sample.
+- **Variance decays with confidence.** As the model becomes confident ($p$ approaches a one-hot vector), $\sqrt p \odot R$ collapses to a near-one-hot vector and the simplex-projection term $(\sqrt p \cdot R)\, p$ cancels the surviving coordinate. The estimator variance decays toward zero with the Gini impurity of $p$. Late in training, when classification gradients are sharp and Fisher sampling's single-class probe becomes most wasteful, Hutchinson approaches a noise-free preconditioner.
+- **Cost.** Both are $O(K_c)$ per aux sample. Hutchinson has a small constant-factor overhead from the additional `sqrt`, `sum`, and elementwise ops.
 
-1. **Broadcasting.** $R$ must be an independent $\{\pm 1\}^{K_c}$ sample *per (sample, class)*. Sharing one $K_c$-vector across the batch makes $\mathbb{E}[R_n R_m^\top] = I \ne 0$ for $n \ne m$, injecting a covariance bias between unrelated samples that destroys the batched-GGN identity.
-2. **BatchNorm.** The per-sample GGN sum assumes the Jacobian of sample $n$ does not depend on sample $m$. BatchNorm couples the forward pass across the batch dim, breaking the block-diagonal structure of the true batched Hessian. Use GroupNorm or LayerNorm in any architecture trained under `cce_hutchinson` (or `cce`).
+**Common pitfalls (both modes).** Two ways to silently break the estimator:
+
+1. **Broadcasting.** Random probes must be independent per (sample, class). Sharing one $K_c$-vector across the batch makes $\mathbb{E}[R_n R_m^\top] = I \ne 0$ for $n \ne m$, injecting a covariance bias between unrelated samples that destroys the batched-GGN identity.
+2. **BatchNorm.** The per-sample GGN sum assumes the Jacobian of sample $n$ does not depend on sample $m$. BatchNorm couples the forward pass across the batch dim, breaking the block-diagonal structure of the true batched Hessian. Use GroupNorm or LayerNorm in any architecture trained under `'cce'` or `'cce_hutchinson'`.
 
 ## 6. The full step
 
 For each minibatch, with `main_closure` returning $(\hat y, y)$ on the $B-K$ main slice and `aux_closure` returning $(\hat y_{\text{aux}}, y_{\text{aux}})$ on the disjoint $K$ aux slice:
 
 1. **Main forward + backward.** Compute the main loss internally (`mse` → sum-over-D-mean-over-B, `cce` / `cce_hutchinson` → `reduction='mean'`). Gradient $g_{\text{main}} = \nabla_\theta \ell_{\text{main}}$ via `autograd.grad`. Free the main graph.
+
+   *Gradient accumulation.* When the full main batch does not fit in memory, `main_closure` can be a **list of closures**, one per micro-batch. Each runs an independent forward+backward, and their gradients are combined as a size-weighted average (weighted by each micro-batch's sample count). The result matches a single forward over the concatenation of all micro-batches exactly, regardless of how they were chunked. The eigenbasis $Q$ and all EMAs update once per logical step; the aux surrogate still runs once.
+
+   *Global gradient clipping.* If `max_grad_norm` is set, the accumulated main gradient is rescaled so its total L2 norm (across all parameters) does not exceed the given value, matching `torch.nn.utils.clip_grad_norm_`. The curvature surrogate gradient $g_s$ is intentionally left unclipped. Its scale is calibrated by the $1/\sqrt{K}$ normalization and should not be distorted.
+
 2. **Aux forward + backward.** Build $S$ per §5 from the aux logits and sampled randomness. Gradient $g_s = \nabla_\theta S$. Free the aux graph.
+
 3. **Per-parameter update.** For each parameter tensor:
    - Update the Kronecker factors $L, R$ with EMA from $g_s g_s^\top$ and $g_s^\top g_s$ (`shampoo_beta`).
    - If on the refresh schedule, recompute the eigenbases $Q_L, Q_R$ (full `eigh` on first build, one step of subspace iteration + QR thereafter).
    - Project $g_{\text{main}}$ and $g_s$ into the rotated basis: $\tilde g = Q_L^\top g\, Q_R$.
    - Update the first-moment EMA from $\tilde g_{\text{main}}$ (`beta1`) and the second-moment EMA from $\tilde g_s^{\,2}$ (`beta2`).
-   - Compute the rotated Newton step: $\Delta \tilde\theta = \hat m / (\hat v + \varepsilon)$, clip per-coordinate to $\pm$`clip`.
-   - Project back to the parameter basis; clip again.
-   - Apply with $-\text{lr}_{\text{eff}}$ (linear warmup over `warmup` steps), then decoupled weight decay.
+   - Apply bias correction to obtain $\hat m$ and $\hat v$.
+   - Solve for the trust-region damping $\lambda$: the smallest value $\ge \varepsilon$ such that $\|\hat m / (\hat v + \lambda)\|_2 \le c \cdot \sqrt{P}$, where $c$ is `trust_radius` and $P$ is the number of elements in the parameter tensor. Solved via Hebden's reciprocal Newton method (2 to 3 iterations), warm-started from the previous step's $\lambda$, with an analytic bracket from $\min(\hat v)$ and $\max(\hat v)$.
+   - Compute the damped Newton step: $\Delta \tilde\theta = \hat m / (\hat v + \lambda)$.
+   - Project back to the parameter basis: $\Delta\theta = Q_L \, \Delta\tilde\theta \, Q_R^\top$. Because the $Q$ matrices are orthonormal, $\|\Delta\theta\|_2 = \|\Delta\tilde\theta\|_2$. The trust region bound is preserved exactly.
+   - Apply with $-\text{lr}$, then decoupled weight decay. Gnome owns no learning-rate schedule: `lr` is read from the parameter group on every step and multiplies the update *after* the trust-region solve, so it scales step length linearly and any `torch.optim.lr_scheduler` drives Gnome exactly as it drives AdamW.
 
 Two independent forward passes (one for main, one for aux) cost more than a single shared forward, but mean we don't need `retain_graph=True` and don't have to hold the main batch's activations alive while running the surrogate backward. The aux batch is small (default $K=10$), so the second pass is cheap.
 
 `grad_m` (a vector quantity in the rotated basis) is translated through eigenbasis refreshes: it is rotated back to the parameter basis before the new $Q$ is computed and projected forward into the new basis afterwards. `gnd_m` (a diagonal variance) is permuted along the corresponding tensor axis to match the new eigenvalue ordering but is not re-rotated, matching SOAP's treatment of `exp_avg_sq`.
+
+### 6.1 The `norm_free` option
+
+By default, the squared surrogate $\tilde g_s^2$ enters the curvature EMA directly. When the surrogate magnitude decays faster than the EMA window (common early in classification training), the oldest entries still in the window carry the most mass and the curvature estimate tracks an obsolete scale. Setting `norm_free=True` normalizes each contribution to unit norm before it enters the EMA, so `beta2` controls recency rather than being overridden by a decaying $\|g_s\|$. Off by default: on MSE objectives the shrinking $\hat v$ is the self-annealing mechanism that lets Gnome hold a fixed learning rate, and normalizing would remove it. Turn it on for fast-learning objectives (classification) where the loss moves a long way inside one EMA window. Note that it rescales $\hat v$, so `lr` generally needs retuning when toggled.
 
 ## 7. Why the un-square-rooted denominator (again, briefly)
 
@@ -287,12 +331,12 @@ $$
 \mathbb{E}\!\left[\tilde g_s^{\,2}\right]_i \;=\; \mathbb{E}\!\left[(Q^\top g_s)_i^2\right] \;=\; (Q^\top \text{GGN}\, Q)_{ii} \;\approx\; d_i.
 $$
 
-So $\hat v \approx d$, and $\hat m / \hat v$ is the per-coordinate Newton step in the rotated basis. The Adam denominator $\sqrt{\hat v}$ has the wrong units for a Newton step (it scales like $\sqrt{\text{curvature}}$, not curvature), which is why Adam needs $\varepsilon$ as a numerical-safety constant calibrated against the gradient norm — and why moving curvature from "noisy outer product of gradients" to "true GGN estimate" only pays off when we also move the denominator from $\sqrt{\hat v}$ to $\hat v$.
+So $\hat v \approx d$, and $\hat m / \hat v$ is the per-coordinate Newton step in the rotated basis. The Adam denominator $\sqrt{\hat v}$ has the wrong units for a Newton step (it scales like $\sqrt{\text{curvature}}$, not curvature), which is why Adam needs $\varepsilon$ as a numerical-safety constant calibrated against the gradient norm. Moving curvature from "noisy outer product of gradients" to "true GGN estimate" only pays off when we also move the denominator from $\sqrt{\hat v}$ to $\hat v$.
 
 ## 8. Multi-block losses (PINNs)
 
 A PINN loss is a weighted sum of per-block mean-squared residuals,
-$L = \sum_j \lambda_j \, \mathrm{mean}_i(r_{j,i}^2)$ — one block for the PDE residual on collocation points, one for the initial condition, one per boundary condition, and (for inverse problems) one per data-fit term. Because every block is an MSE, the whole loss rides the §5.1 MSE surrogate unchanged: `gnome.stack_residuals` folds the blocks into a single flat residual vector whose plain `mean(·²)` reproduces $L$ exactly, and the automatic $\sqrt 2\,\varepsilon$ Rademacher probe on that vector decomposes into the per-block independent GGN estimator.
+$L = \sum_j \lambda_j \, \mathrm{mean}_i(r_{j,i}^2)$. One block for the PDE residual on collocation points, one for the initial condition, one per boundary condition, and (for inverse problems) one per data-fit term. Because every block is an MSE, the whole loss rides the §5.1 MSE surrogate unchanged: `gnome.stack_residuals` folds the blocks into a single flat residual vector whose plain `mean(·²)` reproduces $L$ exactly, and the automatic $\sqrt 2\,\varepsilon$ Rademacher probe on that vector decomposes into the per-block independent GGN estimator.
 
 Concretely, scaling block $j$ by $\alpha_j = \sqrt{\lambda_j N / N_j}$ (with $N_j$ the block's element count and $N = \sum_j N_j$) gives $\mathrm{mean}(\text{stacked}^2) = \sum_j \lambda_j\,\mathrm{mean}_i(r_{j,i}^2)$, and the surrogate gradient $g_s = \sum_j \sqrt{2\lambda_j / N_j}\,J_j^\top \varepsilon_{(j)}$ has
 
@@ -302,10 +346,9 @@ $$
 
 the true multi-block GGN with the right $\lambda_j$ weights. Cross-block terms vanish exactly because $\varepsilon$ is drawn per coordinate, so no probe is shared across blocks. Higher-order input derivatives ($u_t$, $u_{xx}$, ...) built with `create_graph=True` differentiate back to $\theta$ through the stacked tensor unchanged.
 
-The four PINN benchmarks in this repo — Poisson, Burgers, Kuramoto–Sivashinsky, and the Navier–Stokes inverse problem — all use this with **equal block weights** ($\lambda_j = 1$): no causal training, no grad-norm balancing, no hand-tuned loss weights.
+The four PINN benchmarks in this repo (Poisson, Burgers, Kuramoto–Sivashinsky, and the Navier–Stokes inverse problem) all use this with **equal block weights** ($\lambda_j = 1$): no causal training, no grad-norm balancing, no hand-tuned loss weights.
 
 ## 9. What's not covered here
 
 * **Adaptive block weighting.** Causal/temporal weighting and grad-norm balancing schemes are orthogonal to Gnome and are deliberately omitted so the optimizer comparison is clean. `stack_residuals` accepts static per-block $\lambda_j$ but does not adapt them during training.
 * **Losses without a closed-form output-Hessian square root.** The whole construction hinges on writing $A$ with $A A^\top = H_y$ in closed form (§5). A loss whose intrinsic output Hessian is not analytically factorizable would need a different surrogate.
-
