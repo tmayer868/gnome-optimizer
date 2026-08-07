@@ -24,7 +24,7 @@ Two architectures, selectable via ``--arch``:
   The multi-block loss is the same plain ``gnome.stack_residuals``
   pattern with equal block weights used throughout these experiments.
 
-Two input embeddings, selectable via ``--embed`` (both architectures):
+Three input embeddings, selectable via ``--embed`` (both architectures):
 
 * ``none`` (default) feeds raw ``[t, x]`` and the periodic BC is imposed
   *softly*, as a third residual block matching ``u`` and ``u_x`` across
@@ -34,6 +34,15 @@ Two input embeddings, selectable via ``--embed`` (both architectures):
   machine precision for ``u`` and *every* x-derivative, so the soft BC
   block is redundant and is **dropped** (two blocks instead of three).
   This is how jaxpi imposes exact periodic BCs for Allen-Cahn.
+* ``fourier`` feeds ``[sin(zB), cos(zB)]`` with ``z = [t, x]`` the raw
+  coordinates and ``B`` a *trainable* matrix initialized ``~ N(0, scale²)``,
+  sized by ``--embed-dim`` and ``--embed-scale``. The frequencies are
+  learned, so ``--embed-scale`` sets the starting bandwidth rather than the
+  final one. Projecting raw ``x`` means the frequencies are not multiples
+  of ``k``, so this is **not** exactly periodic and it keeps the soft BC
+  block (three blocks, like ``none``). Both departures from jaxpi — which
+  freezes ``B`` and applies it on top of the periodic features — are
+  deliberate.
 
 All optimizers share the chosen network so the only variable is the
 optimizer. Every optimizer gets the same linear-warmup + cosine-decay schedule
@@ -48,6 +57,8 @@ Usage:
 
     uv run -m experiments.allen_cahn_pinn --optimizer gnome --arch modified
     uv run -m experiments.allen_cahn_pinn --optimizer soap  --arch mlp
+    uv run -m experiments.allen_cahn_pinn --optimizer gnome \
+        --embed fourier --embed-dim 32 --embed-scale 10
     uv run -m experiments.allen_cahn_pinn --optimizer adamw --arch modified
     uv run -m experiments.allen_cahn_pinn --optimizer gnome --embed periodic
 """
@@ -107,11 +118,52 @@ class PeriodicEmbed(nn.Module):
         return torch.cat([t, torch.cos(k * x), torch.sin(k * x)], dim=1)
 
 
-def build_embedding(embed: str) -> nn.Module:
+class FourierEmbed(nn.Module):
+    """Trainable Fourier features over raw ``(t, x)``: ``[sin(zB), cos(zB)]``
+    with ``z = [t, x]`` and ``B`` initialized ``~ N(0, scale²)``.
+
+    ``B`` is an ``nn.Parameter``, so the frequencies are *learned* rather
+    than frozen at init (unlike Tancik et al. 2020 and jaxpi, which both
+    keep them fixed). ``scale`` therefore sets the starting bandwidth, not
+    the final one — the network can migrate frequencies during training. It
+    still matters as an initialization: too high and the loss surface starts
+    rough enough that the optimizer struggles to move ``B`` usefully at all.
+
+    Because the projection is over raw ``x`` rather than the periodic
+    features, the frequencies are not multiples of ``k = 2π/L`` and the
+    network is **not** exactly period-2 in x. The soft BC block is therefore
+    kept for this embedding (three blocks, as with ``--embed none``).
+    """
+
+    out_dim: int
+
+    def __init__(self, embed_dim: int = 256, scale: float = 10.0):
+        super().__init__()
+        if embed_dim % 2 != 0:
+            raise ValueError(f"--embed-dim must be even, got {embed_dim}")
+        if scale <= 0.0:
+            raise ValueError(f"--embed-scale must be positive, got {scale}")
+        self.out_dim = embed_dim
+        # sin and cos of each projection, hence embed_dim // 2 columns.
+        weights = torch.randn(3, embed_dim // 2) * scale
+        weights[:, 2] = .01 * weights[:, 2]
+        self.B = nn.Parameter(weights)
+
+
+    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        raw_vars = torch.cat([t, x, torch.ones_like(x)], dim=1)
+        p = raw_vars @ self.B
+        return torch.cat([torch.sin(p), torch.cos(p)], dim=1)
+
+
+def build_embedding(embed: str, embed_dim: int = 256,
+                    scale: float = 10.0) -> nn.Module:
     if embed == "none":
         return RawEmbed()
     if embed == "periodic":
         return PeriodicEmbed()
+    if embed == "fourier":
+        return FourierEmbed(embed_dim, scale)
     raise ValueError(f"unknown embedding: {embed}")
 
 
@@ -380,13 +432,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--arch", choices=["mlp", "modified"], default="modified",
                    help="Network: plain tanh MLP or the gated modified MLP "
                         "(Wang et al. 2021). --hidden / --depth control both.")
-    p.add_argument("--embed", choices=["none", "periodic"], default="none",
+    p.add_argument("--embed", choices=["none", "periodic", "fourier"],
+                   default="none",
                    help="Input embedding. 'none' feeds raw [t, x] and keeps "
                         "the soft periodic BC block. 'periodic' feeds "
                         "[t, cos(pi x), sin(pi x)], making the network "
                         "exactly period-2 in x — periodicity then holds for "
                         "every derivative and the BC block is DROPPED (two "
-                        "blocks instead of three).")
+                        "blocks instead of three). 'fourier' feeds trainable "
+                        "Fourier features [sin(zB), cos(zB)] over raw "
+                        "z = [t, x]; not exactly periodic, so it KEEPS the "
+                        "BC block. See --embed-dim / --embed-scale.")
+    p.add_argument("--embed-dim", type=int, default=256,
+                   help="Fourier feature output dim (even). --embed fourier.")
+    p.add_argument("--embed-scale", type=float, default=10.0,
+                   help="Init bandwidth of the Fourier frequencies: "
+                        "B ~ N(0, scale^2). B is trained, so this is the "
+                        "starting point, not a fixed bandwidth — but a high "
+                        "init still gives a rough surface to start from. "
+                        "Sweep it. --embed fourier.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--steps", type=int, default=100_000,
                    help="Allen-Cahn is stiff; may want more than the default.")
@@ -452,10 +516,14 @@ def train(args: argparse.Namespace) -> str:
                       f"— using CPU.", flush=True)
             device = torch.device("cpu")
     torch.manual_seed(args.seed)
-    # The periodic embedding satisfies the BC block exactly, so it is dropped.
-    use_bc = args.embed == "none"
+    # Only 'periodic' satisfies the BC block exactly, so it is the only one
+    # that drops it. 'fourier' projects raw (t, x) at frequencies that are not
+    # multiples of k, so it needs the soft BC block just as 'none' does.
+    use_bc = args.embed != "periodic"
     model = build_model(
-        args.arch, build_embedding(args.embed), args.hidden, args.depth
+        args.arch,
+        build_embedding(args.embed, args.embed_dim, args.embed_scale),
+        args.hidden, args.depth,
     ).to(device)
     opt, opt_cfg, scheduler = build_optimizer(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
@@ -474,6 +542,8 @@ def train(args: argparse.Namespace) -> str:
         "optimizer": args.optimizer,
         "arch": args.arch,
         "embed": args.embed,
+        "embed_dim": args.embed_dim if args.embed == "fourier" else None,
+        "embed_scale": args.embed_scale if args.embed == "fourier" else None,
         "blocks": ["pde", "ic", "bc"] if use_bc else ["pde", "ic"],
         "steps": args.steps,
         "hidden": args.hidden,
