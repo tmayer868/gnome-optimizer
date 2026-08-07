@@ -9,7 +9,7 @@ from experiments.common.run_log import (
     make_run_id,
 )
 from experiments.common.schedule import (
-    baseline_cosine_scheduler,
+    cosine_scheduler,
     cosine_with_warmup,
     current_lr,
 )
@@ -22,7 +22,7 @@ __all__ = [
     "RunRecord",
     "load_run",
     "make_run_id",
-    "baseline_cosine_scheduler",
+    "cosine_scheduler",
     "cosine_with_warmup",
     "current_lr",
 ]

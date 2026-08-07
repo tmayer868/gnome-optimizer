@@ -53,7 +53,7 @@ from experiments.common import (
     diverged,
     RunLogger,
     pick_device,
-    baseline_cosine_scheduler,
+    cosine_scheduler,
     current_lr,
 )
 from experiments.common.resnet import build_model, MODEL_NAMES
@@ -183,9 +183,9 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
                     trust_region=1.0):
     """Return ``(optimizer, config, scheduler)`` with conv-friendly defaults.
 
-    MSE regression, so the repo protocol applies: Gnome runs at a fixed
-    learning rate (self-anneals; no scheduler), while SOAP/AdamW get warmup +
-    cosine decay to a ``cosine_decay`` final-LR fraction. ``precondition_1d`` is
+    Every optimizer gets the same linear-warmup + cosine-decay schedule, to a
+    ``cosine_decay`` final-LR fraction. On MSE, 1.0 (warmup then constant) is
+    the natural setting for Gnome, whose step self-anneals with the residual. ``precondition_1d`` is
     off — the small 1D norm gamma/beta tensors carry no cross-coordinate
     structure worth a Kronecker factor.
     """
@@ -194,7 +194,7 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10,
-            warmup=warmup, loss="mse", precondition_1d=False,
+            loss="mse", precondition_1d=False,
             trust_radius=(trust_region if trust_region > 0 else None),
             norm_free=False,
         )
@@ -203,8 +203,7 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
         # opt.step(...); it is not a Gnome constructor arg. Recorded in the
         # returned config for logging and to set K below.
         cfg["aux_batch_size"] = 10
-        return opt, cfg, None
-    if name == "soap":
+    elif name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
@@ -217,7 +216,7 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
     else:
         raise ValueError(f"unknown optimizer: {name}")
     cfg["warmup"] = warmup   # unified meta key across optimizers
-    scheduler = baseline_cosine_scheduler(opt, warmup, total_steps, cosine_decay)
+    scheduler = cosine_scheduler(opt, warmup, total_steps, cosine_decay)
     return opt, cfg, scheduler
 
 
@@ -403,8 +402,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--norm", choices=["gn", "bn"], default="gn",
                    help="Normalization: GroupNorm (default) or BatchNorm.")
     p.add_argument("--warmup-steps", type=int, default=100,
-                   help="LR warmup steps. Baselines warmup then cosine-decay; "
-                        "Gnome uses this as its internal warmup only.")
+                   help="LR warmup steps, applied to every optimizer.")
     p.add_argument("--cosine-decay", type=float, default=1.0,
                    help="Final-LR fraction for the SOAP/AdamW cosine decay: "
                         "0.0 decays to zero (default), 1.0 disables decay. "

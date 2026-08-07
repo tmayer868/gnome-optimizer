@@ -16,11 +16,11 @@ Optimizer choices:
     * ``soap``               — empirical-Fisher SOAP baseline
     * ``adamw``              — first-order baseline
 
-Unlike the MSE experiments (where Gnome runs a fixed lr), this CCE run gives
-*every* optimizer — Gnome included — a shared linear-warmup + cosine-decay
-schedule: cross-entropy gradients don't self-anneal the way an MSE residual
-does. Gnome's internal warmup is disabled (``warmup=0``) so the two ramps don't
-compound. ``--lr-min-frac`` is the cosine floor (final lr as a fraction of peak).
+This CCE run gives *every* optimizer — Gnome included — a shared linear-warmup
++ cosine-decay schedule. Decay earns its keep here in a way it does not on the
+MSE experiments: cross-entropy gradients don't self-anneal the way an MSE
+residual does. ``--lr-min-frac`` is the cosine floor (final lr as a fraction of
+peak).
 
 Requires ``datasets`` + ``transformers`` (the ``llm`` extra):
 
@@ -215,11 +215,9 @@ def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float
     Both Gnome variants share every hyperparameter except ``loss=`` so the
     A/B between Fisher sampling and Hutchinson is on the surrogate only.
 
-    Gnome's internal warmup is disabled (warmup=0): this experiment owns the
-    LR schedule via ``cosine_with_warmup``, applied to every optimizer's
-    ``group["lr"]`` each step. Leaving Gnome's internal warmup on would compound
-    the two ramps (Gnome multiplies its own warmup factor onto the already-
-    cosined lr), handicapping it vs SOAP/AdamW which have no internal warmup.
+    This experiment owns the LR schedule via ``cosine_with_warmup``, applied to
+    every optimizer's ``group["lr"]`` each step. No optimizer here transforms
+    ``lr`` internally, so that write is what the update actually uses.
 
     aux_batch_size is small (5) because the Hutchinson surrogate's per-token
     tensors are ``(aux*seq_len, vocab)`` ≈ ``(aux*seq_len, 50k)`` — at aux=10
@@ -230,7 +228,6 @@ def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float
         lr=lr, weight_decay=weight_decay,
         betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-4,
         precondition_frequency=10,
-        warmup=0,
         trust_radius=(trust_region if trust_region > 0 else None),
         precondition_1d=False,
     )
@@ -336,10 +333,9 @@ def parse_args() -> argparse.Namespace:
 def cosine_with_warmup(step: int, warmup: int, total: int, min_frac: float) -> float:
     """LR multiplier: linear warmup → cosine decay to ``min_frac``.
 
-    Note: this CCE schedule ramps warmup from ``min_frac`` up to 1.0 (not from
-    0), and is applied to every optimizer including Gnome — distinct from the
-    MSE baselines' ``experiments.common.baseline_cosine_scheduler`` (warmup from
-    0, applied only to SOAP/AdamW). Kept local to preserve the tuned LM run.
+    Note: this CCE schedule ramps warmup from ``min_frac`` up to 1.0, where the
+    shared ``experiments.common.cosine_scheduler`` ramps from 0. Kept local to
+    preserve the tuned LM run.
     """
     if step < warmup:
         return min_frac + (1.0 - min_frac) * step / max(warmup, 1)

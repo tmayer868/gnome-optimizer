@@ -35,9 +35,9 @@ Architecture options (all share the optimizer, so it's the only variable):
   the wave analog of AC's exact-periodicity embedding, and pairs naturally
   with ``--embed fourier``.
 
-Baselines (SOAP, AdamW) get linear-warmup + cosine-decay (``--cosine-decay``
-= final-lr fraction; 1.0 disables); Gnome runs at a fixed lr — its
-Gauss-Newton step self-anneals. Reference: analytic (no download).
+Every optimizer gets linear-warmup + cosine-decay (``--cosine-decay`` =
+final-lr fraction; 1.0 gives warmup then constant, which suits Gnome since
+its Gauss-Newton step self-anneals). Reference: analytic (no download).
 
 Usage:
 
@@ -62,7 +62,7 @@ from experiments.common import (
     DIVERGED_EXIT,
     diverged,
     RunLogger,
-    baseline_cosine_scheduler,
+    cosine_scheduler,
     current_lr,
     pick_device,
 )
@@ -362,22 +362,20 @@ def build_optimizer(
 ):
     """Construct the optimizer and its LR schedule.
 
-    Gnome runs at a fixed lr (self-annealing GGN step) so it gets no
-    scheduler — only its internal warmup. SOAP and AdamW get the standard
-    linear-warmup + cosine-decay; ``cosine_decay`` is the final-lr fraction
-    (0.0 → decay to zero, 1.0 → decay disabled).
+    Every optimizer gets the same linear-warmup + cosine-decay; ``cosine_decay``
+    is the final-lr fraction (0.0 -> decay to zero, 1.0 -> warmup then
+    constant, which suits Gnome's self-annealing GGN step on MSE).
     """
     if name == "gnome":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=20,
-            warmup=warmup,
             trust_radius=(trust_region if trust_region > 0 else None),
             loss="mse", precondition_1d=True,
         )
-        return Gnome(params, **cfg), cfg, None
-    if name == "soap":
+        opt = Gnome(params, **cfg)
+    elif name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
@@ -393,7 +391,7 @@ def build_optimizer(
     else:
         raise ValueError(f"unknown optimizer: {name}")
 
-    scheduler = baseline_cosine_scheduler(opt, warmup, total_steps, cosine_decay)
+    scheduler = cosine_scheduler(opt, warmup, total_steps, cosine_decay)
     cfg["warmup"] = warmup
     cfg["cosine_decay_floor"] = cosine_decay
     return opt, cfg, scheduler

@@ -78,7 +78,7 @@ from experiments.common import (
     DIVERGED_EXIT,
     diverged,
     RunLogger,
-    baseline_cosine_scheduler,
+    cosine_scheduler,
     current_lr,
     pick_device,
 )
@@ -268,7 +268,7 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps,
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10,
-            warmup=warmup, loss="mse", precondition_1d=True,
+            loss="mse", precondition_1d=True,
             trust_radius=(trust_region if trust_region > 0 else None),
             norm_free=False,
         )
@@ -277,8 +277,7 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps,
         # opt.step(...); it is not a Gnome constructor arg. Recorded in the
         # returned config for logging and to set K below.
         cfg["aux_batch_size"] = 16
-        return opt, cfg, None
-    if name == "soap":
+    elif name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
@@ -293,7 +292,7 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps,
 
     cfg["warmup"] = warmup      # unified meta key across optimizers
     cfg["cosine_decay_floor"] = cosine_decay
-    scheduler = baseline_cosine_scheduler(opt, warmup, total_steps, cosine_decay)
+    scheduler = cosine_scheduler(opt, warmup, total_steps, cosine_decay)
     return opt, cfg, scheduler
 
 
@@ -493,8 +492,7 @@ def parse_args() -> argparse.Namespace:
                    help="Default 0: inputs are resampled every step, so there "
                         "is nothing to regularize and decay only biases the fit.")
     p.add_argument("--warmup-steps", type=int, default=200,
-                   help="LR warmup steps. Baselines warm up then cosine-decay; "
-                        "Gnome uses this as its internal warmup only.")
+                   help="LR warmup steps, applied to every optimizer.")
     p.add_argument("--cosine-decay", type=float, default=1.0,
                    help="Final-LR fraction for the SOAP/AdamW cosine decay: "
                         "0.0 decays to zero (default), 1.0 disables decay. "

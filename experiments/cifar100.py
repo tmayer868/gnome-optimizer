@@ -24,12 +24,11 @@ Gnome variants should *narrow* here relative to wikitext: with K=100 rather than
 sample instead of 0.002%. A null result here is informative — it would say the
 Hutchinson advantage is specifically a large-K effect.
 
-Unlike the MSE experiments (where Gnome runs a fixed lr because the step
-self-anneals as the residual shrinks), **every** optimizer here — Gnome included
-— gets a shared linear-warmup + cosine-decay schedule: cross-entropy gradients
-do not self-anneal, since the Fisher stays O(1) at the optimum rather than going
-to zero. Gnome's internal warmup is disabled (``warmup=0``) so the two ramps
-don't compound.
+Every optimizer here — Gnome included — gets a shared linear-warmup +
+cosine-decay schedule. Decay matters more here than on the MSE experiments,
+where Gnome's step self-anneals as the residual shrinks: cross-entropy
+gradients do not self-anneal, since the Fisher stays O(1) at the optimum rather
+than going to zero.
 
     uv run python -m experiments.cifar100 --optimizer gnome_hutchinson --seed 0
     uv run python -m experiments.cifar100 --optimizer gnome_fisher     --seed 0
@@ -167,7 +166,6 @@ def build_optimizer(
         lr=lr, weight_decay=weight_decay,
         betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
         precondition_frequency=10,
-        warmup=0,
         trust_radius=(trust_region if trust_region > 0 else None),
         # CIFAR-100 moves 4.6 -> 2.6 loss inside ~200 steps, which is ~2 EMA
         # windows at beta2=0.99. Without this the curvature EMA is dominated by
@@ -421,8 +419,7 @@ def parse_args() -> argparse.Namespace:
                    help="Disable flip + random-crop augmentation.")
     p.add_argument("--warmup-steps", type=int, default=200,
                    help="LR warmup steps, applied to every optimizer including "
-                        "Gnome (CCE does not self-anneal). Gnome's internal "
-                        "warmup is disabled so the ramps don't compound.")
+                        "Gnome (CCE does not self-anneal).")
     p.add_argument("--lr-min-frac", type=float, default=0.1,
                    help="Cosine floor: final lr as a fraction of peak.")
     p.add_argument("--log-every", type=int, default=50,

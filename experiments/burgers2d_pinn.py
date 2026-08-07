@@ -32,10 +32,9 @@ rides Gnome's single-MSE surrogate and the resulting probe is the per-block
 independent Rademacher GGN estimator.
 
 All three optimizers share one plain tanh MLP so the only variable is the
-optimizer. The baselines (SOAP, AdamW) get a linear-warmup + cosine-decay
-schedule (``--cosine-decay`` sets the final-lr fraction; 1.0 disables it);
-Gnome runs at a fixed lr — its Gauss-Newton step self-anneals as the residual
-shrinks.
+optimizer. Every optimizer gets the same linear-warmup + cosine-decay schedule
+(``--cosine-decay`` sets the final-lr fraction; 1.0 gives warmup then constant,
+which suits Gnome on MSE since its step self-anneals as the residual shrinks).
 
 **Reference architecture.** The paper gives "10 hidden layers, tanh" and a
 parameter count of 3881, which pins the width exactly: with 3 inputs and 1
@@ -89,7 +88,7 @@ from experiments.common import (
     DIVERGED_EXIT,
     diverged,
     RunLogger,
-    baseline_cosine_scheduler,
+    cosine_scheduler,
     current_lr,
     pick_device,
 )
@@ -290,23 +289,22 @@ def build_optimizer(
 ):
     """Construct the optimizer and its LR schedule.
 
-    Returns ``(optimizer, config, scheduler_or_None)``. Gnome runs at a fixed
-    lr (its Gauss-Newton step self-anneals as the residual shrinks) so it gets
-    no scheduler — only its own internal warmup. SOAP and AdamW get the
-    standard linear-warmup + cosine-decay treatment; ``cosine_decay`` is the
-    final-lr fraction (0.0 → decay to zero, 1.0 → decay disabled).
+    Returns ``(optimizer, config, scheduler)``. Every optimizer gets the same
+    linear-warmup + cosine-decay schedule; ``cosine_decay`` is the final-lr
+    fraction (0.0 -> decay to zero, 1.0 -> warmup then constant). On MSE, 1.0
+    is the natural setting for Gnome -- its Gauss-Newton step self-anneals as
+    the residual shrinks -- where the gradient-RMS baselines do want the decay.
     """
     if name == "gnome":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10,
-            warmup=warmup,
             trust_radius=(trust_region if trust_region > 0 else None),
             loss="mse", precondition_1d=True, norm_free=False,
         )
-        return Gnome(params, **cfg), cfg, None
-    if name == "soap":
+        opt = Gnome(params, **cfg)
+    elif name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
@@ -322,7 +320,7 @@ def build_optimizer(
     else:
         raise ValueError(f"unknown optimizer: {name}")
 
-    scheduler = baseline_cosine_scheduler(opt, warmup, total_steps, cosine_decay)
+    scheduler = cosine_scheduler(opt, warmup, total_steps, cosine_decay)
     cfg["warmup"] = warmup
     cfg["cosine_decay_floor"] = cosine_decay
     return opt, cfg, scheduler
@@ -385,9 +383,7 @@ def parse_args() -> argparse.Namespace:
                         "hits a ~1e-5 floor in float32. MPS has no float64 and "
                         "falls back to CPU.")
     p.add_argument("--warmup-steps", type=int, default=200,
-                   help="Linear LR warmup steps. For the SOAP/AdamW baselines "
-                        "this is the schedule warmup; for Gnome it is passed "
-                        "as its internal `warmup=`.")
+                   help="Linear LR warmup steps, applied to every optimizer.")
     p.add_argument("--cosine-decay", type=float, default=0.0,
                    help="Final-LR fraction for the baseline cosine decay: 0.0 "
                         "decays to zero (standard treatment), 1.0 disables "

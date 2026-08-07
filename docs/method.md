@@ -313,7 +313,7 @@ For each minibatch, with `main_closure` returning $(\hat y, y)$ on the $B-K$ mai
    - Solve for the trust-region damping $\lambda$: the smallest value $\ge \varepsilon$ such that $\|\hat m / (\hat v + \lambda)\|_2 \le c \cdot \sqrt{P}$, where $c$ is `trust_radius` and $P$ is the number of elements in the parameter tensor. Solved via Hebden's reciprocal Newton method (2 to 3 iterations), warm-started from the previous step's $\lambda$, with an analytic bracket from $\min(\hat v)$ and $\max(\hat v)$.
    - Compute the damped Newton step: $\Delta \tilde\theta = \hat m / (\hat v + \lambda)$.
    - Project back to the parameter basis: $\Delta\theta = Q_L \, \Delta\tilde\theta \, Q_R^\top$. Because the $Q$ matrices are orthonormal, $\|\Delta\theta\|_2 = \|\Delta\tilde\theta\|_2$. The trust region bound is preserved exactly.
-   - Apply with $-\text{lr}_{\text{eff}}$ (linear warmup over `warmup` steps, floored at $0.01 \cdot \text{lr}$), then decoupled weight decay.
+   - Apply with $-\text{lr}$, then decoupled weight decay. Gnome owns no learning-rate schedule: `lr` is read from the parameter group on every step and multiplies the update *after* the trust-region solve, so it scales step length linearly and any `torch.optim.lr_scheduler` drives Gnome exactly as it drives AdamW.
 
 Two independent forward passes (one for main, one for aux) cost more than a single shared forward, but mean we don't need `retain_graph=True` and don't have to hold the main batch's activations alive while running the surrogate backward. The aux batch is small (default $K=10$), so the second pass is cheap.
 

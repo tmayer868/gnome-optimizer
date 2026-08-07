@@ -69,6 +69,28 @@ own graph immediately — no ``retain_graph``, no held activations between
 passes. The optimizer never writes into ``p.grad``; gradients are
 obtained via ``torch.autograd.grad`` and applied directly.
 
+**Learning-rate schedules.** Gnome does not own a schedule. ``group["lr"]``
+is read fresh on every step and multiplies the update *after* the
+trust-region solve, so it scales step length linearly and any stock
+``torch.optim.lr_scheduler`` drives Gnome exactly as it drives AdamW::
+
+    opt = Gnome(model.parameters(), lr=1e-3, loss='mse')
+    sched = torch.optim.lr_scheduler.SequentialLR(
+        opt,
+        [torch.optim.lr_scheduler.LinearLR(opt, 0.01, 1.0, total_iters=200),
+         torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total - 200)],
+        milestones=[200],
+    )
+
+    for ...:
+        opt.step(main_closure, aux_closure)
+        sched.step()
+
+On MSE the Gauss-Newton step self-anneals as the residual shrinks, so a
+decay schedule is optional there in a way it is not for gradient-RMS
+methods; a warmup is still usually worth having while the eigenbasis is
+cold.
+
 .. _SOAP: https://arxiv.org/abs/2409.11321
 """
 
@@ -193,11 +215,6 @@ class Gnome(Optimizer):
             the curvature surrogate. Default None; the ``trust_radius`` region
             is the usual safeguard, but a global norm clip can help on steps
             where the raw gradient spikes.
-        warmup: Number of steps over which the learning rate is linearly
-            ramped from zero to ``lr``. At step ``k`` (1-indexed) the
-            effective learning rate is ``lr * min(k / warmup, 1.0)``. Pass
-            ``0`` to disable internal warmup (e.g. when using an external
-            scheduler).
         loss: One of ``"mse"`` (mean-squared error for regression),
             ``"cce"`` (softmax cross-entropy with Fisher-sampling surrogate),
             or ``"cce_hutchinson"`` (softmax cross-entropy with a Rademacher
@@ -226,7 +243,6 @@ class Gnome(Optimizer):
         max_grad_norm: Optional[float] = None,
         trust_radius: Optional[float] = 1.0,
         norm_free: bool = False,
-        warmup: int = 200,
         loss: str = "mse",
         merge_dims: bool = False,
         precondition_1d: bool = False,
@@ -244,8 +260,6 @@ class Gnome(Optimizer):
             raise ValueError(f"Invalid max_grad_norm: {max_grad_norm}")
         if trust_radius is not None and trust_radius <= 0.0:
             raise ValueError(f"Invalid trust_radius: {trust_radius}")
-        if warmup < 0:
-            raise ValueError(f"Invalid warmup: {warmup}")
         if loss not in ("mse", "cce", "cce_hutchinson"):
             raise ValueError(
                 f"Invalid loss mode: {loss!r}; "
@@ -265,7 +279,6 @@ class Gnome(Optimizer):
             merge_dims=merge_dims,
             precondition_1d=precondition_1d,
             trust_radius=trust_radius,
-            warmup=warmup,
         )
         super().__init__(params, defaults)
         self._data_format = data_format
@@ -276,7 +289,35 @@ class Gnome(Optimizer):
         # contribution to unit norm before it enters the curvature EMA. See
         # _param_step for why, and why it is off by default.
         self._norm_free = norm_free
+        # Global step counter: one increment per step() call, regardless of how
+        # many micro-batch closures it was given. Distinct from the per-tensor
+        # state["step"], which lags it by one (the first step builds the
+        # eigenbasis and returns without updating).
         self._step_count = 0
+
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+
+    def state_dict(self) -> dict:
+        """``Optimizer.state_dict`` plus Gnome's optimizer-level counters.
+
+        ``_step_count`` is a plain instance attribute rather than per-parameter
+        state, so the base implementation would silently drop it and a resumed
+        run would restart the counter from zero.
+        """
+        sd = super().state_dict()
+        sd["gnome"] = {"step_count": self._step_count}
+        return sd
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        extra = state_dict.get("gnome")
+        if extra is not None:
+            # Hand the base implementation only the keys it knows about.
+            state_dict = {k: v for k, v in state_dict.items() if k != "gnome"}
+        super().load_state_dict(state_dict)
+        if extra is not None:
+            self._step_count = int(extra["step_count"])
 
     # ------------------------------------------------------------------
     # SOAP machinery: dim merging, Kronecker factor maintenance, projection
@@ -880,10 +921,10 @@ class Gnome(Optimizer):
 
         state["step"] += 1
         beta1, beta2 = group["betas"]
-        warmup = group["warmup"]
+        # Read fresh each step, so an external torch.optim.lr_scheduler that
+        # mutates group["lr"] takes effect immediately. Gnome applies no
+        # schedule of its own.
         lr = group["lr"]
-        if warmup > 0:
-            lr = lr * max(min((self._step_count-1) / warmup, 1.0), .01)
         grad_m, gnd_m = state["grad_m"], state["gnd_m"]
 
         # Project loss gradient and surrogate into the GGN-derived eigenbasis.
