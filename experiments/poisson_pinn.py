@@ -42,13 +42,14 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
 
-from gnome import Gnome, stack_residuals
+from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
@@ -296,6 +297,17 @@ def parse_args() -> argparse.Namespace:
                         "(MPS has no float64) and sets the global default "
                         "dtype to float64 so params, samples and the "
                         "reference are all double.")
+    p.add_argument("--diagnostics-every", type=int, default=0,
+                   help="Log Gnome's internal state — curvature spectrum, LM "
+                        "damping, trust-region usage — every N steps to a "
+                        "sibling runs/.../{run_id}.diag.jsonl. 0 (default) "
+                        "disables it entirely. Gnome only: SOAP and AdamW "
+                        "expose no such hook.")
+    p.add_argument("--diagnostics-params", type=str, default=None,
+                   help="Comma-separated parameter indices to log, e.g. "
+                        "'0,4'. Default logs every parameter, which is one "
+                        "record per tensor per logged step — narrow it to "
+                        "keep the file readable.")
     p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--quiet", action="store_true")
@@ -335,6 +347,8 @@ def train(args: argparse.Namespace) -> str:
         "n_bc_per_edge": args.n_bc_per_edge,
         "n_pde_aux": n_pde_aux,
         "n_bc_aux_per_edge": n_bc_aux_per_edge,
+        # Non-zero means a sibling {run_id}.diag.jsonl exists for this run.
+        "diagnostics_every": args.diagnostics_every,
         "device": str(device),
         "dtype": str(torch.get_default_dtype()),
         **{f"opt.{k}": v for k, v in opt_cfg.items()},
@@ -347,6 +361,30 @@ def train(args: argparse.Namespace) -> str:
         runs_dir=args.runs_dir,
     )
 
+    # Optional optimizer-internals log. Kept in its own file rather than as
+    # extra records in the run's JSONL: it is one record per *parameter* per
+    # logged step, so it would outnumber the training records several times
+    # over and slow load_run() down for everyone not looking at it.
+    diag = None
+    if args.diagnostics_every > 0:
+        if args.optimizer != "gnome":
+            raise SystemExit(
+                f"--diagnostics-every is Gnome-only; --optimizer "
+                f"{args.optimizer} exposes no diagnostics hook."
+            )
+        diag_params = (
+            None if not args.diagnostics_params
+            else [int(s) for s in args.diagnostics_params.split(",")]
+        )
+        diag_path = os.path.join(
+            os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
+        )
+        diag = JsonlDiagnostics(diag_path, params=diag_params)
+        # Plain attributes, so this attaches to the already-built optimizer —
+        # which is what lets the file be named after the run id.
+        opt.diagnostics = diag
+        opt.diagnostics_every = args.diagnostics_every
+
     if not args.quiet:
         print(
             f"[{EXPERIMENT}] {args.optimizer} | params={n_params:,} | "
@@ -355,6 +393,9 @@ def train(args: argparse.Namespace) -> str:
             f"aux={n_pde_aux}/{n_bc_aux_per_edge} | steps={args.steps}",
             flush=True,
         )
+        if diag is not None:
+            print(f"  diagnostics every {args.diagnostics_every} steps "
+                  f"→ {diag.path}", flush=True)
     x_ref, y_ref, u_ref = poisson_reference()
 
     t_start = time.perf_counter()
@@ -389,6 +430,8 @@ def train(args: argparse.Namespace) -> str:
         loss_val = float(loss.detach().item())
         if diverged(loss_val):
             run.finish(completed=False, diverged=True, diverged_step=step)
+            if diag is not None:
+                diag.close()
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
             raise SystemExit(DIVERGED_EXIT)
         run.log_train(step, loss=loss_val)
@@ -421,6 +464,9 @@ def train(args: argparse.Namespace) -> str:
         final_avg_train=last_avg, best_avg_train=best_avg,
         final_rel_l2=last_rel_l2, best_rel_l2=best_rel_l2,
     )
+    if diag is not None:
+        diag.close()
+        print(f"[{EXPERIMENT}] diagnostics → {diag.path}")
     print(f"[{EXPERIMENT}] saved → {path}")
     print(f"  final avg_train={last_avg:.4e}  best={best_avg:.4e}")
     print(f"  final rel_l2={last_rel_l2:.3e}  best rel_l2={best_rel_l2:.3e}")

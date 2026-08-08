@@ -228,6 +228,40 @@ class Gnome(Optimizer):
         precondition_1d: Build a Kronecker factor for 1D parameters as well.
         data_format: ``"channels_first"`` or ``"channels_last"`` for the
             ``merge_dims`` layout convention.
+        diagnostics: Optional callable receiving one record ``dict`` per
+            parameter per logged step, describing the optimizer's *internal*
+            state — curvature spectrum, damping, step geometry. This is not a
+            training-metrics channel; it answers questions like "is the trust
+            region binding?" and "how much of the curvature estimate is below
+            ``eps``?". ``None`` (default) disables it, and nothing is computed:
+            the cost is one integer comparison per parameter per step. See
+            :mod:`gnome.diagnostics` for ready-made sinks
+            (``PrintDiagnostics``, ``JsonlDiagnostics``, ``CollectDiagnostics``)
+            and the full record schema.
+        diagnostics_every: Emit every N global steps. Gated on the global step
+            counter, so every parameter emits together and the records form one
+            coherent snapshot. Ignored when ``diagnostics is None``.
+
+        metrics: ``{name: fn}`` dict saying *what* to measure, where
+            ``diagnostics`` says where it goes. Each ``fn`` takes a context
+            dict of the live rotated-basis tensors (``v`` the curvature, ``m``
+            the gradient EMA, ``update`` the damped step, plus ``lam``, ``eps``,
+            ``lr``, ``p``, ``state``, ``group``) and returns a **0-dim
+            tensor** — results are stacked into one host transfer, so a
+            pre-converted Python float would force its own device sync.
+            Defaults to :data:`gnome.diagnostics.DEFAULT_METRICS`; extend it
+            rather than replacing so the built-in fields survive::
+
+                metrics={**DEFAULT_METRICS,
+                         "v_cond": lambda c: c["v"].max() / c["v"].min()}
+
+            Nothing about which statistics exist is hardcoded here.
+
+            All three are plain attributes, so they can be changed mid-run::
+
+                opt.diagnostics = PrintDiagnostics(params=[0])
+                opt.diagnostics_every = 1
+                opt.metrics = {"v_max": lambda c: c["v"].max()}
     """
 
     def __init__(
@@ -247,6 +281,9 @@ class Gnome(Optimizer):
         merge_dims: bool = False,
         precondition_1d: bool = False,
         data_format: str = "channels_first",
+        diagnostics: Optional[Callable[[dict], None]] = None,
+        diagnostics_every: int = 100,
+        metrics: Optional[dict] = None,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -260,6 +297,18 @@ class Gnome(Optimizer):
             raise ValueError(f"Invalid max_grad_norm: {max_grad_norm}")
         if trust_radius is not None and trust_radius <= 0.0:
             raise ValueError(f"Invalid trust_radius: {trust_radius}")
+        if diagnostics is not None and not callable(diagnostics):
+            raise ValueError(
+                f"diagnostics must be callable, got {type(diagnostics).__name__}"
+            )
+        if diagnostics_every < 1:
+            raise ValueError(f"Invalid diagnostics_every: {diagnostics_every}")
+        if metrics is not None:
+            bad = [k for k, v in metrics.items() if not callable(v)]
+            if bad:
+                raise ValueError(
+                    f"metrics values must be callable; not callable: {bad}"
+                )
         if loss not in ("mse", "cce", "cce_hutchinson"):
             raise ValueError(
                 f"Invalid loss mode: {loss!r}; "
@@ -294,6 +343,144 @@ class Gnome(Optimizer):
         # state["step"], which lags it by one (the first step builds the
         # eigenbasis and returns without updating).
         self._step_count = 0
+        # Optional internal-state logging. Both are plain attributes: flip them
+        # on and off mid-run (e.g. to sample a window around a divergence)
+        # without rebuilding the optimizer. See _emit_diagnostics.
+        self.diagnostics = diagnostics
+        self.diagnostics_every = diagnostics_every
+        # What to measure. Imported lazily to keep gnome.diagnostics from
+        # importing gnome.optimizer back at module scope.
+        if metrics is None:
+            from gnome.diagnostics import DEFAULT_METRICS
+            metrics = dict(DEFAULT_METRICS)
+        self.metrics = metrics
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+
+    def _diagnostics_due(self) -> bool:
+        """Whether this step should emit. Cheap enough to call unconditionally.
+
+        Gated on the *global* step counter rather than sampled per parameter,
+        so when it fires every parameter emits on the same step and the records
+        form one coherent snapshot of the optimizer rather than a scatter of
+        unrelated tensors from unrelated steps.
+        """
+        return (
+            self.diagnostics is not None
+            and self._step_count % self.diagnostics_every == 0
+        )
+
+    def _emit_diagnostics(
+        self,
+        idx: int,
+        p: torch.Tensor,
+        group: dict,
+        grad_hat: torch.Tensor,
+        gnd_hat: torch.Tensor,
+        update_rot: torch.Tensor,
+        lam,
+        lr: float,
+    ) -> None:
+        """Build one record of internal state and hand it to ``diagnostics``.
+
+        Only called when :meth:`_diagnostics_due`, because each metric is a
+        reduction over a full parameter tensor — running them every step would
+        be a real cost, not a rounding error.
+
+        What gets measured is entirely ``self.metrics``: a ``{name: fn}`` dict
+        where each ``fn`` takes the context assembled here and returns a 0-dim
+        tensor. Nothing about *which* statistics exist is hardcoded in the
+        optimizer — see :data:`gnome.diagnostics.DEFAULT_METRICS`. This method
+        only assembles the context and merges the results with the cheap
+        metadata fields (step, shape, lr, ...) that need no reduction.
+
+        Every metric result is stacked and moved to host in a **single**
+        transfer. Read individually they would be one device sync each, which
+        on CUDA serializes the whole step — which is why metrics are asked to
+        return 0-dim tensors rather than Python floats.
+
+        The context is in the rotated eigenbasis, where the curvature is
+        diagonal — ``v`` is that diagonal, so its entries are the estimated GGN
+        eigenvalues. ``update`` is pre-projection but basis-independent in
+        norm: the Q matrices are orthonormal, so its RMS equals that of the
+        final parameter update.
+        """
+        eps = group["eps"]
+        trust_radius = group["trust_radius"]
+        # When the trust region is disabled lam is the Python float eps rather
+        # than a device tensor. Report it as-is rather than round-tripping it
+        # through float32, which would come back an ulp under eps and read as
+        # though something had perturbed it.
+        lam_is_tensor = torch.is_tensor(lam)
+        lam_f = float(lam) if not lam_is_tensor else None
+
+        ctx = {
+            # Rotated-basis tensors — the usual subjects.
+            "v": gnd_hat,           # bias-corrected curvature (GGN diagonal)
+            "m": grad_hat,          # bias-corrected gradient EMA
+            "update": update_rot,   # the damped Newton step, pre-projection
+            # Scalars. lam is a 0-dim tensor when the trust region is active.
+            "lam": lam,
+            "eps": eps,
+            "lr": lr,
+            "trust_radius": trust_radius,
+            # Escape hatches: the raw pre-bias-correction EMAs live in state
+            # as gnd_m / grad_m, alongside the Kronecker factors GG and the
+            # eigenbasis Q.
+            "p": p,
+            "state": self.state[p],
+            "group": group,
+            "step": self._step_count,
+            "param": idx,
+        }
+
+        names, reductions = [], []
+        for name, fn in self.metrics.items():
+            val = fn(ctx)
+            if not torch.is_tensor(val):
+                raise TypeError(
+                    f"diagnostics metric {name!r} returned "
+                    f"{type(val).__name__}, expected a 0-dim tensor. Returning "
+                    f"a Python number forces a separate device sync per "
+                    f"metric; keep the reduction on-device (e.g. "
+                    f"`c['v'].max()`, not `float(c['v'].max())`)."
+                )
+            names.append(name)
+            reductions.append(val.reshape(()).to(gnd_hat.dtype))
+        if lam_is_tensor:
+            reductions.append(lam.reshape(()).to(gnd_hat.dtype))
+
+        stats = (
+            torch.stack(reductions).cpu().tolist() if reductions else []
+        )  # one host transfer for every metric at once
+        record = dict(zip(names, stats))
+        if lam_is_tensor:
+            lam_f = stats[-1]
+
+        record.update({
+            "step": self._step_count,
+            "param": idx,
+            "shape": tuple(p.shape),
+            "numel": p.numel(),
+            "lr": lr,
+            # Levenberg-Marquardt damping. lam == eps means the trust region
+            # never bound and the step was an undamped Newton step.
+            "eps": eps,
+            "lam": lam_f,
+            # Relative slack so a lam that is float32-equal to eps does not
+            # read as binding on the strength of one ulp.
+            "lam_binding": lam_f > eps * (1.0 + 1e-6),
+        })
+        # trust_ratio needs update_rms, which is a metric rather than a
+        # built-in — so it is only derivable when that metric is in use.
+        if trust_radius is not None and "update_rms" in record:
+            record["trust_ratio"] = record["update_rms"] / trust_radius
+        elif trust_radius is None:
+            record["trust_ratio"] = None
+
+        self.diagnostics(record)
 
     # ------------------------------------------------------------------
     # Checkpointing
@@ -873,12 +1060,14 @@ class Gnome(Optimizer):
         del y_hat_aux, aux_result
 
         with torch.no_grad():
-            for p, g, G_s, group in zip(params, g_accum, g_aux, groups_for_params):
+            for idx, (p, g, G_s, group) in enumerate(
+                zip(params, g_accum, g_aux, groups_for_params)
+            ):
                 if g is None:
                     continue
                 if G_s is None:
                     G_s = torch.zeros_like(g)
-                self._param_step(p, g.detach(), G_s.detach(), group)
+                self._param_step(p, g.detach(), G_s.detach(), group, idx)
 
         return mean_loss
 
@@ -888,6 +1077,7 @@ class Gnome(Optimizer):
         g: torch.Tensor,
         G_s: torch.Tensor,
         group: dict,
+        idx: int = 0,
     ) -> None:
         state = self.state[p]
 
@@ -991,9 +1181,13 @@ class Gnome(Optimizer):
             lam = self._lm_lambda(grad_hat, gnd_hat, T, eps,
                                   lam_prev=state.get("lm_lambda"))
             state["lm_lambda"] = lam
-
         # Newton step in the rotated basis, damped by lam.
         update_rot = grad_hat / gnd_hat.add(lam)
+
+        if self._diagnostics_due():
+            self._emit_diagnostics(
+                idx, p, group, grad_hat, gnd_hat, update_rot, lam, lr
+            )
 
         # Rotate back into the parameter basis. Orthonormal Q means the l2
         # norm — and hence the trust-region bound — carries over exactly, so
