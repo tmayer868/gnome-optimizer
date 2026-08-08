@@ -50,13 +50,14 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import time
 
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
 
-from gnome import Gnome, stack_residuals
+from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
@@ -89,14 +90,14 @@ class NoEmbed(nn.Module):
 class PeriodicEmbed(nn.Module):
     """``[t, cos(πx), sin(πx), cos(πt), sin(πt)]`` — period-2 in x (spectral aid on wave; it
     does not enforce the Dirichlet BC)."""
-    n_freq = 5
-    out_dim = 1 + 4 *(n_freq-1)
+    n_freq = 10
+    out_dim = 2 + 4 *(n_freq-1)
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        in_features = [t*(1-t)]
+        in_features = [t ** n for n in range(1, self.n_freq)] + [t ** n for n in range(1, n_freq)]
         in_features += [torch.sin(n * math.pi * x) for n in range(1, self.n_freq)]
-        in_features += [torch.cos(n * math.pi * x) * x * (1.0 - x) for n in range(1, self.n_freq)]
-        in_features += [torch.cos(n * math.pi * t) * t * (1.0 - t) for n in range(1, self.n_freq)]
+        in_features += [torch.cos(n * math.pi * x) for n in range(1, self.n_freq)]
+        in_features += [torch.cos(n * math.pi * t) for n in range(1, self.n_freq)]
         in_features += [torch.sin(n * math.pi * t) for n in range(1, self.n_freq)]
         return torch.cat(in_features, dim=1)
 
@@ -116,12 +117,13 @@ class FourierEmbed(nn.Module):
         proj_dim = (embed_dim) // 2
 
         # 1. Correct logic: Pass string name first, do NOT assign the function output to a variable
-        B_tensor = torch.randn(2, proj_dim) * scale
-        self.register_buffer('B', B_tensor)
+        weights = torch.randn(3, embed_dim // 2) * scale
+        weights[:, 2] = .001 * weights[:, 2]
+        self.B = nn.Parameter(weights)
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         # Assuming t and x have shape (batch_size, 1)
-        p = torch.cat([t, x], dim=1) @ self.B  # self.B is now safely available
+        p = torch.cat([t, x, torch.ones_like(x)], dim=1) @ self.B  # self.B is now safely available
         return torch.cat([torch.sin(p), torch.cos(p)], dim=1)
 
 def build_embedding(embed: str, fourier_dim: int, fourier_scale: float
@@ -150,9 +152,9 @@ class MLP(nn.Module):
         assert depth >= 2
         self.embed = embed
         self.hard_bc = hard_bc
-        layers: list[nn.Module] = [nn.Linear(embed.out_dim, hidden), nn.Tanh()]
+        layers: list[nn.Module] = [nn.Linear(embed.out_dim, hidden), nn.SiLU()]
         for _ in range(depth - 2):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
+            layers += [nn.Linear(hidden, hidden), nn.SiLU()]
         layers += [nn.Linear(hidden, 1)]
         self.net = nn.Sequential(*layers)
 
@@ -450,6 +452,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cosine-decay", type=float, default=0.0,
                    help="Final-LR fraction for the baseline cosine decay: 0.0 "
                         "decays to zero, 1.0 disables. Gnome never decays.")
+    p.add_argument("--diagnostics-every", type=int, default=0,
+                   help="Log Gnome's internal state — curvature spectrum, LM "
+                        "damping, trust-region usage — every N steps to a "
+                        "sibling runs/.../{run_id}.diag.jsonl. 0 (default) "
+                        "disables it entirely. Gnome only: SOAP and AdamW "
+                        "expose no such hook.")
+    p.add_argument("--diagnostics-params", type=str, default=None,
+                   help="Comma-separated parameter indices to log, e.g. "
+                        "'0,4'. Default logs every parameter, which is one "
+                        "record per tensor per logged step — narrow it to "
+                        "keep the file readable.")
     p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--quiet", action="store_true")
@@ -477,6 +490,8 @@ def train(args: argparse.Namespace) -> str:
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
+        # Non-zero means a sibling {run_id}.diag.jsonl exists.
+        "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
         "arch": args.arch,
         "embed": args.embed,
@@ -507,6 +522,30 @@ def train(args: argparse.Namespace) -> str:
         runs_dir=args.runs_dir,
     )
 
+    # Optional optimizer-internals log. Kept in its own file rather than as
+    # extra records in the run's JSONL: it is one record per *parameter* per
+    # logged step, so it would outnumber the training records several times
+    # over and slow load_run() down for everyone not looking at it.
+    diag = None
+    if args.diagnostics_every > 0:
+        if args.optimizer != "gnome":
+            raise SystemExit(
+                f"--diagnostics-every is Gnome-only; --optimizer "
+                f"{args.optimizer} exposes no diagnostics hook."
+            )
+        diag_params = (
+            None if not args.diagnostics_params
+            else [int(s) for s in args.diagnostics_params.split(",")]
+        )
+        diag_path = os.path.join(
+            os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
+        )
+        diag = JsonlDiagnostics(diag_path, params=diag_params)
+        # Plain attributes, so this attaches to the already-built optimizer —
+        # which is what lets the file be named after the run id.
+        opt.diagnostics = diag
+        opt.diagnostics_every = args.diagnostics_every
+
     if not args.quiet:
         embed_desc = args.embed
         if args.embed == "fourier":
@@ -521,6 +560,9 @@ def train(args: argparse.Namespace) -> str:
         )
     t_ref, x_ref, u_ref = wave_reference()
 
+    if diag is not None and not args.quiet:
+        print(f"  diagnostics every {args.diagnostics_every} steps "
+              f"→ {diag.path}", flush=True)
     t_start = time.perf_counter()
     window: list[float] = []
     last_avg = last_rel_l2 = float("nan")
@@ -553,6 +595,8 @@ def train(args: argparse.Namespace) -> str:
 
         loss_val = float(loss.detach().item())
         if diverged(loss_val):
+            if diag is not None:
+                diag.close()
             run.finish(completed=False, diverged=True, diverged_step=step)
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.",
                   flush=True)
@@ -586,6 +630,9 @@ def train(args: argparse.Namespace) -> str:
                 )
             window.clear()
 
+    if diag is not None:
+        diag.close()
+        print(f"[{EXPERIMENT}] diagnostics → {diag.path}")
     path = run.finish(
         completed=True,
         final_avg_train=last_avg, best_avg_train=best_avg,
