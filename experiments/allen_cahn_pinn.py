@@ -81,13 +81,16 @@ from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
+    FusedMLP,
     ModifiedMLP,
     diverged,
     RunLogger,
     cosine_scheduler,
     current_lr,
     pick_device,
+    FusedLinear
 )
+from experiments.common import MLP as _SharedMLP, ConcatEmbed
 
 
 EXPERIMENT = "allen_cahn_pinn"
@@ -170,34 +173,32 @@ def build_embedding(embed: str, embed_dim: int = 256,
     raise ValueError(f"unknown embedding: {embed}")
 
 
-class MLP(nn.Module):
+class MLP(_SharedMLP):
     """Plain tanh MLP over an input embedding: ``(t, x) → u``.
 
     ``depth`` = number of Linear layers.
     """
 
     def __init__(self, embed: nn.Module, hidden: int = 256, depth: int = 4):
-        super().__init__()
-        assert depth >= 2
-        self.embed = embed
-        d = embed.out_dim
-        layers: list[nn.Module] = [nn.Linear(d, hidden), nn.Tanh()]
-        for _ in range(depth - 2):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, 1)]
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return self.net(self.embed(t, x))
+        super().__init__(embed, hidden=hidden, depth=depth)
 
 
-def build_model(arch: str, embed: nn.Module, hidden: int, depth: int
-                ) -> nn.Module:
-    """``(t, x) → u``. The input embedding is whatever ``--embed`` selects."""
+def build_model(arch: str, embed: nn.Module, hidden: int, depth: int,
+                fuse_every: int = 0) -> nn.Module:
+    """``(t, x) → u``. The input embedding is whatever ``--embed`` selects.
+
+    ``fused`` is the same function class as ``mlp`` — it differs only in how
+    the weights are grouped into parameter tensors, which is what Gnome
+    preconditions over. ``--fuse-every 1`` is its control: one tensor per
+    layer, bit-identical initialization, one variable.
+    """
     if arch == "mlp":
         return MLP(embed, hidden=hidden, depth=depth)
     if arch == "modified":
         return ModifiedMLP(embed, hidden=hidden, depth=depth)
+    if arch == "fused":
+        return FusedMLP(embed, hidden=hidden, depth=depth,
+                        fuse_every=fuse_every)
     raise ValueError(f"unknown arch: {arch}")
 
 
@@ -400,9 +401,21 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--optimizer", required=True,
                    choices=["gnome", "soap", "adamw"])
-    p.add_argument("--arch", choices=["mlp", "modified"], default="modified",
-                   help="Network: plain tanh MLP or the gated modified MLP "
-                        "(Wang et al. 2021). --hidden / --depth control both.")
+    p.add_argument("--arch", choices=["mlp", "modified", "fused"],
+                   default="modified",
+                   help="Network: plain tanh MLP, the gated modified MLP "
+                        "(Wang et al. 2021), or 'fused' — the plain MLP with "
+                        "[W|b] merged per layer and hidden layers grouped "
+                        "per --fuse-every. --hidden / --depth control all "
+                        "three.")
+    p.add_argument("--fuse-every", type=int, default=0,
+                   help="--arch fused only: consecutive hidden layers per "
+                        "parameter tensor. 1 = one tensor per layer, the "
+                        "control every larger value is compared against "
+                        "(identical function and initialization, only the "
+                        "grouping differs). 0 (default) fuses the whole "
+                        "stack. Note --depth 4 leaves only k=2 hidden layers "
+                        "to group, so raise --depth to give this room.")
     p.add_argument("--embed", choices=["none", "periodic", "fourier"],
                    default="none",
                    help="Input embedding. 'none' feeds raw [t, x] and keeps "
@@ -505,7 +518,7 @@ def train(args: argparse.Namespace) -> str:
     model = build_model(
         args.arch,
         build_embedding(args.embed, args.embed_dim, args.embed_scale),
-        args.hidden, args.depth,
+        args.hidden, args.depth, args.fuse_every,
     ).to(device)
     opt, opt_cfg, scheduler = build_optimizer(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
@@ -523,6 +536,12 @@ def train(args: argparse.Namespace) -> str:
     hyperparameters = {
         "optimizer": args.optimizer,
         "arch": args.arch,
+        # Realized chunk sizes, not the raw flag: 0 and any value >= depth-2
+        # both mean "one chunk", and the sweep needs those runs to compare
+        # equal. None for the archs that have no such grouping.
+        "fuse_every": (
+            getattr(model, "chunks", None) if args.arch == "fused" else None
+        ),
         "embed": args.embed,
         "embed_dim": args.embed_dim if args.embed == "fourier" else None,
         "embed_scale": args.embed_scale if args.embed == "fourier" else None,

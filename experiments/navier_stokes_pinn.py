@@ -60,6 +60,7 @@ from experiments.common import (
     current_lr,
     pick_device,
 )
+from experiments.common import MLP as _SharedMLP, ConcatEmbed
 
 
 EXPERIMENT = "navier_stokes_pinn"
@@ -82,7 +83,7 @@ DEFAULT_REF_CACHE = "experiments/data/cylinder_nektar_wake.mat"
 
 # ========================= Model =========================
 
-class PINN(nn.Module):
+class PINN(_SharedMLP):
     """Maps ``(t, x, y) → (u, v, p)`` via a tanh MLP plus two learnable scalars.
 
     ``self.lambda1`` and ``self.lambda2`` are ordinary ``nn.Parameter`` scalars
@@ -97,20 +98,10 @@ class PINN(nn.Module):
         lambda1_init: float = 0.0,
         lambda2_init: float = 0.0,
     ):
-        super().__init__()
-        assert depth >= 2
-        layers: list[nn.Module] = [nn.Linear(3, hidden), nn.Tanh()]
-        for _ in range(depth - 2):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, 3)]
-        self.net = nn.Sequential(*layers)
+        super().__init__(ConcatEmbed(3), hidden=hidden, depth=depth,
+                         out_features=3)
         self.lambda1 = nn.Parameter(torch.tensor(float(lambda1_init)))
         self.lambda2 = nn.Parameter(torch.tensor(float(lambda2_init)))
-
-    def forward(
-        self, t: torch.Tensor, x: torch.Tensor, y: torch.Tensor
-    ) -> torch.Tensor:
-        return self.net(torch.cat([t, x, y], dim=1))
 
 
 # ========================= Residuals =========================

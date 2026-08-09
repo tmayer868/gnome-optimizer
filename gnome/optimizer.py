@@ -402,8 +402,8 @@ class Gnome(Optimizer):
         return 0-dim tensors rather than Python floats.
 
         The context is in the rotated eigenbasis, where the curvature is
-        diagonal — ``v`` is that diagonal, so its entries are the estimated GGN
-        eigenvalues. ``update`` is pre-projection but basis-independent in
+        diagonal — ``v`` estimates ``diag(Q^T H Q)``, the rotated-GGN
+        diagonal, which are the eigenvalues of H only when Q diagonalizes it. ``update`` is pre-projection but basis-independent in
         norm: the Q matrices are orthonormal, so its RMS equals that of the
         final parameter update.
         """
@@ -426,6 +426,9 @@ class Gnome(Optimizer):
             "eps": eps,
             "lr": lr,
             "trust_radius": trust_radius,
+            # Optimizer-level, so not reachable via group — but metrics that
+            # compare v against raw (un-normalized) quantities need it.
+            "norm_free": self._norm_free,
             # Escape hatches: the raw pre-bias-correction EMAs live in state
             # as gnd_m / grad_m, alongside the Kronecker factors GG and the
             # eigenbasis Q.

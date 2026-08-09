@@ -75,6 +75,8 @@ import torch.nn as nn
 from torch.func import functional_call, jacfwd, jacrev, vmap
 
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
+from experiments.common import FusedLinear
+from experiments.common import MLP as _SharedMLP, ConcatEmbed
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
@@ -93,8 +95,8 @@ PI = math.pi
 
 # ========================= Model =========================
 
-class PINN(nn.Module):
-    """Maps ``x ∈ ℝ^d → u`` via a plain tanh MLP with Xavier init.
+class PINN(_SharedMLP):
+    """Maps ``x ∈ ℝ^d → u`` via a plain tanh MLP.
 
     Uniform-width MLP following the repo convention (same as ``poisson_pinn``):
     ``hidden`` is the layer width and ``depth`` is the total number of linear
@@ -104,20 +106,7 @@ class PINN(nn.Module):
     """
 
     def __init__(self, d_in: int, hidden: int = 64, depth: int = 5):
-        super().__init__()
-        assert depth >= 2
-        layers: list[nn.Module] = [nn.Linear(d_in, hidden), nn.Tanh()]
-        for _ in range(depth - 2):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, 1)]
-        self.net = nn.Sequential(*layers)
-        for m in self.net:                      # Xavier suits tanh
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                nn.init.zeros_(m.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        super().__init__(ConcatEmbed(d_in), hidden=hidden, depth=depth)
 
 
 # ========================= Exact solution + forcing =========================

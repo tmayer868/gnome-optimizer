@@ -115,6 +115,7 @@ from experiments.common import (
     current_lr,
     pick_device,
 )
+from experiments.common import MLP as _SharedMLP, ConcatEmbed
 
 
 EXPERIMENT = "ldc_pinn"
@@ -128,7 +129,7 @@ LID_SHARPNESS = 50.0
 
 # ========================= Models =========================
 
-class MLP(nn.Module):
+class MLP(_SharedMLP):
     """Plain tanh MLP: ``(x, y) → (u, v, p)``.
 
     ``depth`` = number of Linear layers. No input embedding: the cavity is a
@@ -136,16 +137,8 @@ class MLP(nn.Module):
     """
 
     def __init__(self, hidden: int = 256, depth: int = 4):
-        super().__init__()
-        assert depth >= 2
-        layers: list[nn.Module] = [nn.Linear(2, hidden), nn.Tanh()]
-        for _ in range(depth - 2):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, 3)]
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([x, y], dim=1))
+        super().__init__(ConcatEmbed(2), hidden=hidden, depth=depth,
+                         out_features=3)
 
 
 def build_model(arch: str, hidden: int, depth: int) -> nn.Module:

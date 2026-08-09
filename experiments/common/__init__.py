@@ -2,7 +2,13 @@
 
 from experiments.common.device import pick_device
 from experiments.common.divergence import DIVERGED_EXIT, diverged
-from experiments.common.modified_mlp import ConcatEmbed, ModifiedMLP
+from experiments.common.modified_mlp import (
+    ConcatEmbed,
+    FusedLinear,
+    FusedMLP,
+    MLP,
+    ModifiedMLP,
+)
 from experiments.common.run_log import (
     RunLogger,
     RunRecord,
@@ -20,6 +26,8 @@ __all__ = [
     "DIVERGED_EXIT",
     "diverged",
     "ConcatEmbed",
+    "FusedMLP",
+    "MLP",
     "ModifiedMLP",
     "RunLogger",
     "RunRecord",
@@ -28,4 +36,5 @@ __all__ = [
     "cosine_scheduler",
     "cosine_with_warmup",
     "current_lr",
+    "FusedLinear"
 ]

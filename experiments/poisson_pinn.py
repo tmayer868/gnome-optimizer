@@ -41,6 +41,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import time
@@ -49,16 +50,25 @@ import torch
 import torch.autograd as autograd
 import torch.nn as nn
 
-from gnome import Gnome, JsonlDiagnostics, stack_residuals
+from gnome import (
+    Gnome,
+    JsonlDiagnostics,
+    format_records,
+    measure_rho,
+    stack_residuals,
+)
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
+    ConcatEmbed,
+    FusedMLP,
     diverged,
     RunLogger,
     cosine_scheduler,
     current_lr,
     pick_device,
 )
+from experiments.common import MLP as _SharedMLP
 
 
 EXPERIMENT = "poisson_pinn"
@@ -71,20 +81,39 @@ SOURCE_COEFF = 2.0 * PI * PI
 
 # ========================= Model =========================
 
-class PINN(nn.Module):
+class PINN(_SharedMLP):
     """Maps ``(x, y) → u`` via a plain tanh MLP."""
 
     def __init__(self, hidden: int = 64, depth: int = 5):
-        super().__init__()
-        assert depth >= 2
-        layers: list[nn.Module] = [nn.Linear(2, hidden), nn.Tanh()]
-        for _ in range(depth - 2):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, 1)]
-        self.net = nn.Sequential(*layers)
+        super().__init__(ConcatEmbed(2), hidden=hidden, depth=depth)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([x, y], dim=1))
+
+def build_model(
+    arch: str, hidden: int, depth: int, fuse_every: int = 0
+) -> nn.Module:
+    """``(x, y) -> u``. Both archs compute the same function class; they differ
+    only in how the weights are grouped into parameter tensors, which is what
+    Gnome preconditions over.
+
+    * ``mlp``   — ``nn.Linear`` stack. Weight and bias are separate tensors, so
+      each bias is preconditioned as its own 1-D factor (this experiment runs
+      Gnome with ``precondition_1d=True``). The historical baseline: do not
+      change it, existing runs are compared against it.
+    * ``fused`` — ``FusedMLP``: ``[W | b]`` merged per layer, and the
+      ``depth - 2`` hidden layers grouped ``fuse_every`` to a tensor.
+      ``fuse_every=1`` is one tensor per layer and is the **control** for every
+      larger setting — same function, same init, one variable. ``0`` fuses the
+      whole stack.
+
+    ``mlp`` is not the control for ``fused``: it differs in bias handling too.
+    """
+    if arch == "mlp":
+        return PINN(hidden=hidden, depth=depth)
+    if arch == "fused":
+        return FusedMLP(
+            ConcatEmbed(2), hidden=hidden, depth=depth, fuse_every=fuse_every,
+        )
+    raise ValueError(f"unknown arch: {arch}")
 
 
 # ========================= Residuals =========================
@@ -283,6 +312,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight-decay", type=float, default=1e-8)
     p.add_argument("--hidden", type=int, default=64, help="MLP width.")
     p.add_argument("--depth", type=int, default=5, help="MLP depth.")
+    p.add_argument("--arch", type=str, default="mlp",
+                   choices=["mlp", "fused"],
+                   help="Weight grouping — same function class either way, "
+                        "different parameter tensors for the optimizer to "
+                        "precondition over. 'mlp' (default) is the nn.Linear "
+                        "baseline; 'fused' merges [W|b] per layer and groups "
+                        "hidden layers per --fuse-every.")
+    p.add_argument("--fuse-every", type=int, default=0,
+                   help="--arch fused only: consecutive hidden layers per "
+                        "parameter tensor. 1 = one tensor per layer, which is "
+                        "the control every larger value is compared against "
+                        "(identical function and initialization, only the "
+                        "grouping differs). 0 (default) fuses the whole stack. "
+                        "A short final chunk is fine if it does not divide "
+                        "depth-2. Not just a modelling knob: fewer, bigger "
+                        "tensors cut Gnome's per-tensor per-step overhead, so "
+                        "at modest width raising this is also a speedup (~8%% "
+                        "for 1 -> 2 at hidden=64 depth=10). That reverses once "
+                        "the eigenbasis refresh dominates, well above "
+                        "hidden=64.")
     p.add_argument("--warmup-steps", type=int, default=200,
                    help="Linear LR warmup steps, applied to every optimizer.")
     p.add_argument("--cosine-decay", type=float, default=0.0,
@@ -308,6 +357,18 @@ def parse_args() -> argparse.Namespace:
                         "'0,4'. Default logs every parameter, which is one "
                         "record per tensor per logged step — narrow it to "
                         "keep the file readable.")
+    p.add_argument("--measure-rho-every", type=int, default=0,
+                   help="Every N steps, measure exactly how much curvature "
+                        "the eigenbasis fails to diagonalize (rho), writing "
+                        "runs/.../{run_id}.rho.jsonl. 0 (default) disables. "
+                        "Costs one backward pass per sample (see "
+                        "--measure-rho-samples), so keep N large. Gnome only.")
+    p.add_argument("--measure-rho-samples", type=int, default=256,
+                   help="Residual entries per rho measurement. This is the "
+                        "cost knob: one backward pass each.")
+    p.add_argument("--measure-rho-kron-floor", action="store_true",
+                   help="Also compute the best-Kronecker-product error. "
+                        "Builds a (P x P) matrix, so small layers only.")
     p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--quiet", action="store_true")
@@ -324,7 +385,9 @@ def train(args: argparse.Namespace) -> str:
     else:
         device = pick_device()
     torch.manual_seed(args.seed)
-    model = PINN(hidden=args.hidden, depth=args.depth).to(device)
+    model = build_model(
+        args.arch, args.hidden, args.depth, args.fuse_every
+    ).to(device)
     opt, opt_cfg, scheduler = build_optimizer(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
         warmup=args.warmup_steps, total_steps=args.steps,
@@ -340,9 +403,20 @@ def train(args: argparse.Namespace) -> str:
     hyperparameters = {
         "optimizer": args.optimizer,
         "steps": args.steps,
+        "arch": args.arch,
+        # Layers per fused tensor. Recorded as the *realized* chunk sizes, not
+        # the raw flag: 0 and any value >= depth-2 both mean "one chunk", and
+        # the sweep needs those runs to compare equal.
+        "fuse_every": (
+            getattr(model, "chunks", None) if args.arch == "fused" else None
+        ),
         "hidden": args.hidden,
         "depth": args.depth,
         "n_params": n_params,
+        # Parameter *tensor* count, not element count: the variable --arch
+        # actually changes, and what Gnome's per-tensor preconditioning and
+        # per-tensor trust region see.
+        "n_tensors": sum(1 for _ in model.parameters()),
         "n_pde": args.n_pde,
         "n_bc_per_edge": args.n_bc_per_edge,
         "n_pde_aux": n_pde_aux,
@@ -385,6 +459,21 @@ def train(args: argparse.Namespace) -> str:
         opt.diagnostics = diag
         opt.diagnostics_every = args.diagnostics_every
 
+    # Exact rho measurement, in its own file. Unlike the diagnostics above this
+    # is not free — it needs per-sample gradients, i.e. one backward pass per
+    # sample — so it runs on its own much coarser cadence.
+    rho_log = None
+    if args.measure_rho_every > 0:
+        if args.optimizer != "gnome":
+            raise SystemExit(
+                f"--measure-rho-every measures Gnome's eigenbasis; "
+                f"--optimizer {args.optimizer} has none."
+            )
+        rho_log = open(os.path.join(
+            os.path.dirname(run.path) or ".", f"{run.run_id}.rho.jsonl"
+        ), "a")
+    params_measured = [q for q in model.parameters() if q.requires_grad]
+
     if not args.quiet:
         print(
             f"[{EXPERIMENT}] {args.optimizer} | params={n_params:,} | "
@@ -424,6 +513,22 @@ def train(args: argparse.Namespace) -> str:
             loss.backward()
             opt.step()
 
+        if rho_log is not None and (step + 1) % args.measure_rho_every == 0:
+            # A fresh batch, so the measurement is not tied to the points the
+            # optimizer just stepped on. opt= adds the live-eigenbasis column.
+            rb = sample_batch(args.n_pde, args.n_bc_per_edge, device)
+            records = measure_rho(
+                stacked_residuals(model, rb), params_measured, opt=opt,
+                max_samples=args.measure_rho_samples,
+                with_kron_floor=args.measure_rho_kron_floor,
+            )
+            for rec in records:
+                rho_log.write(json.dumps({"step": step + 1, **rec}) + "\n")
+            rho_log.flush()
+            if not args.quiet:
+                print(f"  [rho @ step {step + 1}]")
+                print(format_records(records, prefix="    "), flush=True)
+
         if scheduler is not None:
             scheduler.step()
 
@@ -432,6 +537,8 @@ def train(args: argparse.Namespace) -> str:
             run.finish(completed=False, diverged=True, diverged_step=step)
             if diag is not None:
                 diag.close()
+            if rho_log is not None:
+                rho_log.close()
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
             raise SystemExit(DIVERGED_EXIT)
         run.log_train(step, loss=loss_val)
@@ -467,6 +574,9 @@ def train(args: argparse.Namespace) -> str:
     if diag is not None:
         diag.close()
         print(f"[{EXPERIMENT}] diagnostics → {diag.path}")
+    if rho_log is not None:
+        print(f"[{EXPERIMENT}] rho → {rho_log.name}")
+        rho_log.close()
     print(f"[{EXPERIMENT}] saved → {path}")
     print(f"  final avg_train={last_avg:.4e}  best={best_avg:.4e}")
     print(f"  final rel_l2={last_rel_l2:.3e}  best rel_l2={best_rel_l2:.3e}")

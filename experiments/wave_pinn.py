@@ -68,6 +68,7 @@ from experiments.common import (
     current_lr,
     pick_device,
 )
+from experiments.common import MLP as _SharedMLP, ConcatEmbed
 
 
 EXPERIMENT = "wave_pinn"
@@ -140,8 +141,8 @@ def build_embedding(embed: str, fourier_dim: int, fourier_scale: float
 
 # ========================= Models =========================
 
-class MLP(nn.Module):
-    """Plain tanh MLP over an input embedding. ``depth`` = Linear-layer count.
+class MLP(_SharedMLP):
+    """Plain GELU MLP over an input embedding. ``depth`` = Linear-layer count.
 
     With ``hard_bc``, the output is transformed to ``sin(πx)·N(t,x)`` so it
     vanishes at x = 0, 1 (exact Dirichlet).
@@ -149,21 +150,13 @@ class MLP(nn.Module):
 
     def __init__(self, embed: nn.Module, hidden: int = 256, depth: int = 4,
                  hard_bc: bool = False):
-        super().__init__()
-        assert depth >= 2
-        self.embed = embed
-        self.hard_bc = hard_bc
-        layers: list[nn.Module] = [nn.Linear(embed.out_dim, hidden), nn.SiLU()]
-        for _ in range(depth - 2):
-            layers += [nn.Linear(hidden, hidden), nn.SiLU()]
-        layers += [nn.Linear(hidden, 1)]
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        out = self.net(self.embed(t, x))
-        if self.hard_bc:
-            out = torch.sin(math.pi * x) * out
-        return out
+        super().__init__(
+            embed, hidden=hidden, depth=depth, activation=nn.GELU,
+            out_transform=(
+                (lambda out, t, x: torch.sin(math.pi * x) * out)
+                if hard_bc else None
+            ),
+        )
 
 
 def _dirichlet_transform(out: torch.Tensor, t: torch.Tensor, x: torch.Tensor

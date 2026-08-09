@@ -32,8 +32,11 @@ Metric context ``c``
 Each metric receives this dict and must return a **0-dim tensor** (see
 :data:`DEFAULT_METRICS` for why).
 
-``v``           bias-corrected curvature — the diagonal GGN estimate in the
-                rotated eigenbasis, i.e. the estimated GGN eigenvalues
+``v``           bias-corrected curvature: the EMA of the squared rotated
+                surrogate gradient, which estimates ``diag(Q^T H Q)`` — the
+                *diagonal of the rotated GGN*. Not the eigenvalues of H: those
+                coincide only when Q diagonalizes H, i.e. only when rho = 0,
+                and rho is precisely what measures that gap
 ``m``           bias-corrected gradient EMA, same basis
 ``update``      the damped Newton step ``m / (v + lam)``, pre-projection.
                 Basis-independent in norm, since Q is orthonormal
@@ -73,9 +76,9 @@ present and need no reduction:
 From :data:`DEFAULT_METRICS` — present only while those metrics are in use:
 
 ``v_min``, ``v_max``, ``v_mean``
-                      curvature (the diagonal GGN estimate) in the rotated
-                      eigenbasis, after bias correction — these are the
-                      estimated GGN eigenvalues
+                      the rotated-GGN diagonal ``diag(Q^T H Q)``, after bias
+                      correction. These are eigenvalues of H only in the
+                      rho = 0 limit
 ``v_frac_below_eps``  fraction of coordinates whose curvature sits under
                       ``eps``. Only meaningful when ``eps`` is in the same
                       range as the curvature — set ``eps`` far below
@@ -98,13 +101,135 @@ From :data:`DEFAULT_METRICS` — present only while those metrics are in use:
                       active. ``None`` when ``trust_radius=None``. Derived
                       from ``update_rms``, so it disappears if you drop that
                       metric
+``captured_energy``   ``‖diag(Q_Gᵀ H Q_G)‖²_F`` — curvature energy Gnome's
+                      eigenbasis actually captures on the diagonal
+``energy_ratio``      ``captured / ‖M_G‖²_F``. ``>1`` is the factorization
+                      gap — the curvature eigenvalues do not factorize, so
+                      re-estimating the diagonal beats any Kronecker-product
+                      model of the GGN (i.e. beats KFAC; Shampoo factorizes
+                      loss gradients, a different matrix, so it is not what
+                      this compares against). ``<1`` means ``rho_proxy`` is a
+                      valid upper bound; ``≈1`` means the model is accurate.
+                      ``NaN`` for 1D params. ``kron_energy`` itself is
+                      recoverable as ``captured_energy / energy_ratio``
+``rho_proxy``         ``sqrt(1 - captured/kron)`` — Kronecker-model proxy for
+                      the off-diagonal mass fraction ``ρ(Q_G)``. 0 means the
+                      basis diagonalizes the curvature exactly; near 1 means
+                      most of it sits off-diagonal. Conservative, but a hard 0
+                      is ambiguous (also what the clamp returns when
+                      ``captured > kron``) — read it with ``energy_ratio``
+
+The eigenbasis-quality group is unreliable for roughly the first 50-75 steps:
+``GG`` is an EMA from zero carrying no bias correction while ``v`` is
+bias-corrected, so ``kron`` is understated early and ``energy_ratio`` inflated.
+During that window ``rho_proxy`` clamps to ``0.0``, which is indistinguishable
+from a genuine zero — a Kronecker-model-free ρ for the early transient needs a
+dedicated measurement script, not a per-step metric (see the note above
+:data:`DEFAULT_METRICS`).
 """
 
 from __future__ import annotations
 
 import json
+import math
 import sys
 from typing import Callable, Iterable, Optional, TextIO
+
+
+# ----------------------------------------------------------------------
+# Eigenbasis quality
+# ----------------------------------------------------------------------
+#
+# How much of the curvature does Gnome's basis actually diagonalize? The
+# rotated curvature ``v`` is the diagonal Gnome keeps; the Kronecker model
+# carries the total. Their ratio bounds the off-diagonal mass Gnome discards.
+
+
+def _nan_like(t):
+    """0-dim NaN matching ``t``'s dtype/device — the 'not applicable' value."""
+    return t.sum().new_full((), float("nan"))
+
+
+def _kron_energy(c):
+    """``‖M_G‖²_F``, or ``None`` when there is no separable model.
+
+    ``M_G = (Â ⊗ B̂) / tr(H)`` is diagonal in ``Q_G``, so its Frobenius norm
+    equals its diagonal norm; when the Kronecker model is accurate this
+    approximates ``‖H‖²_F``. Uses ``‖A ⊗ B‖²_F = ‖A‖²_F · ‖B‖²_F``, so no
+    Kronecker product is formed.
+
+    Only the first two modes are used — all of them for an MLP's 2D weights,
+    but a >2D parameter (conv) has a factor per mode and the rest are ignored.
+
+    Internal helper, not a metric: it returns ``None`` rather than a tensor
+    for the inapplicable cases.
+    """
+    v, GG = c["v"], c["state"]["GG"]
+    # 1D params have no separable-basis question at all. The len(GG) < 2 test
+    # is a second guard: with merge_dims a 2D param can collapse to a single
+    # factor, so v.dim() alone does not guarantee GG[1] exists. Empty entries
+    # mean the mode was skipped (precondition_1d=False, or > max_precond_dim).
+    if v.dim() < 2 or len(GG) < 2 or len(GG[0]) == 0 or len(GG[1]) == 0:
+        return None
+    A, B = GG[0], GG[1]
+    trH = A.trace().clamp_min(1e-30)
+    return (A * A).sum() * (B * B).sum() / (trH * trH)
+
+
+def _captured_energy(c):
+    """``‖diag(Q_Gᵀ H Q_G)‖²_F`` — curvature energy Gnome's basis captures."""
+    return (c["v"] ** 2).sum()
+
+
+def _energy_ratio(c):
+    """``captured / kron_energy``.
+
+    | ``> 1`` — factorization gap: the curvature eigenvalues do not
+      factorize, so re-estimating the diagonal in the basis beats any
+      Kronecker-*product* model of the GGN. That bounds KFAC; Shampoo
+      factorizes loss-gradient outer products, a different matrix entirely,
+      and SOAP also re-estimates its diagonal, so neither is what this
+      compares against
+    | ``< 1`` — ``rho_proxy`` is valid as an upper bound on true ρ
+    | ``≈ 1`` — Kronecker model accurate, proxy ≈ true ρ
+    | ``NaN`` — 1D param (no separable basis question)
+
+    Expect ``> 1`` for the first tens of steps regardless: ``GG`` is an EMA
+    from zero with no bias correction while ``v`` is bias-corrected, so
+    ``kron`` is understated early and the ratio is inflated.
+    """
+    kron = _kron_energy(c)
+    if kron is None:
+        return _nan_like(c["v"])
+    return (c["v"] ** 2).sum() / kron.clamp_min(1e-30)
+
+
+def _rho_proxy(c):
+    """Proxy ρ: ``sqrt(1 - captured / kron)``, clamped to 0 when captured > kron.
+
+    Uses ``‖M_G‖`` as a stand-in for ``‖H‖``. Biased when the Kronecker model
+    is poor, but conservatively: understating ``‖M_G‖`` overstates ρ rather
+    than under. 0 means the basis diagonalizes the curvature exactly; near 1
+    means most of the curvature sits off-diagonal.
+
+    A hard 0 is ambiguous — it is also what the clamp returns whenever
+    ``captured > kron``, so read it alongside ``energy_ratio``.
+    """
+    kron = _kron_energy(c)
+    if kron is None:
+        return _nan_like(c["v"])
+    return (1.0 - (c["v"] ** 2).sum() / kron.clamp_min(1e-30)).clamp_min(0.0).sqrt()
+
+
+# A note on what is deliberately *not* here: a fourth-moment estimate of
+# trace(H^2), which would give rho without the Kronecker model. It needs an EMA
+# of ||g_s||^4 updated on every step, i.e. optimizer state maintained purely to
+# be observed — unlike v/GG/Q/lam, which exist because the update needs them.
+# That cost is paid whether or not anyone is looking, and the estimator is
+# biased anyway: the Gaussian identity assumes a fixed H, while an EMA averages
+# over a window in which the curvature is moving. Measuring it properly means
+# freezing the parameters and drawing independent surrogate samples there,
+# which belongs in a dedicated script rather than the hot path.
 
 
 # ----------------------------------------------------------------------
@@ -112,8 +237,8 @@ from typing import Callable, Iterable, Optional, TextIO
 # ----------------------------------------------------------------------
 
 DEFAULT_METRICS = {
-    # Curvature: the diagonal GGN estimate in the rotated eigenbasis, so
-    # these entries are the estimated GGN eigenvalues.
+    # Curvature: diag(Q^T H Q), the rotated-GGN diagonal. Eigenvalues of H
+    # only when Q diagonalizes H (rho = 0).
     "v_min": lambda c: c["v"].min(),
     "v_max": lambda c: c["v"].max(),
     "v_mean": lambda c: c["v"].mean(),
@@ -130,6 +255,13 @@ DEFAULT_METRICS = {
     # Basis-independent: Q is orthonormal, so this is also the RMS of the
     # final parameter update, in units of lr.
     "update_rms": lambda c: c["update"].square().mean().sqrt(),
+    # Eigenbasis quality — how much curvature Gnome's basis diagonalizes.
+    # kron_energy is not itself a metric: it is recoverable as
+    # captured_energy / energy_ratio, and returning None for the
+    # inapplicable cases keeps it out of the record cleanly.
+    "captured_energy": _captured_energy,
+    "energy_ratio": _energy_ratio,
+    "rho_proxy": _rho_proxy,
 }
 """Default ``{name: fn}`` metric set. Pass your own via ``Gnome(metrics=...)``.
 
@@ -150,9 +282,13 @@ also drops ``trust_ratio`` from the record.
 """
 
 
+# captured_energy is an intermediate of the ratios, so it is in the record but
+# not printed. The line is wide with everything else on it — pass fields= to
+# narrow it (e.g. fields=("rho_proxy", "energy_ratio", "trust_ratio")).
 _DEFAULT_FIELDS = (
     "v_min", "v_max", "v_mean", "v_frac_below_eps", "v_frac_below_lam",
     "lam", "grad_rms", "update_rms", "trust_ratio",
+    "energy_ratio", "rho_proxy",
 )
 
 
@@ -219,7 +355,9 @@ class JsonlDiagnostics:
         if self._fh is None:
             self._fh = open(self.path, "a")
         # shape is a tuple; JSON turns it into a list either way.
-        self._fh.write(json.dumps(rec) + "\n")
+        # allow_nan=False turns a missed non-finite into a loud error rather
+        # than a file that only Python can read back.
+        self._fh.write(json.dumps(_json_safe(rec), allow_nan=False) + "\n")
         self._fh.flush()
 
     def close(self) -> None:
@@ -264,6 +402,20 @@ def multi(*sinks: Callable[[dict], None]) -> Callable[[dict], None]:
         for s in sinks:
             s(rec)
     return _fan
+
+
+def _json_safe(rec: dict) -> dict:
+    """Map non-finite floats to ``None``.
+
+    Metrics use NaN for "not applicable" (``rho_proxy`` on a 1D parameter, say),
+    but ``json.dumps`` writes that as a bare ``NaN`` token, which is not valid
+    JSON — Python reads it back, ``jq`` and most other parsers do not. ``null``
+    round-trips everywhere, and pandas reads it back as NaN regardless.
+    """
+    return {
+        k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+        for k, v in rec.items()
+    }
 
 
 def _fmt(v) -> str:

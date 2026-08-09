@@ -47,6 +47,7 @@ from experiments.common import (
     current_lr,
     pick_device,
 )
+from experiments.common import MLP as _SharedMLP, ConcatEmbed
 
 
 EXPERIMENT = "burgers_pinn"
@@ -70,20 +71,11 @@ JAXPI_REFERENCE_CACHE = "experiments/data/burgers.mat"
 
 # ========================= Model =========================
 
-class PINN(nn.Module):
+class PINN(_SharedMLP):
     """Maps ``(t, x) → u`` via a plain tanh MLP."""
 
     def __init__(self, hidden: int = 20, depth: int = 9):
-        super().__init__()
-        assert depth >= 2
-        layers: list[nn.Module] = [nn.Linear(2, hidden), nn.Tanh()]
-        for _ in range(depth - 2):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, 1)]
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([t, x], dim=1))
+        super().__init__(ConcatEmbed(2), hidden=hidden, depth=depth)
 
 
 # ========================= Residuals =========================

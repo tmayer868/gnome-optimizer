@@ -97,6 +97,7 @@ from experiments.common import (
     current_lr,
     pick_device,
 )
+from experiments.common import MLP as _SharedMLP, ConcatEmbed
 
 
 EXPERIMENT = "kuramoto_sivashinsky_pinn"
@@ -138,25 +139,14 @@ def build_embedding(embed: str) -> nn.Module:
     raise ValueError(f"unknown embedding: {embed}")
 
 
-class MLP(nn.Module):
+class MLP(_SharedMLP):
     """Plain tanh MLP over an input embedding: ``(t, x) → u``.
 
     ``depth`` = number of Linear layers.
     """
 
     def __init__(self, embed: nn.Module, hidden: int = 128, depth: int = 6):
-        super().__init__()
-        assert depth >= 2
-        self.embed = embed
-        d = embed.out_dim
-        layers: list[nn.Module] = [nn.Linear(d, hidden), nn.Tanh()]
-        for _ in range(depth - 2):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, 1)]
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return self.net(self.embed(t, x))
+        super().__init__(embed, hidden=hidden, depth=depth)
 
 
 def build_model(arch: str, embed: nn.Module, hidden: int, depth: int

@@ -93,6 +93,7 @@ from experiments.common import (
     current_lr,
     pick_device,
 )
+from experiments.common import MLP as _SharedMLP, ConcatEmbed
 
 
 EXPERIMENT = "burgers2d_pinn"
@@ -123,7 +124,7 @@ def exact_solution(
 
 # ========================= Model =========================
 
-class PINN(nn.Module):
+class PINN(_SharedMLP):
     """Maps ``(t, x, y) → u`` via a plain tanh MLP.
 
     ``depth`` counts *total* linear layers, so ``depth = 11`` is the paper's
@@ -131,18 +132,7 @@ class PINN(nn.Module):
     """
 
     def __init__(self, hidden: int = 20, depth: int = 11):
-        super().__init__()
-        assert depth >= 2
-        layers: list[nn.Module] = [nn.Linear(3, hidden), nn.Tanh()]
-        for _ in range(depth - 2):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, 1)]
-        self.net = nn.Sequential(*layers)
-
-    def forward(
-        self, t: torch.Tensor, x: torch.Tensor, y: torch.Tensor
-    ) -> torch.Tensor:
-        return self.net(torch.cat([t, x, y], dim=1))
+        super().__init__(ConcatEmbed(3), hidden=hidden, depth=depth)
 
 
 # ========================= Residuals =========================
