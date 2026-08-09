@@ -2,6 +2,7 @@
 
 from experiments.common.device import pick_device
 from experiments.common.divergence import DIVERGED_EXIT, diverged
+from experiments.common.modified_mlp import ConcatEmbed, ModifiedMLP
 from experiments.common.run_log import (
     RunLogger,
     RunRecord,
@@ -18,6 +19,8 @@ __all__ = [
     "pick_device",
     "DIVERGED_EXIT",
     "diverged",
+    "ConcatEmbed",
+    "ModifiedMLP",
     "RunLogger",
     "RunRecord",
     "load_run",

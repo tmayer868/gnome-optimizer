@@ -90,6 +90,7 @@ from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
+    ModifiedMLP,
     diverged,
     RunLogger,
     cosine_scheduler,
@@ -158,48 +159,9 @@ class MLP(nn.Module):
         return self.net(self.embed(t, x))
 
 
-class ModifiedMLP(nn.Module):
-    """Modified MLP (Wang, Teng & Perdikaris 2021) over an input embedding.
-
-    Two encoders gate every hidden layer. The gate is written in the
-    algebraically equivalent form ``h = v + h·(u - v)`` via one fused
-    ``addcmul`` (rather than ``h·u + (1-h)·v``, three elementwise kernels and
-    three autograd nodes), and the two encoders are fused into a single
-    Linear producing ``2·hidden`` features. ``depth`` = gated-hidden-layer
-    count.
-
-    Architecture only — no random weight factorization, Fourier features or
-    causal weighting (jaxpi-pipeline pieces, deliberately not ported).
-    """
-
-    def __init__(self, embed: nn.Module, hidden: int = 128, depth: int = 6):
-        super().__init__()
-        assert depth >= 1
-        self.embed = embed
-        d = embed.out_dim
-        # Fused u/v encoder: one matmul, chunked into the two gates.
-        self.enc_uv = nn.Linear(d, 2 * hidden)
-        self.layers = nn.ModuleList(
-            [nn.Linear(d if i == 0 else hidden, hidden) for i in range(depth)]
-        )
-        self.out = nn.Linear(hidden, 1)
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        z = self.embed(t, x)
-
-        uv = torch.tanh(self.enc_uv(z))
-        enc_a, enc_b = uv.chunk(2, dim=-1)
-        w = enc_a - enc_b  # computed once; gate becomes enc_b + h*w
-
-        h = z
-        for layer in self.layers:
-            h = torch.tanh(layer(h))
-            h = torch.addcmul(enc_b, h, w)  # == h*enc_a + (1-h)*enc_b
-        return self.out(h)
-
-
 def build_model(arch: str, embed: nn.Module, hidden: int, depth: int
                 ) -> nn.Module:
+    """``(t, x) → u``. The input embedding is whatever ``--embed`` selects."""
     if arch == "mlp":
         return MLP(embed, hidden=hidden, depth=depth)
     if arch == "modified":

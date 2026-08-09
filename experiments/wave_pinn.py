@@ -61,6 +61,7 @@ from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
+    ModifiedMLP,
     diverged,
     RunLogger,
     cosine_scheduler,
@@ -165,59 +166,22 @@ class MLP(nn.Module):
         return out
 
 
-class ModifiedMLP(nn.Module):
-    """Modified MLP (Wang, Teng & Perdikaris 2021) over an input embedding.
-
-    Two encoders ``u, v`` gate every hidden layer. The gate is computed in
-    the algebraically equivalent form ``h = v + h*(u - v)`` via a single
-    fused ``addcmul`` per layer (instead of ``h*u + (1-h)*v``, which costs
-    three elementwise kernels and three autograd nodes). The two encoders
-    are fused into one Linear producing ``2*hidden`` features (one GEMM
-    launch instead of two). ``depth`` = gated-hidden-layer count.
-    ``hard_bc`` applies the ``sin(pi*x)*N`` Dirichlet transform.
-
-    Numerically identical to the original implementation; only the
-    kernel/graph structure differs.
-    """
-
-    def __init__(self, embed: nn.Module, hidden: int = 256, depth: int = 4,
-                 hard_bc: bool = False):
-        super().__init__()
-        assert depth >= 1
-        self.embed = embed
-        self.hard_bc = hard_bc
-        d = embed.out_dim
-        # Fused u/v encoder: one matmul, chunked into the two gates.
-        self.enc_uv = nn.Linear(d, 2 * hidden)
-        self.layers = nn.ModuleList(
-            [nn.Linear(d if i == 0 else hidden, hidden) for i in range(depth)]
-        )
-        self.out = nn.Linear(hidden, 1)
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        z = self.embed(t, x)
-
-        uv = torch.tanh(self.enc_uv(z))
-        u, v = uv.chunk(2, dim=-1)
-        w = u - v  # computed once; gate becomes v + h*w
-
-        h = z
-        for layer in self.layers:
-            h = torch.tanh(layer(h))
-            h = torch.addcmul(v, h, w)  # == h*u + (1-h)*v, one fused kernel
-
-        out = self.out(h)
-        if self.hard_bc:
-            out = torch.sin(math.pi * x) * out
-        return out
+def _dirichlet_transform(out: torch.Tensor, t: torch.Tensor, x: torch.Tensor
+                         ) -> torch.Tensor:
+    """``sin(πx)·N(t, x)`` — the hard Dirichlet BC, zero at ``x = 0, 1``."""
+    return torch.sin(math.pi * x) * out
 
 
 def build_model(arch: str, embed: nn.Module, hidden: int, depth: int,
                 hard_bc: bool) -> nn.Module:
+    """``(t, x) → u``, optionally with the hard ``sin(πx)`` Dirichlet BC."""
     if arch == "mlp":
         return MLP(embed, hidden, depth, hard_bc)
     if arch == "modified":
-        return ModifiedMLP(embed, hidden, depth, hard_bc)
+        return ModifiedMLP(
+            embed, hidden, depth,
+            out_transform=_dirichlet_transform if hard_bc else None,
+        )
     raise ValueError(f"unknown arch: {arch}")
 
 

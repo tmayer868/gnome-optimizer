@@ -81,6 +81,7 @@ from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
+    ModifiedMLP,
     diverged,
     RunLogger,
     cosine_scheduler,
@@ -190,41 +191,9 @@ class MLP(nn.Module):
         return self.net(self.embed(t, x))
 
 
-class ModifiedMLP(nn.Module):
-    """Modified MLP (Wang, Teng & Perdikaris 2021): ``(t, x) → u``.
-
-    Two input encoders ``u, v`` gate every hidden layer:
-    ``h = tanh(W_l h);  h = h·u + (1-h)·v``. ``depth`` = number of gated
-    hidden layers. Architecture only — no random weight factorization or
-    Fourier features (those are jaxpi-pipeline pieces, deliberately not
-    ported here); the input embedding is whatever ``--embed`` selects.
-    """
-
-    def __init__(self, embed: nn.Module, hidden: int = 256, depth: int = 4):
-        super().__init__()
-        assert depth >= 1
-        self.embed = embed
-        d = embed.out_dim
-        self.enc_u = nn.Linear(d, hidden)
-        self.enc_v = nn.Linear(d, hidden)
-        self.layers = nn.ModuleList(
-            [nn.Linear(d if i == 0 else hidden, hidden) for i in range(depth)]
-        )
-        self.out = nn.Linear(hidden, 1)
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        z = self.embed(t, x)
-        u = torch.tanh(self.enc_u(z))
-        v = torch.tanh(self.enc_v(z))
-        h = z
-        for layer in self.layers:
-            h = torch.tanh(layer(h))
-            h = h * u + (1.0 - h) * v
-        return self.out(h)
-
-
 def build_model(arch: str, embed: nn.Module, hidden: int, depth: int
                 ) -> nn.Module:
+    """``(t, x) → u``. The input embedding is whatever ``--embed`` selects."""
     if arch == "mlp":
         return MLP(embed, hidden=hidden, depth=depth)
     if arch == "modified":

@@ -106,7 +106,9 @@ import torch.nn as nn
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.baselines import SOAP
 from experiments.common import (
+    ConcatEmbed,
     DIVERGED_EXIT,
+    ModifiedMLP,
     diverged,
     RunLogger,
     cosine_scheduler,
@@ -146,53 +148,20 @@ class MLP(nn.Module):
         return self.net(torch.cat([x, y], dim=1))
 
 
-class ModifiedMLP(nn.Module):
-    """Modified MLP (Wang, Teng & Perdikaris 2021): ``(x, y) → (u, v, p)``.
-
-    Two input encoders gate every hidden layer. The gate is written in the
-    algebraically equivalent form ``h = v + h·(u - v)`` via one fused
-    ``addcmul`` (rather than ``h·u + (1-h)·v``, three elementwise kernels and
-    three autograd nodes), and the two encoders are fused into a single
-    Linear producing ``2·hidden`` features. ``depth`` = gated-hidden-layer
-    count.
-
-    The three fields share one trunk and split only at the output layer, so
-    ``u``, ``v`` and ``p`` are coupled in the representation the way they are
-    coupled in the equations.
-
-    Architecture only — no random weight factorization, Fourier features or
-    grad-norm balancing (jaxpi-pipeline pieces, deliberately not ported).
-    """
-
-    def __init__(self, hidden: int = 256, depth: int = 4):
-        super().__init__()
-        assert depth >= 1
-        # Fused u/v encoder: one matmul, chunked into the two gates.
-        self.enc_uv = nn.Linear(2, 2 * hidden)
-        self.layers = nn.ModuleList(
-            [nn.Linear(2 if i == 0 else hidden, hidden) for i in range(depth)]
-        )
-        self.out = nn.Linear(hidden, 3)
-
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        z = torch.cat([x, y], dim=1)
-
-        uv = torch.tanh(self.enc_uv(z))
-        enc_a, enc_b = uv.chunk(2, dim=-1)
-        w = enc_a - enc_b  # computed once; gate becomes enc_b + h*w
-
-        h = z
-        for layer in self.layers:
-            h = torch.tanh(layer(h))
-            h = torch.addcmul(enc_b, h, w)  # == h*enc_a + (1-h)*enc_b
-        return self.out(h)
-
-
 def build_model(arch: str, hidden: int, depth: int) -> nn.Module:
+    """``(x, y) → (u, v, p)``.
+
+    No input embedding: the cavity is a plain square with Dirichlet data, so
+    there is no periodicity to encode. Under ``modified`` the three fields
+    share one trunk and split only at the output layer, so ``u``, ``v`` and
+    ``p`` are coupled in the representation the way they are in the equations.
+    """
     if arch == "mlp":
         return MLP(hidden=hidden, depth=depth)
     if arch == "modified":
-        return ModifiedMLP(hidden=hidden, depth=depth)
+        return ModifiedMLP(
+            ConcatEmbed(2), hidden=hidden, depth=depth, out_features=3
+        )
     raise ValueError(f"unknown arch: {arch}")
 
 
