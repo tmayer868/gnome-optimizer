@@ -82,6 +82,7 @@ from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
     FusedMLP,
+    FusedModifiedMLP,
     ModifiedMLP,
     diverged,
     RunLogger,
@@ -187,10 +188,13 @@ def build_model(arch: str, embed: nn.Module, hidden: int, depth: int,
                 fuse_every: int = 0) -> nn.Module:
     """``(t, x) → u``. The input embedding is whatever ``--embed`` selects.
 
-    ``fused`` is the same function class as ``mlp`` — it differs only in how
-    the weights are grouped into parameter tensors, which is what Gnome
-    preconditions over. ``--fuse-every 1`` is its control: one tensor per
-    layer, bit-identical initialization, one variable.
+    ``fused`` and ``fused-modified`` are the same function classes as ``mlp``
+    and ``modified`` respectively — they differ only in how the weights are
+    grouped into parameter tensors, which is what Gnome preconditions over.
+    ``--fuse-every 1`` is the control for both: one tensor per layer,
+    bit-identical initialization, one variable. Note the fusable run differs —
+    ``depth - 2`` layers for ``fused``, ``depth - 1`` for ``fused-modified``,
+    whose first gated layer consumes the embedding and cannot share a tensor.
     """
     if arch == "mlp":
         return MLP(embed, hidden=hidden, depth=depth)
@@ -199,6 +203,9 @@ def build_model(arch: str, embed: nn.Module, hidden: int, depth: int,
     if arch == "fused":
         return FusedMLP(embed, hidden=hidden, depth=depth,
                         fuse_every=fuse_every)
+    if arch == "fused-modified":
+        return FusedModifiedMLP(embed, hidden=hidden, depth=depth,
+                                fuse_every=fuse_every)
     raise ValueError(f"unknown arch: {arch}")
 
 
@@ -401,7 +408,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--optimizer", required=True,
                    choices=["gnome", "soap", "adamw"])
-    p.add_argument("--arch", choices=["mlp", "modified", "fused"],
+    p.add_argument("--arch",
+                   choices=["mlp", "modified", "fused", "fused-modified"],
                    default="modified",
                    help="Network: plain tanh MLP, the gated modified MLP "
                         "(Wang et al. 2021), or 'fused' — the plain MLP with "
@@ -539,9 +547,7 @@ def train(args: argparse.Namespace) -> str:
         # Realized chunk sizes, not the raw flag: 0 and any value >= depth-2
         # both mean "one chunk", and the sweep needs those runs to compare
         # equal. None for the archs that have no such grouping.
-        "fuse_every": (
-            getattr(model, "chunks", None) if args.arch == "fused" else None
-        ),
+        "fuse_every": getattr(model, "chunks", None),
         "embed": args.embed,
         "embed_dim": args.embed_dim if args.embed == "fourier" else None,
         "embed_scale": args.embed_scale if args.embed == "fourier" else None,

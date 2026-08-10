@@ -223,6 +223,7 @@ class FusedMLP(nn.Module):
         depth: int = 5,
         out_features: int = 1,
         fuse_every: int = 0,
+        activation: Callable[[], nn.Module] = nn.Tanh,
         out_transform: Optional[Callable[..., torch.Tensor]] = None,
     ):
         super().__init__()
@@ -247,6 +248,9 @@ class FusedMLP(nn.Module):
             [nn.Parameter(self._init_blocks(c, hidden)) for c in self.chunks]
         )
         self.out = FusedLinear(hidden, out_features)
+        # Held as a module (not called functionally) so it matches the shared
+        # ``MLP``'s ``activation=`` contract and shows up in repr().
+        self.act = activation()
         self.out_transform = out_transform
 
     @staticmethod
@@ -281,12 +285,12 @@ class FusedMLP(nn.Module):
         return w
 
     def forward(self, *coords: torch.Tensor) -> torch.Tensor:
-        h = torch.tanh(self.inp(self.embed(*coords)))
+        h = self.act(self.inp(self.embed(*coords)))
 
         for W, c in zip(self.mid, self.chunks):
             for i in range(c):
                 blk = W[i * self.hidden:(i + 1) * self.hidden]
-                h = torch.tanh(F.linear(h, blk[:, :-1], blk[:, -1]))
+                h = self.act(F.linear(h, blk[:, :-1], blk[:, -1]))
 
         out = self.out(h)
         if self.out_transform is not None:
@@ -336,6 +340,94 @@ class MLP(nn.Module):
 
     def forward(self, *coords: torch.Tensor) -> torch.Tensor:
         out = self.net(self.embed(*coords))
+        if self.out_transform is not None:
+            out = self.out_transform(out, *coords)
+        return out
+
+
+class FusedModifiedMLP(nn.Module):
+    """:class:`ModifiedMLP` with its gated hidden layers grouped into shared
+    parameter tensors — ``FusedMLP``'s chunking applied to the gated trunk.
+
+    Same function as :class:`ModifiedMLP` for every ``fuse_every``; only the
+    parameter-tensor grouping changes. ``fuse_every=1`` reproduces
+    ``ModifiedMLP`` exactly, weight for weight (see below), and is the control
+    for every larger setting.
+
+    **The fusable run is ``k = depth - 1``, not ``depth - 2``.** In the gated
+    architecture the first hidden layer consumes the *embedding*
+    (``d -> hidden``) rather than a hidden state, so it has a different input
+    width and cannot share a tensor with the rest. It stays as its own
+    ``first``; the remaining ``depth - 1`` layers are ``hidden -> hidden`` and
+    are what gets chunked. ``depth`` keeps ``ModifiedMLP``'s meaning: the
+    gated-hidden-layer count.
+
+    Init is bit-identical to ``ModifiedMLP`` under the same seed. Both draw in
+    the order ``enc_uv``, first layer, hidden layers in sequence, ``out``, and
+    the chunk tensors are filled one ``(hidden, hidden+1)`` block at a time
+    with ``FusedLinear``'s bound — so the RNG stream does not depend on the
+    chunking. See :meth:`FusedMLP._init_blocks`.
+
+    The ``u``/``v`` encoder is left alone. It is ``(2*hidden, d+1)`` — a
+    different input width again — so it cannot join a chunk; it is already
+    fused across ``u`` and ``v``, which is the module docstring's subject.
+
+    One reason to expect fusion to be *cheaper* here than in the plain
+    ``FusedMLP``: every gated layer's output passes through the same
+    ``enc_b + h*(enc_a - enc_b)``, so the layers' output-side statistics are
+    shaped by a shared gate rather than drifting independently with depth.
+    That should make their curvature eigenbases more alike, and the shared
+    input-side factor correspondingly less of a compromise. Untested.
+
+    Activation is ``tanh`` throughout, matching ``ModifiedMLP`` — the gate
+    wants ``u, v`` bounded, so it is not a free knob here the way it is in
+    :class:`FusedMLP`.
+    """
+
+    def __init__(
+        self,
+        embed: nn.Module,
+        hidden: int = 256,
+        depth: int = 4,
+        out_features: int = 1,
+        fuse_every: int = 0,
+        out_transform: Optional[Callable[..., torch.Tensor]] = None,
+    ):
+        super().__init__()
+        assert depth >= 1
+        if fuse_every < 0:
+            raise ValueError(f"fuse_every must be >= 0, got {fuse_every}")
+        self.embed = embed
+        self.hidden = hidden
+        self.fuse_every = fuse_every
+        d = embed.out_dim
+
+        # Draw order matches ModifiedMLP exactly, so seeds line up.
+        self.enc_uv = FusedLinear(d, 2 * hidden)
+        self.first = FusedLinear(d, hidden)
+        self.chunks = FusedMLP._chunk_sizes(depth - 1, fuse_every)
+        self.mid = nn.ParameterList(
+            [nn.Parameter(FusedMLP._init_blocks(c, hidden))
+             for c in self.chunks]
+        )
+        self.out = FusedLinear(hidden, out_features)
+        self.out_transform = out_transform
+
+    def forward(self, *coords: torch.Tensor) -> torch.Tensor:
+        z = self.embed(*coords)
+
+        uv = torch.tanh(self.enc_uv(z))
+        enc_a, enc_b = uv.chunk(2, dim=-1)
+        w = enc_a - enc_b  # computed once; gate becomes enc_b + h*w
+
+        h = torch.addcmul(enc_b, torch.tanh(self.first(z)), w)
+        for W, c in zip(self.mid, self.chunks):
+            for i in range(c):
+                blk = W[i * self.hidden:(i + 1) * self.hidden]
+                h = torch.tanh(F.linear(h, blk[:, :-1], blk[:, -1]))
+                h = torch.addcmul(enc_b, h, w)
+
+        out = self.out(h)
         if self.out_transform is not None:
             out = self.out_transform(out, *coords)
         return out

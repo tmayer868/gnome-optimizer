@@ -68,7 +68,11 @@ from experiments.common import (
     current_lr,
     pick_device,
 )
-from experiments.common import MLP as _SharedMLP, ConcatEmbed
+from experiments.common import (
+    MLP as _SharedMLP,
+    FusedMLP,
+    FusedModifiedMLP,
+)
 
 
 EXPERIMENT = "wave_pinn"
@@ -166,13 +170,34 @@ def _dirichlet_transform(out: torch.Tensor, t: torch.Tensor, x: torch.Tensor
 
 
 def build_model(arch: str, embed: nn.Module, hidden: int, depth: int,
-                hard_bc: bool) -> nn.Module:
-    """``(t, x) → u``, optionally with the hard ``sin(πx)`` Dirichlet BC."""
+                hard_bc: bool, fuse_every: int = 0) -> nn.Module:
+    """``(t, x) → u``, optionally with the hard ``sin(πx)`` Dirichlet BC.
+
+    ``fused`` and ``fused-modified`` are the same function classes as ``mlp``
+    (GELU trunk) and ``modified`` (gated, tanh) respectively, differing only
+    in how the weights are grouped into parameter tensors — which is what
+    Gnome preconditions over. ``--fuse-every 1`` is the control for both:
+    one tensor per layer, bit-identical initialization, one variable. The
+    fusable run differs: ``depth - 2`` layers for ``fused``, ``depth - 1``
+    for ``fused-modified``, whose first gated layer consumes the embedding
+    and so cannot share a tensor.
+    """
     if arch == "mlp":
         return MLP(embed, hidden, depth, hard_bc)
+    if arch == "fused":
+        return FusedMLP(
+            embed, hidden=hidden, depth=depth, fuse_every=fuse_every,
+            activation=nn.GELU,
+            out_transform=_dirichlet_transform if hard_bc else None,
+        )
     if arch == "modified":
         return ModifiedMLP(
             embed, hidden, depth,
+            out_transform=_dirichlet_transform if hard_bc else None,
+        )
+    if arch == "fused-modified":
+        return FusedModifiedMLP(
+            embed, hidden=hidden, depth=depth, fuse_every=fuse_every,
             out_transform=_dirichlet_transform if hard_bc else None,
         )
     raise ValueError(f"unknown arch: {arch}")
@@ -362,7 +387,17 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--optimizer", required=True,
                    choices=["gnome", "soap", "adamw"])
-    p.add_argument("--arch", choices=["mlp", "modified"], default="modified",
+    p.add_argument("--fuse-every", type=int, default=0,
+                   help="--arch fused only: consecutive hidden layers per "
+                        "parameter tensor. 1 = one tensor per layer, the "
+                        "control every larger value is compared against "
+                        "(identical function and initialization, only the "
+                        "grouping differs). 0 (default) fuses the whole "
+                        "stack. --depth 4 leaves only k=2 hidden layers to "
+                        "group, so raise --depth to give this room.")
+    p.add_argument("--arch",
+                   choices=["mlp", "modified", "fused", "fused-modified"],
+                   default="modified",
                    help="Network: plain tanh MLP or the gated modified MLP.")
     p.add_argument("--embed", choices=["none", "periodic", "fourier"],
                    default="fourier",
@@ -431,7 +466,8 @@ def train(args: argparse.Namespace) -> str:
     device = pick_device()
     embed = build_embedding(args.embed, args.fourier_dim, args.fourier_scale)
     model = build_model(
-        args.arch, embed, args.hidden, args.depth, args.hard_bc
+        args.arch, embed, args.hidden, args.depth, args.hard_bc,
+        args.fuse_every,
     ).to(device)
     opt, opt_cfg, scheduler = build_optimizer(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
@@ -451,6 +487,10 @@ def train(args: argparse.Namespace) -> str:
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
         "arch": args.arch,
+        # Realized chunk sizes, not the raw flag: 0 and any value >= depth-2
+        # both mean "one chunk", and the sweep needs those runs to compare
+        # equal. None for the archs that have no such grouping.
+        "fuse_every": getattr(model, "chunks", None),
         "embed": args.embed,
         "fourier_dim": args.fourier_dim if args.embed == "fourier" else None,
         "fourier_scale": args.fourier_scale if args.embed == "fourier" else None,

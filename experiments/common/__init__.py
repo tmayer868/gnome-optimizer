@@ -6,6 +6,7 @@ from experiments.common.modified_mlp import (
     ConcatEmbed,
     FusedLinear,
     FusedMLP,
+    FusedModifiedMLP,
     MLP,
     ModifiedMLP,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "diverged",
     "ConcatEmbed",
     "FusedMLP",
+    "FusedModifiedMLP",
     "MLP",
     "ModifiedMLP",
     "RunLogger",
