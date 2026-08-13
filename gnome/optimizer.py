@@ -128,6 +128,18 @@ def _rademacher_like(t: torch.Tensor) -> torch.Tensor:
     return (torch.rand_like(t) < 0.5).to(t.dtype).mul_(2.0).sub_(1.0)
 
 
+def _linalg_work_dtype(t: torch.Tensor) -> torch.dtype:
+    """Internal precision for preconditioner factors and decompositions.
+
+    Half and bfloat16 inputs are promoted to float32 because PyTorch's
+    decomposition support and numerical accuracy are poor at those dtypes.
+    Float64 is deliberately preserved: casting a double-precision run to
+    float32 here computes a low-precision eigenbasis and merely relabels it as
+    float64 when it is cast back, defeating the purpose of the double run.
+    """
+    return torch.float64 if t.dtype == torch.float64 else torch.float32
+
+
 def _eigh_safe(M: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """``torch.linalg.eigh`` with CPU routing for MPS and relative jitter.
 
@@ -135,7 +147,8 @@ def _eigh_safe(M: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     natively. A small relative jitter keeps rank-deficient factors
     numerically tractable.
     """
-    M_f = M.float()
+    work_dtype = _linalg_work_dtype(M)
+    M_f = M.to(dtype=work_dtype)
     n = M_f.shape[0]
     scale = M_f.diag().abs().mean().clamp(min=1.0)
     jitter = 1e-6 * scale
@@ -545,12 +558,18 @@ class Gnome(Optimizer):
         merge_dims: bool,
     ) -> None:
         state["GG"] = []
+        # Keep the factors in the same precision used by eigh/QR: float64 for
+        # a double run, otherwise float32 (including half/bfloat16 models).
+        factor_dtype = _linalg_work_dtype(grad)
         if grad.dim() == 1:
             if not precondition_1d or grad.shape[0] > max_precond_dim:
                 state["GG"].append([])
             else:
                 state["GG"].append(
-                    torch.zeros(grad.shape[0], grad.shape[0], device=grad.device)
+                    torch.zeros(
+                        grad.shape[0], grad.shape[0],
+                        device=grad.device, dtype=factor_dtype,
+                    )
                 )
         else:
             ref = self._merge_dims(grad, max_precond_dim) if merge_dims else grad
@@ -558,7 +577,9 @@ class Gnome(Optimizer):
                 if sh > max_precond_dim:
                     state["GG"].append([])
                 else:
-                    state["GG"].append(torch.zeros(sh, sh, device=grad.device))
+                    state["GG"].append(torch.zeros(
+                        sh, sh, device=grad.device, dtype=factor_dtype,
+                    ))
 
         state["Q"] = None
         state["precondition_frequency"] = precondition_frequency
@@ -579,9 +600,9 @@ class Gnome(Optimizer):
             grad = self._merge_dims(grad, max_precond_dim)
         for mat in state["Q"]:
             if len(mat) > 0:
-                # Q is stored in the eigen-decomposition's float32 working
-                # precision; align it to grad's dtype (a no-op for float32
-                # params, an upcast for float64) so the projection matches.
+                # Q is stored in the decomposition's working precision
+                # (float64 for double runs, otherwise float32). Align it to
+                # grad's dtype so the projection is accepted for half models.
                 grad = torch.tensordot(grad, mat.to(grad.dtype), dims=[[0], [0]])
             else:
                 permute_order = list(range(1, len(grad.shape))) + [0]
@@ -645,10 +666,9 @@ class Gnome(Optimizer):
         if G_s.dim() == 1:
             if precondition_1d and G_s.shape[0] <= max_precond_dim:
                 gg = state["GG"][0]
-                # GG is kept in float32 (the preconditioner's internal working
-                # precision, matching _eigh_safe); cast the contribution to its
-                # dtype so higher-precision (e.g. float64) grads accumulate. For
-                # float32 grads this .to() is a no-op and behaviour is unchanged.
+                # GG uses the preconditioner's working precision (float64 for
+                # double runs, otherwise float32, matching _eigh_safe). Cast
+                # the contribution to that dtype before accumulating it.
                 gg.lerp_(
                     (G_s.unsqueeze(1) @ G_s.unsqueeze(0)).to(gg.dtype),
                     1 - state["shampoo_beta"],
@@ -736,8 +756,9 @@ class Gnome(Optimizer):
             if len(m) == 0 or len(o) == 0:
                 new_Q.append([])
                 continue
-            m_f = m.data.float()
-            o_f = o.float()
+            work_dtype = _linalg_work_dtype(m)
+            m_f = m.data.to(dtype=work_dtype)
+            o_f = o.to(dtype=work_dtype)
 
             est_eig = torch.diag(o_f.T @ m_f @ o_f)
             sort_idx = torch.argsort(est_eig, descending=True)
