@@ -1,350 +1,594 @@
-# The Basis Argument
+# Why Gnome's Kronecker Basis Approximates the GGN
 
-*Companion to `kfac_gnome_convergence_targets.md`. That document compares estimands
-under Frobenius norm. This one asks the narrower question that Gnome's implementation
-actually poses: **which rotation?** Same setup — fixed weights, infinite averaging.*
+*A comparison with K-FAC at fixed weights and under infinite averaging. This is a
+statement about population targets and bases; finite-sample estimation is treated
+separately in §9.*
+
+Gnome and K-FAC both attach two small symmetric matrices to a weight tensor and use
+their eigenvectors as a Kronecker-structured rotation. It is tempting to compare the
+full Kronecker products implied by those factors. That comparison is useful, but it is
+not the question Gnome's implementation ultimately asks: Gnome discards the factor
+eigenvalues and re-estimates the curvature diagonal after rotating.
+
+The operative question is therefore:
+
+> **How much of the GGN remains off-diagonal in the basis selected by the factors?**
+
+This note derives Gnome's factors as partial traces of the GGN, compares their basis
+with K-FAC's, gives an exact recovery result for the separable-eigenbasis class, and
+states precisely what is and is not known in the approximate and finite-sample cases.
 
 ---
 
-## 1. Gnome's estimand is not $M_{\mathrm G}$
+## 1. The object Gnome actually approximates
 
-Let $Q = Q_R \otimes Q_L$ with $Q_L \in O(m)$, $Q_R \in O(n)$; the Kronecker product of
-orthogonal matrices is orthogonal, so $Q \in O(mn)$. Gnome's $\hat v$ estimates
-$\operatorname{diag}(Q^\top H Q)$, so the implied curvature model is
+For a layer with weight $W \in \mathbb{R}^{m \times n}$, let
+$P = mn$ and let $H \in \mathbb{R}^{P \times P}$ be its GGN block. Gradients
+reshaped like the weight are written $G \in \mathbb{R}^{m \times n}$, with
+$g = \operatorname{vec}(G)$ using column-major vectorization.
+
+Gnome constructs two orthogonal matrices $Q_L \in O(m)$ and $Q_R \in O(n)$ and
+uses the joint basis
 
 $$
-D_Q \;=\; Q \operatorname{diag}\!\left(Q^\top H Q\right) Q^\top .
+Q = Q_R \otimes Q_L \in O(P).
+$$
+
+Its curvature EMA in that basis estimates $\operatorname{diag}(Q^\top H Q)$.
+The implied curvature model is consequently
+
+$$
+D_Q
+= Q\,\operatorname{diag}\!\left(Q^\top H Q\right)Q^\top .
 \tag{1}
 $$
 
-For **fixed** $Q$, this is the exact Frobenius projection of $H$ onto matrices diagonal in
-that basis: $\lVert H - QDQ^\top\rVert_F = \lVert Q^\top H Q - D\rVert_F$ is minimised over
-diagonal $D$ by taking the diagonal. Hence the error is precisely the off-diagonal mass,
+For fixed $Q$, this is the exact Frobenius projection of $H$ onto the matrices
+diagonal in that basis. Indeed,
 
 $$
-\boxed{\;\lVert H - D_Q \rVert_F \;=\; \rho(Q)\,\lVert H \rVert_F,
-\qquad
-\rho(Q) \;\triangleq\; \frac{\lVert \operatorname{offdiag}(Q^\top H Q) \rVert_F}{\lVert H \rVert_F}\;}
+\min_{D\ \mathrm{diagonal}}
+\left\|H-QDQ^\top\right\|_F
+= \left\|\operatorname{offdiag}(Q^\top H Q)\right\|_F.
+$$
+
+Define the relative basis error
+
+$$
+\boxed{
+\rho(Q)
+\;\triangleq\;
+\frac{\left\|\operatorname{offdiag}(Q^\top H Q)\right\|_F}
+     {\left\|H\right\|_F}
+}
 \tag{2}
 $$
 
-**There is no eigenvalue approximation error in Gnome.** The eigenvalues are re-estimated
-from data in whatever basis is supplied. The entire approximation is $\rho(Q)$, and
-$\rho$ is invariant to the eigenvalues of $\hat A, \hat B$ — it is a function of the
-*basis alone*.
+so that $\|H-D_Q\|_F = \rho(Q)\|H\|_F$.
 
----
+This framing has two important consequences:
 
-## 2. Three nested assumptions
+1. **Gnome imposes a Kronecker structure on the eigenbasis, not on the
+   eigenvalues.** The $mn$ diagonal entries estimated after rotation are free; they
+   need not factor as $\lambda_i\mu_j$.
+2. **There is no inherited factor-eigenvalue error.** The eigenvalues of the two
+   factor matrices determine ordering during the basis refresh, but they are not used
+   as the curvature denominator. The approximation that survives into the optimizer
+   is the residual off-diagonal mass $\rho(Q)$.
 
-$$
-\underbrace{H = \mathbb{E}[aa^\top] \otimes \mathbb{E}[\delta\delta^\top]}_{\text{C1 — K-FAC exact}}
-\;\Longrightarrow\;
-\underbrace{\varepsilon^\star = 0}_{M_{\mathrm G} \text{ exact}}
-\;\Longrightarrow\;
-\underbrace{\rho^\star = 0}_{\text{Gnome exact}}
-$$
+This is the spine of the comparison below. Full Kronecker matrix approximations enter
+later as supporting motivation, not as Gnome's final curvature model.
 
-with $\rho^\star = \min_{Q_L, Q_R} \rho(Q_R \otimes Q_L)$. Both implications are **strict**:
+## 2. Gnome's factors are partial traces of the GGN
 
-* **C1 $\not\Leftarrow \varepsilon^\star = 0$.** Two equiprobable samples,
-  $a^{(1)} = \delta^{(1)} = e_1$, $a^{(2)} = e_2$, $\delta^{(2)} = 3e_1$. Then
-  $H = \operatorname{diag}(0.5, 4.5) \otimes \operatorname{diag}(1,0)$ is *exactly*
-  Kronecker, $M_{\mathrm G} = H$, and yet
-  $\lVert H - M_{\mathrm K}\rVert_F / \lVert H\rVert_F = 0.625$.
-  K-FAC's error is **estimator error, not model error** — it survives even when the
-  Kronecker model is perfectly correct.
-* **$\varepsilon^\star = 0 \not\Leftarrow \rho^\star = 0$.**
-  $H = \operatorname{diag}(1,5,5,1)$ is diagonal, hence trivially diagonal in
-  $I \otimes I$, so $\rho^\star = 0$. It is not a Kronecker product: $a_1b_1 = 1$,
-  $a_1b_2 = a_2b_1 = 5$, $a_2b_2 = 1$ forces $1 = a_1a_2b_1b_2 = 25$.
-  This is the Shampoo/SOAP gap — eigenvalues that do not factor as $\lambda_i \mu_k$.
-
-**Separable eigenbasis, stated concretely.** The columns of $Q_R \otimes Q_L$ are
-$q_R^{(k)} \otimes q_L^{(i)}$, which un-vec to $q_L^{(i)} (q_R^{(k)})^\top$. So the
-assumption is: *every eigenvector of the GGN, viewed as an $m \times n$ matrix, is rank
-one, and all $mn$ of them are built from a shared pool of $m + n$ vectors.* The $mn$
-eigenvalues remain free. Dimension of the separable subset of $O(mn)$ is
-$\binom{m}{2} + \binom{n}{2}$ against $\binom{mn}{2}$.
-
----
-
-## 3. The Frobenius error splits orthogonally
-
-$H - D_Q$ is purely off-diagonal in $Q$; $D_Q - M$ is purely diagonal. They are
-Frobenius-orthogonal, so for any $M$ diagonal in its own eigenbasis $Q$,
+Gnome's surrogate gradient is constructed so that
 
 $$
-\underbrace{\lVert H - M \rVert_F^2}_{\text{estimand error}}
-\;=\;
-\underbrace{\rho(Q)^2 \lVert H \rVert_F^2}_{\text{basis error}}
-\;+\;
-\underbrace{\lVert \operatorname{diag}(Q^\top H Q) - \operatorname{diag}(Q^\top M Q) \rVert_F^2}_{\text{eigenvalue error}} .
+\mathbb{E}[g_s g_s^\top] = H.
 \tag{3}
 $$
 
-Two consequences.
-
-1. **The Frobenius numbers in the companion document are upper bounds** on what the
-   optimizers actually incur: $\lVert H - D_{Q}\rVert_F \le \lVert H - M \rVert_F$ for
-   both methods, since $D_Q$ is the best matrix diagonal in $Q$ and $M$ is one such.
-2. **Only the first term survives into Gnome.** The second is discarded and re-estimated
-   by $\hat v$. Reporting the split is therefore more informative than reporting the total.
-
----
-
-## 4. Basis recovery: the partial traces are marginals of the eigenvalues
-
-Suppose $H = (Q_R \otimes Q_L)\operatorname{diag}(\Lambda)(Q_R \otimes Q_L)^\top$ exactly,
-with $\Lambda_{ik}$ **arbitrary** (not factorising). Then
+Reshape $g_s$ into $G_s \in \mathbb{R}^{m \times n}$. Under infinite averaging,
+the two factor EMAs converge to
 
 $$
-\hat A_{cc'} = \sum_r H_{(r,c),(r,c')}
-= \sum_{i,k} \Lambda_{ik} (Q_R)_{ci}(Q_R)_{c'i} \underbrace{\sum_r (Q_L)_{rk}^2}_{=1},
-$$
-
-so
-
-$$
-\boxed{\;\hat A = Q_R \operatorname{diag}(r) Q_R^\top,
+\hat A = \mathbb{E}[G_s^\top G_s] \in \mathbb{R}^{n \times n},
 \qquad
-\hat B = Q_L \operatorname{diag}(c) Q_L^\top,
-\qquad
-r_i = \sum_k \Lambda_{ik},\;\; c_k = \sum_i \Lambda_{ik}\;}
+\hat B = \mathbb{E}[G_s G_s^\top] \in \mathbb{R}^{m \times m}.
 \tag{4}
 $$
 
-> **Proposition.** $\rho^\star = 0 \Longrightarrow Q_{\mathrm G} = Q_R \otimes Q_L$
-> exactly (up to column permutation and sign), provided the marginals $r_i$ and $c_k$ are
-> non-degenerate.
-
-Gnome is consistent on the entire separable-eigenbasis class — strictly larger than the
-Kronecker class on which $M_{\mathrm G}$ is consistent, which is in turn strictly larger
-than the class C1 on which $M_{\mathrm K}$ is consistent. Degeneracy is the only failure
-mode: repeated marginals leave $Q_R$ underdetermined by $\hat A$, and nothing then forces
-the within-eigenspace rotation to diagonalise $H$.
-
----
-
-## 5. Why the partial traces, when the assumption only holds approximately
-
-Write $\alpha = Q_R^\top a$, $d = Q_L^\top \delta$. The diagonal of the rotated curvature
-is the nonnegative **energy matrix**
+These are exactly the two partial traces of $H$. In indexed form,
 
 $$
-C_{ik} = \mathbb{E}\!\left[\alpha_i^2 d_k^2\right] \ge 0,
+\hat A_{cc'} = \sum_{r=1}^{m} H_{(r,c),(r,c')},
 \qquad
-\sum_{ik} C_{ik} = \mathbb{E}\!\left[\lVert a\rVert^2 \lVert\delta\rVert^2\right] = \operatorname{tr}(H),
-$$
-
-the total being basis-independent. So minimising $\rho$ is exactly **maximising
-$\lVert C \rVert_F^2$** — concentrating curvature energy into as few coordinate pairs as
-possible. The marginals of $C$ are
-
-$$
-\sum_k C_{ik} = \big(Q_R^\top \hat A\, Q_R\big)_{ii},
-\qquad
-\sum_i C_{ik} = \big(Q_L^\top \hat B\, Q_L\big)_{kk}.
+\hat B_{rr'} = \sum_{c=1}^{n} H_{(r,c),(r',c)}.
 \tag{5}
 $$
 
-Since $0 \le C_{ik} \le r_i$,
+They share the trace
 
 $$
-\lVert C \rVert_F^2 = \sum_{ik} C_{ik}^2 \;\le\; \sum_{ik} C_{ik} r_i \;=\; \lVert r \rVert_2^2
-= \big\lVert \operatorname{diag}(Q_R^\top \hat A Q_R) \big\rVert_2^2 ,
+\operatorname{tr}(\hat A)
+= \operatorname{tr}(\hat B)
+= \operatorname{tr}(H).
 \tag{6}
 $$
 
-tight iff each row of $C$ has a single nonzero — i.e. tight in the concentrated regime we
-are aiming for. By Schur–Horn (the diagonal of $Q^\top M Q$ is majorised by the
-eigenvalues of $M$; $\sum x_i^2$ is Schur-convex), the right side of $(6)$ is maximised
-over $O(n)$ at the **eigenbasis of $\hat A$**.
+Gnome takes $Q_R$ to be an eigenbasis of $\hat A$ and $Q_L$ an eigenbasis of
+$\hat B$. Equations (3)--(5) are general: they do not require a rank-one
+per-sample gradient or a layer-specific curvature derivation. This matters for weight
+sharing and for PINN residuals, where a parameter-gradient matrix can be a sum of
+several outer products.
 
-> Gnome's basis is the exact maximiser of the tightest marginal upper bound on the true
-> objective. K-FAC's basis maximises concentration of $\mathbb{E}[\alpha_i^2]$, the
-> diagonal of $A_{\mathrm K}$, which is not a marginal of $C$ and bounds nothing.
+## 3. Comparison with K-FAC on an ordinary dense layer
 
-This reaches the same object as the one-step-power-iteration argument by a route that
-never invokes Van Loan–Pitsianis, and it is the argument matching what the code does.
-Note that the $\operatorname{tr}(H)$ normalisation in eq. (3) of the companion document is
-irrelevant here: eigenvectors do not see scale.
+For a dense layer with input activation $a \in \mathbb{R}^n$ and a target-matched
+backpropagated curvature probe $\delta \in \mathbb{R}^m$, the per-sample gradient is
 
----
+$$
+G = \delta a^\top,
+\qquad
+g = \operatorname{vec}(G) = a \otimes \delta.
+$$
 
-## 6. Scalar coupling is not enough — the coupling must be directional
+The exact layerwise curvature is therefore
 
-The two arguments require different premises, and conflating them is the main trap.
+$$
+\boxed{
+H
+= \mathbb{E}[g g^\top]
+= \mathbb{E}\!\left[(aa^\top)\otimes(\delta\delta^\top)\right].
+}
+\tag{7}
+$$
 
-| coupling | breaks | separates in Frobenius | separates the basis |
-|---|---|---|---|
-| $\lVert\delta\rVert^2$ depends on $\lVert a \rVert$ | C2 | yes | **no** |
-| $\lVert\delta\rVert^2$ depends on $\langle a, u\rangle$ | C2 | yes | yes |
+The expectation in (7) is over data and whatever output-space randomness is needed
+to make the covariance equal the Fisher/GGN. This idealized population comparison
+should not be confused with the empirical Fisher obtained from real-label loss
+gradients; that distinction is revisited in §8.
 
-For elliptically symmetric $a$, scalar coupling leaves the bases identical: in $\Sigma$'s
-eigenbasis, flipping the sign of $a_i$ alone flips $a_i a_j$ while leaving $\lVert a\rVert$
-fixed, so $\mathbb{E}[f(\lVert a\rVert) a_i a_j] = 0$ and $\hat A$ stays diagonal there.
-The §5 example of the companion document is of this type — every matrix in it is diagonal,
-so $\rho = 0$ for **both** methods and the example is silent on the question at hand.
+K-FAC moves the expectation through the Kronecker product:
 
-The load-bearing empirical premise is therefore narrower than "coupling exists":
-**curvature magnitude must be anisotropic in activation space.** Hard examples, tail
-classes, or collocation points near a shock occupying a particular subspace of the hidden
-representation. Note also that $Q_{\mathrm G} = Q_{\mathrm K}$ requires only
-$[\hat A, A_{\mathrm K}] = 0$ — commuting, strictly weaker than C2's
-$\hat A \propto A_{\mathrm K}$ — so the methods agree *more often* at the basis level than
-at the estimand level, and the separation is correspondingly harder to demonstrate.
+$$
+A_K = \mathbb{E}[aa^\top],
+\qquad
+B_K = \mathbb{E}[\delta\delta^\top],
+\qquad
+M_K = A_K \otimes B_K.
+\tag{8}
+$$
 
----
+By contrast, substituting $G=\delta a^\top$ into Gnome's partial traces gives
 
-## 7. Numbers
+$$
+\boxed{
+\hat A = \mathbb{E}[\|\delta\|^2 aa^\top],
+\qquad
+\hat B = \mathbb{E}[\|a\|^2\delta\delta^\top].
+}
+\tag{9}
+$$
 
-**(a) Directional coupling, $n=6$, $m=5$, $N = 2 \times 10^5$.**
+Thus:
 
-| | $\varepsilon^\star/\lVert H\rVert$ | $\frac{\lVert H - M_{\mathrm G}\rVert}{\lVert H\rVert}$ | $\frac{\lVert H - M_{\mathrm K}\rVert}{\lVert H\rVert}$ | $\rho(I)$ | $\rho(Q_{\mathrm G})$ | $\rho(Q_{\mathrm K})$ |
-|---|---|---|---|---|---|---|
-| coupled | 0.0143 | 0.0148 | 0.3193 | 0.2492 | **0.0144** | **0.2497** |
-| decoupled (control) | 0.0087 | 0.0091 | 0.0106 | 0.0101 | 0.0085 | 0.0089 |
+> **Gnome's factors are K-FAC's second moments, each reweighted by the squared
+> norm of the signal on the other side of the layer.**
 
-* $\rho(Q_{\mathrm K}) = 0.2497 \approx \rho(I) = 0.2492$: **K-FAC's rotation buys nothing
-  over not rotating at all.** Against a diagonal-GGN baseline it is a no-op; Gnome's cuts
-  off-diagonal mass $17\times$.
-* $\rho(Q_{\mathrm G}) = 0.0144 \approx \varepsilon^\star/\lVert H\rVert = 0.0143$: the
-  one-step estimator is at the achievable floor, so $\rho^\star \le 0.0144$.
-* Per-eigenvector angles $Q_{\mathrm G}$ vs $Q_{\mathrm K}$: $[24°, 73°, 72°, 7°, 13°, 4°]$
-  coupled; all $< 0.5°$ decoupled. (Compare columns pairwise — principal angles between
-  the full subspaces are identically zero, both being complete bases.)
+The reweighting is not an added heuristic. It follows mechanically from taking the
+partial traces of the target matrix $H$. A direction of activation space receives more
+weight when it occurs on examples carrying more output-side curvature, and vice versa.
 
-Applying the split $(3)$: K-FAC's $0.319$ is $62\%$ basis and $38\%$ eigenvalue by squared
-mass ($\rho = 0.2497$, eigenvalue $= 0.1989$). Gnome's $0.0148$ is $0.0144$ basis against
-$0.0034$ eigenvalue. Only the basis column survives into either optimizer.
+## 4. When K-FAC and Gnome agree
 
-**(b) The middle tier is non-empty.** Constructing $H$ with random orthogonal
-$Q_L, Q_R$ and deliberately non-factorising $\Lambda$:
+Several conditions are useful here, and they should not be conflated.
 
-| quantity | value |
+### 4.1 Second-moment independence: K-FAC is exact
+
+If
+
+$$
+\mathbb{E}\!\left[(aa^\top)\otimes(\delta\delta^\top)\right]
+= \mathbb{E}[aa^\top]\otimes\mathbb{E}[\delta\delta^\top],
+\tag{C1}
+$$
+
+then $H=M_K$ exactly. The norm weights in (9) also factor, so
+
+$$
+\hat A = \mathbb{E}[\|\delta\|^2]A_K,
+\qquad
+\hat B = \mathbb{E}[\|a\|^2]B_K.
+$$
+
+K-FAC and Gnome therefore select the same basis, and both diagonalize $H$ exactly.
+
+### 4.2 Norm decoupling: the factors are proportional
+
+The methods can agree without (C1). It is enough that
+
+$$
+\mathbb{E}[\|\delta\|^2aa^\top]
+= \mathbb{E}[\|\delta\|^2]\,\mathbb{E}[aa^\top],
+$$
+
+$$
+\mathbb{E}[\|a\|^2\delta\delta^\top]
+= \mathbb{E}[\|a\|^2]\,\mathbb{E}[\delta\delta^\top].
+\tag{C2}
+$$
+
+Under (C2), $\hat A \propto A_K$ and $\hat B \propto B_K$, so the bases are
+identical even though $H$ need not be a Kronecker product and neither method need be
+exact.
+
+### 4.3 Commuting factors: only the bases agree
+
+Gnome requires still less. Two real symmetric matrices share an eigenbasis when they
+commute, so
+
+$$
+[\hat A,A_K]=0,
+\qquad
+[\hat B,B_K]=0
+\tag{C3}
+$$
+
+is enough for the two pairs of factors to **admit** a common eigenbasis. With
+nondegenerate spectra this gives $Q_G=Q_K$ up to permutation and sign. Under
+degeneracy, independently run eigensolvers can choose incompatible rotations inside a
+shared eigenspace, so equality of the implemented bases requires compatible resolution
+of those degeneracies. The factor eigenvalues may otherwise differ arbitrarily.
+
+The hierarchy relevant to equality of the two bases is therefore
+
+$$
+\text{(C1)} \Longrightarrow \text{(C2)} \Longrightarrow \text{(C3)},
+$$
+
+with neither converse holding in general. This explains why showing a difference
+between two full Kronecker approximants does not, by itself, show a difference between
+the rotations used by the optimizers.
+
+## 5. Exact basis recovery beyond the Kronecker class
+
+Suppose the GGN has an exactly separable eigenbasis,
+
+$$
+H
+= (Q_R\otimes Q_L)\operatorname{diag}(\Lambda)
+  (Q_R\otimes Q_L)^\top,
+\tag{10}
+$$
+
+where $\Lambda \in \mathbb{R}_+^{n\times m}$ contains **arbitrary** eigenvalues.
+They need not factor as $\Lambda_{ik}=r_i c_k$, so $H$ need not itself be a
+Kronecker product.
+
+Taking the partial traces of (10) gives
+
+$$
+\boxed{
+\hat A = Q_R\operatorname{diag}(r)Q_R^\top,
+\qquad
+\hat B = Q_L\operatorname{diag}(c)Q_L^\top,
+}
+\tag{11}
+$$
+
+with the marginal eigenvalues
+
+$$
+r_i = \sum_k \Lambda_{ik},
+\qquad
+c_k = \sum_i \Lambda_{ik}.
+\tag{12}
+$$
+
+Hence:
+
+> **Proposition.** If $H$ has a separable eigenbasis and the row and column
+> marginals in (12) are nondegenerate, Gnome's partial traces recover that basis
+> exactly, up to column permutation and sign.
+
+The nondegeneracy condition is necessary for the partial traces alone to identify the
+basis uniquely. Repeated marginals leave the corresponding factor eigenspace
+underdetermined; recovery can still occur, but an arbitrary rotation inside that
+eigenspace need not diagonalize $H$.
+
+This yields three strictly nested model classes:
+
+$$
+\underbrace{H=A_K\otimes B_K}_{\text{K-FAC exact under (C1)}}
+\quad\subsetneq\quad
+\underbrace{H=A\otimes B}_{\text{some Kronecker product}}
+\quad\subsetneq\quad
+\underbrace{H\text{ has a separable eigenbasis}}_{\rho^\star=0},
+\tag{13}
+$$
+
+where
+
+$$
+\rho^\star
+= \min_{Q_R\in O(n),\,Q_L\in O(m)}
+\rho(Q_R\otimes Q_L).
+$$
+
+Gnome is basis-consistent on the largest class in (13). This is the
+Shampoo/SOAP gap in its cleanest form: a Kronecker-structured basis does not require
+Kronecker-factorized eigenvalues.
+
+Concretely, the eigenvectors $q_R^{(i)}\otimes q_L^{(k)}$ un-vectorize into
+rank-one matrices $q_L^{(k)}(q_R^{(i)})^\top$. The assumption is that all $mn$
+eigenvectors of the layerwise GGN can be built from one shared pool of $m+n$ vectors.
+This is still restrictive, but it is strictly weaker than assuming the whole GGN is one
+Kronecker product.
+
+## 6. Why use the partial-trace basis when separability is approximate?
+
+For candidate bases $Q_R,Q_L$, write
+
+$$
+\alpha = Q_R^\top a,
+\qquad
+d = Q_L^\top\delta.
+$$
+
+The diagonal of the rotated curvature is the nonnegative energy matrix
+
+$$
+C_{ik}=\mathbb{E}[\alpha_i^2d_k^2]\ge 0,
+\qquad
+\sum_{ik}C_{ik}=\operatorname{tr}(H).
+\tag{14}
+$$
+
+Because the Frobenius norm is rotation-invariant,
+
+$$
+\rho(Q_R\otimes Q_L)^2
+= 1-\frac{\|C\|_F^2}{\|H\|_F^2}.
+\tag{15}
+$$
+
+Minimizing basis error is therefore equivalent to concentrating as much curvature
+energy as possible into the diagonal coordinate pairs.
+
+The row and column marginals of $C$ are
+
+$$
+\sum_k C_{ik} = (Q_R^\top\hat A Q_R)_{ii},
+\qquad
+\sum_i C_{ik} = (Q_L^\top\hat B Q_L)_{kk}.
+\tag{16}
+$$
+
+Since $0\le C_{ik}\le r_i$ for $r_i=\sum_kC_{ik}$,
+
+$$
+\|C\|_F^2
+\le \sum_i r_i^2
+= \left\|\operatorname{diag}(Q_R^\top\hat A Q_R)\right\|_2^2,
+\tag{17}
+$$
+
+and analogously for $\hat B$. By Schur--Horn, the right side is maximized when
+$Q_R$ is an eigenbasis of $\hat A$; likewise for $Q_L$ and $\hat B$.
+
+Thus Gnome's basis exactly maximizes the natural marginal upper bounds on the true
+diagonal-energy objective. These bounds become tight when the energy matrix is
+concentrated, which is precisely the regime the rotation is meant to discover.
+
+This is a principled surrogate objective, not a proof that the two independently chosen
+factor eigenbases globally minimize $\rho$. The latter is a coupled non-convex problem,
+and the gap should be measured rather than hidden.
+
+### 6.1 Supporting view: one Kronecker power-iteration step
+
+Van Loan--Pitsianis rearrangement converts
+
+$$
+\min_{A,B}\|H-A\otimes B\|_F
+$$
+
+into a best rank-one approximation of a rearrangement of $H$. The corresponding power
+iteration, initialized at the identity and run for one step, yields the partial traces
+in (4), up to the common trace normalization. This supplies a second reason that the
+partial traces are natural: they are the first iterate toward the best full Kronecker
+approximation.
+
+That result should not be overstated. One step is not guaranteed to be close to the
+optimum for every architecture, and the best full Kronecker approximation is not the
+object Gnome ultimately inverts. The direct basis argument above is the one matching
+the code.
+
+## 7. Full Kronecker approximants: useful but secondary
+
+For comparison at a common trace, define
+
+$$
+M_G = \frac{\hat A\otimes\hat B}{\operatorname{tr}(H)},
+\qquad
+M_K = \frac{\operatorname{tr}(H)}
+{\operatorname{tr}(A_K)\operatorname{tr}(B_K)}
+(A_K\otimes B_K).
+\tag{18}
+$$
+
+Equation (9) shows that $M_G$ reweights each side of K-FAC by the norm of the
+other. Under (C1), $M_G=M_K=H$. Under (C2), $M_G=M_K$ even when neither is exact.
+When directional curvature and activation geometry are coupled, the two generally
+differ.
+
+These full-matrix errors split orthogonally. If $M$ is diagonal in basis $Q$, then
+
+$$
+\|H-M\|_F^2
+= \underbrace{\|\operatorname{offdiag}(Q^\top H Q)\|_F^2}_{\text{basis error}}
++ \underbrace{\left\|\operatorname{diag}(Q^\top H Q)
+ -\operatorname{diag}(Q^\top M Q)\right\|_2^2}_{\text{eigenvalue error}}.
+\tag{19}
+$$
+
+Gnome keeps the first term and re-estimates away the second. Consequently,
+
+$$
+\|H-D_Q\|_F \le \|H-M\|_F,
+$$
+
+and a comparison of $\|H-M_G\|_F$ with $\|H-M_K\|_F$ is only an upper-bound
+comparison for the actual diagonal-in-basis optimizers.
+
+This also explains why a Frobenius-optimal Kronecker approximation is not necessarily a
+better preconditioner. It can achieve lower matrix error by setting weak directions to
+zero, producing a singular inverse. Gnome's freely re-estimated diagonal, damping, and
+trust region make the relevant question the quality and conditioning of $D_Q$, not only
+the fit of $M_G$.
+
+## 8. Directional coupling is what separates the bases
+
+The norm reweighting in (9) changes the basis only when curvature magnitude is coupled
+to **direction** in activation or error space. Scalar coupling is insufficient.
+
+For elliptically symmetric $a$, a multiplier depending only on $\|a\|$ changes the
+eigenvalues of $\mathbb{E}[aa^\top]$ but not its eigenvectors: sign symmetry keeps the
+off-diagonal entries zero in the same basis. Thus a construction in which
+$\|\delta\|^2$ merely grows with $\|a\|$ can make $M_G$ and $M_K$ differ while
+leaving $Q_G=Q_K$ and $\rho(Q_G)=\rho(Q_K)$.
+
+A basis separation requires anisotropic coupling, for example
+$\|\delta\|^2$ growing with $|\langle a,u\rangle|$ for a particular direction $u$.
+This is plausible when hard examples, rare classes, boundaries, or shocks occupy a
+particular subspace of a hidden representation. It is an empirical premise, not a
+universal property of neural networks.
+
+In a synthetic directional-coupling example with $n=6$, $m=5$, and
+$N=2\times10^5$, the population diagnostics are:
+
+| setting | $\rho(I)$ | $\rho(Q_G)$ | $\rho(Q_K)$ |
+|---|---:|---:|---:|
+| directionally coupled | 0.2492 | **0.0144** | 0.2497 |
+| decoupled control | 0.0101 | 0.0085 | 0.0089 |
+
+In the coupled case K-FAC's rotation buys essentially nothing over the identity, while
+the partial-trace basis reduces off-diagonal mass by about $17\times$. In the control,
+both methods agree to Monte Carlo noise. The example establishes that the separation
+can occur; it does not establish its prevalence in real networks.
+
+## 9. Population targets are not finite-sample performance
+
+Everything above fixes the weights and takes infinite averaging. It establishes what
+the factors target, not which target is estimated more accurately at a fixed compute
+budget.
+
+Gnome's factors are built from randomized GGN probes. K-FAC's activation and error
+moments can often be collected directly during a forward/backward pass. Therefore:
+
+- Gnome can have the better population basis and the noisier finite-sample estimate.
+- Eigenvector perturbation scales like estimation noise divided by the eigengap, so
+  nearly degenerate factor spectra are particularly sensitive.
+- EMA length, auxiliary batch size, basis-refresh frequency, and basis staleness can
+  reverse the population ordering at finite compute.
+- The variance analysis in `variance.md` applies to Gnome's rank-one GGN estimates;
+  it should not be read as a completed finite-sample comparison with K-FAC.
+
+There are also two scope limits:
+
+1. The dense-layer formulas (7)--(9) assume $G=\delta a^\top$. Gnome's
+   partial-trace construction (3)--(5) remains valid under weight sharing and PINN
+   differential operators, but the simple K-FAC comparison then needs the corresponding
+   weight-sharing treatment.
+2. A target-matched K-FAC Fisher uses output-space sampling or an analytic expectation.
+   Practical K-FAC and SOAP variants sometimes use real-label loss gradients instead,
+   producing an empirical-Fisher target. That is a separate target mismatch, not a
+   Kronecker-factorization error.
+
+## 10. Relationship to SOAP
+
+The partial-trace argument applies to the covariance supplied to the factor updates.
+Gnome supplies $H$ because its zero-mean surrogate satisfies (3). SOAP instead forms
+outer products from observed minibatch loss gradients. If $g$ is a per-example
+real-label gradient, $\mu=\mathbb{E}[g]$, and $\bar g$ averages a batch of size $B$,
+then
+
+$$
+\mathbb{E}[\bar g\bar g^\top]
+= \frac{1}{B}\mathbb{E}[gg^\top]
++ \frac{B-1}{B}\mu\mu^\top.
+\tag{20}
+$$
+
+The first term is a scaled empirical-Fisher moment and the second is a rank-one
+mean-gradient term that dominates as $B$ grows. Neither is generally the GGN. Even if
+SOAP's partial traces were estimated without noise, they would therefore be the partial
+traces of a different target matrix.
+
+This cleanly separates two possible advantages:
+
+1. **Target advantage:** GGN rather than empirical Fisher, likely the dominant effect on
+   MSE and PINN objectives.
+2. **Basis advantage over conventional K-FAC:** partial traces retain directional
+   coupling through the opposite-side norm weights in (9).
+
+If real-network measurements find $Q_G\approx Q_K$, the second advantage is small; that
+does not weaken the first.
+
+## 11. What to measure
+
+On a layer small enough to form $H$ explicitly, report
+
+$$
+\rho(I),
+\qquad
+\rho(Q_K),
+\qquad
+\rho(Q_G),
+\qquad
+\rho(Q_{\mathrm{SOAP}}),
+\qquad
+\rho^\star\ \text{when numerically feasible}.
+$$
+
+These answer different questions:
+
+- $\rho(I)-\rho(Q_G)$: what the rotated-basis machinery buys over a diagonal GGN.
+- $\rho(Q_K)-\rho(Q_G)$: what the partial-trace weighting buys over K-FAC's basis.
+- $\rho(Q_{\mathrm{SOAP}})-\rho(Q_G)$: what changing the covariance target buys over
+  the empirical-Fisher basis.
+- $\rho(Q_G)-\rho^\star$: the remaining gap to the best separable basis.
+
+Frobenius off-diagonal mass is not the whole optimizer story: it underweights errors in
+small-eigenvalue directions. Also report
+
+$$
+\kappa\!\left(D_Q^{-1/2}HD_Q^{-1/2}\right)
+$$
+
+with the same damping convention used by the optimizer. Finally, compare fresh and stale
+bases, such as $\rho(Q_t)$ against $\rho(Q_{t-100})$, to justify the refresh interval
+independently of the population construction.
+
+## 12. Claims, in order of strength
+
+| claim | status |
 |---|---|
-| $\varepsilon^\star / \lVert H\rVert_F$ | $0.387$ — badly non-Kronecker |
-| $\rho(Q_R \otimes Q_L)$, true basis | $5.6 \times 10^{-16}$ |
-| $\rho(Q_{\mathrm G})$, from partial traces | $1.7 \times 10^{-15}$ |
-| eigenvalues of $\hat A$ | exactly the marginals $\{\sum_k \Lambda_{ik}\}$ |
-| $\lvert\cos(q_{\mathrm G}^{(i)}, q_R^{(\pi(i))})\rvert$ | all $1.000$ |
+| Gnome's factor targets are the partial traces of the GGN | exact from (3)--(5) |
+| K-FAC and Gnome coincide under second-moment independence | exact |
+| Gnome recovers a nondegenerate separable GGN eigenbasis | exact |
+| The partial-trace basis maximizes marginal energy bounds | exact |
+| It globally minimizes off-diagonal mass among separable bases | **not established** |
+| One Kronecker power step is near the best full Kronecker fit | empirical, architecture-dependent |
+| Gnome's finite-sample basis is better than K-FAC's | empirical question |
+| Directional activation--curvature coupling is substantial in PINNs or LLMs | empirical question |
 
-Shampoo is $39\%$ wrong here; Gnome is exact. Recovery is up to a **permutation** $\pi$
-— `eigh` orders by marginal, which is unrelated to any construction order. This is the
-bookkeeping at method.md line 320. A unit test asserting $\rho$ is unchanged across an
-eigenbasis refresh catches the whole class of ordering bugs with one scalar.
+The defensible summary is:
 
----
-
-## 8. Graceful degradation
-
-Because $\hat v$ is re-estimated in whatever basis is supplied, a poor $Q$ costs accuracy
-but not correctness: $D_Q$ remains PSD, remains the optimal diagonal model in that basis,
-and at $Q = I$ degrades exactly to a diagonal-GGN optimizer. There is no basis for which
-the preconditioner becomes singular or the eigenvalues become wrong.
-
-Contrast Shampoo/K-FAC, where a poor Kronecker fit corrupts the eigenvalues too. In §5 of
-the companion document the Van Loan–Pitsianis optimum is
-$\operatorname{diag}(0,0,0,4.5)$ — Frobenius-optimal, rank-deficient, and uninvertible,
-while the one-step $M_{\mathrm G} = \operatorname{diag}(0.05,0.45,0.45,4.05)$ is worse by
-$0.9$ against $0.5$ and strictly better to invert. **Frobenius optimality on $H$ is not
-optimality for $H^{-1}$-like operators**, and the shrinkage-toward-identity implicit in one
-power step is a feature, not a shortfall to apologise for.
-
----
-
-## 9. What this does not establish
-
-1. **Nothing about finite samples.** $Q_{\mathrm K}$ comes from second moments already
-   computed in the forward/backward pass; $Q_{\mathrm G}$ from a $K$-probe Hutchinson
-   estimate with genuine Monte Carlo variance. Eigenvector perturbation scales as noise
-   divided by the *eigenvalue gap*, so near-degenerate spectra — common in wide layers —
-   are where a variance disadvantage bites hardest, independently of any bias analysis.
-   The ordering can reverse at fixed budget.
-2. **$\rho$ is still Frobenius-flavoured.** It weights by absolute magnitude and
-   under-reports damage in the small-eigenvalue directions that govern step size. Report
-   $\kappa\big(D_Q^{-1/2} H D_Q^{-1/2}\big)$ alongside it; a basis can lower off-diagonal
-   mass while worsening conditioning.
-3. **Nothing about which layers.** The assumption "every GGN eigenvector is rank one in
-   parameter shape" is most plausible in small dense MLP layers without normalisation
-   (the PINN benchmarks) and least plausible where residual connections or normalisation
-   make the effective map from $W$ depend on $W$ in ways that do not factor through a
-   single activation direction. Attention projections are the natural stress test.
-
-**Measurement ladder** on a layer small enough to form $H$ explicitly
-($m, n \lesssim 64$): $\rho(I) \ge \rho(Q_{\mathrm K}) \ge \rho(Q_{\mathrm G}) \ge \rho^\star \ge 0$
-across training. The gap $\rho(I) - \rho(Q_{\mathrm G})$ is what the SOAP machinery buys;
-$\rho(Q_{\mathrm K}) - \rho(Q_{\mathrm G})$ is what the partial-trace construction buys over
-K-FAC. Add basis staleness, $\rho(Q_{t-100})$ vs $\rho(Q_t)$, to justify the refresh
-interval independently.
-
-If $\rho(Q_{\mathrm G}) \approx \rho(Q_{\mathrm K})$ in real networks, the honest reading is
-that Gnome's advantage comes from the GGN surrogate replacing empirical Fisher rather than
-from the partial-trace construction. That would not undercut the method — the EF$\to$GGN
-change is plausibly the larger effect on MSE and PINN objectives — but it determines which
-section is load-bearing.
-
----
-
-## 10. Reproduction
-
-```python
-import numpy as np
-rng = np.random.default_rng(0); n, m, N = 6, 5, 200_000
-
-def diagnostics(coupled):
-    rng = np.random.default_rng(0)
-    u = rng.standard_normal(n); u /= np.linalg.norm(u)
-    a = rng.standard_normal((N, n)) @ np.diag([1.5, 1., .9, .8, .6, .4])
-    d = rng.standard_normal((N, m)) @ np.diag([1.3, 1., .9, .7, .5])
-    if coupled:
-        d *= (1.0 + 3.0 * np.abs(a @ u))[:, None]        # DIRECTIONAL coupling
-    g = (a[:, :, None] * d[:, None, :]).reshape(N, -1)   # vec(G), G = d a^T
-    H = g.T @ g / N; nH = np.linalg.norm(H, 'fro'); trH = np.trace(H)
-    G = g.reshape(N, n, m)
-
-    A_K, S_K = a.T @ a / N, d.T @ d / N
-    A_h = np.einsum('nij,nkj->ik', G, G) / N             # E[||delta||^2 a a^T]
-    B_h = np.einsum('nji,njk->ik', G, G) / N             # E[||a||^2 delta delta^T]
-    M_K = np.kron(A_K, S_K); M_K *= trH / np.trace(M_K)
-    M_G = np.kron(A_h, B_h) / trH
-
-    R = H.reshape(n, m, n, m).transpose(0, 2, 1, 3).reshape(n*n, m*m)
-    eps = np.sqrt((np.linalg.svd(R, compute_uv=False)[1:] ** 2).sum())
-    eb = lambda M: np.linalg.eigh(M)[1][:, ::-1]
-
-    def split(QR, QL, M):
-        W = np.kron(QR, QL); Ht, Mt = W.T @ H @ W, W.T @ M @ W
-        off = np.linalg.norm(Ht - np.diag(np.diag(Ht)), 'fro')
-        dia = np.linalg.norm(np.diag(Ht) - np.diag(Mt))
-        return off / nH, dia / nH, np.linalg.norm(H - M, 'fro') / nH
-
-    print(f"{'coupled' if coupled else 'control'}  eps*={eps/nH:.4f}  "
-          f"rho(I)={split(np.eye(n), np.eye(m), H)[0]:.4f}")
-    for nm_, QR, QL, M in [('KFAC ', eb(A_K), eb(S_K), M_K),
-                           ('Gnome', eb(A_h), eb(B_h), M_G)]:
-        r, e, t = split(QR, QL, M)
-        print(f"   {nm_}  rho={r:.4f}  eigval={e:.4f}  total={t:.4f}"
-              f"  (check {np.hypot(r, e):.4f})")
-
-diagnostics(True); diagnostics(False)
-
-# --- middle tier: separable eigenbasis, non-factorising eigenvalues ---
-rng = np.random.default_rng(7)
-QR = np.linalg.qr(rng.standard_normal((n, n)))[0]
-QL = np.linalg.qr(rng.standard_normal((m, m)))[0]
-Lam = rng.uniform(0.5, 8.0, size=(n, m))
-H = np.kron(QR, QL) @ np.diag(Lam.reshape(-1)) @ np.kron(QR, QL).T
-T = H.reshape(n, m, n, m); nH = np.linalg.norm(H, 'fro')
-A_h, B_h = np.einsum('irjr->ij', T), np.einsum('crcs->rs', T)
-eb = lambda M: np.linalg.eigh(M)[1][:, ::-1]
-rho = lambda qr, ql: (lambda Ht: np.linalg.norm(
-    Ht - np.diag(np.diag(Ht)), 'fro') / nH)(np.kron(qr, ql).T @ H @ np.kron(qr, ql))
-eps = np.sqrt((np.linalg.svd(
-    T.transpose(0, 2, 1, 3).reshape(n*n, m*m), compute_uv=False)[1:] ** 2).sum())
-print(f"\nmiddle tier  eps*={eps/nH:.4f}  rho(true)={rho(QR, QL):.2e}  "
-      f"rho(Q_G)={rho(eb(A_h), eb(B_h)):.2e}")
-print("A_h eigvals vs marginals:", np.allclose(
-    np.sort(np.linalg.eigh(A_h)[0])[::-1], np.sort(Lam.sum(1))[::-1]))
-```
+> K-FAC selects a basis from unweighted activation and error moments. Gnome selects
+> one from the GGN's partial traces, which retain directional coupling between the two
+> sides of a layer. The resulting basis is exact for any nondegenerate separable GGN
+> eigenbasis, even when the eigenvalues are not Kronecker-factorizable, and otherwise
+> gives a principled rotation whose quality is measured directly by residual
+> off-diagonal GGN mass. Whether its additional estimation variance is worth that
+> population advantage is a finite-sample empirical question.
