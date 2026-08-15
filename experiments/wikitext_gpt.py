@@ -226,7 +226,7 @@ def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float
     """
     common_gnome = dict(
         lr=lr, weight_decay=weight_decay,
-        betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-4,
+        betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-12,
         precondition_frequency=10,
         trust_radius=(trust_region if trust_region > 0 else None),
         precondition_1d=False,
