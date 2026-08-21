@@ -172,7 +172,7 @@ def build_optimizer(
         # the oldest (largest ||g_s||) entries in its window and tracks a scale
         # that is already stale. CCE has no residual-driven self-annealing to
         # lose here, unlike the MSE experiments.
-        norm_free=True,
+        norm_free=False,
         precondition_1d=False,
     )
     if name in ("gnome_fisher", "gnome_hutchinson"):

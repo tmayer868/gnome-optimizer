@@ -279,9 +279,10 @@ class FusedMLP(nn.Module):
         confound the one variable this class exists to isolate.
         """
         w = torch.empty(c * hidden, hidden + 1)
-        bound = 1.0 / math.sqrt(hidden)
+        bound = math.sqrt(6.0) / math.sqrt(hidden)
         for i in range(c):
             nn.init.uniform_(w[i * hidden:(i + 1) * hidden], -bound, bound)
+            w[i * hidden:(i + 1) * hidden,-1] = 0.0
         return w
 
     def forward(self, *coords: torch.Tensor) -> torch.Tensor:
@@ -431,3 +432,107 @@ class FusedModifiedMLP(nn.Module):
         if self.out_transform is not None:
             out = self.out_transform(out, *coords)
         return out
+
+
+class AllFusedExperimental(nn.Module):
+    """Plain MLP whose parameters are packed into one near-square tensor.
+
+    ``hidden_sizes`` is the list of widths including input and output:
+    e.g. ``[2, 64, 64, 1]`` gives three affine transforms with tanh gating
+    between the hidden layers. The forward pass is identical to a standard MLP --
+    only the parameter grouping differs.
+
+    For ``P`` live parameters, the single tensor has ``d = ceil(sqrt(P))``
+    columns and ``ceil(P / d)`` rows. The final row is padded when necessary;
+    padded entries never participate in the forward pass and therefore receive
+    zero gradient. Gnome consequently sees one genuine 2-D parameter and builds
+    one pair of Kronecker factors for the whole MLP.
+
+    Live entries are laid out layer by layer in *layer order* (input->h0,
+    h0->h1, ..., hk->output), each ``[W | b]`` flattened row-major. ``_unpack``
+    slices the live prefix back into per-layer views without copying data.
+
+    Initialization draws from the same stream as plain ``FusedLinear`` so that
+    the live entries exactly equal the flattened values from a layer-by-layer
+    MLP under the same seed. Padding is zero and consumes no random numbers,
+    keeping runs comparable for the optimizer study rather than the architecture.
+    """
+
+    def __init__(
+        self,
+        hidden_sizes: list[int],
+        activation: Callable[[], nn.Module] = nn.Tanh,
+    ):
+        super().__init__()
+        if len(hidden_sizes) < 2:
+            raise ValueError("hidden_sizes must contain at least input and output widths")
+        if any(not isinstance(width, int) or isinstance(width, bool) or width <= 0
+               for width in hidden_sizes):
+            raise ValueError(f"all hidden_sizes must be positive integers, got {hidden_sizes}")
+
+        self.hidden_sizes = tuple(hidden_sizes)
+        self.act = activation()
+
+        # Compute per-layer parameter counts and offsets.
+        layer_shapes: list[tuple[int, int]] = []  # (out_features, in_dim+1)
+        for in_d, out_d in zip(hidden_sizes[:-1], hidden_sizes[1:]):
+            layer_shapes.append((out_d, in_d + 1))
+
+        self._layer_shapes = layer_shapes
+        offsets: list[int] = []
+        cum = 0
+        for _, shape in enumerate(layer_shapes):
+            offsets.append(cum)
+            cum += math.prod(shape)
+        self._offsets = offsets
+        self.n_live = sum(math.prod(s) for s in layer_shapes)
+        self.packed_cols = math.isqrt(self.n_live)
+        if self.packed_cols * self.packed_cols < self.n_live:
+            self.packed_cols += 1
+        self.packed_rows = (self.n_live + self.packed_cols - 1) // self.packed_cols
+
+        # Initialize the live prefix block-by-block with exactly FusedLinear's
+        # call shapes and bound, then reshape it with zero padding. Appending
+        # padding after initialization avoids consuming random numbers for it.
+        w_all = torch.zeros(
+            self.packed_rows * self.packed_cols,
+            dtype=torch.get_default_dtype(),
+        )
+        cum = 0
+        for _, (out_d, in_d_1) in enumerate(layer_shapes):
+            bound = 1.0 / math.sqrt(in_d_1 - 1)
+            nn.init.uniform_(
+                w_all[cum:cum + out_d * in_d_1], -bound, bound
+            )
+            cum += out_d * in_d_1
+
+        self.weights = nn.Parameter(w_all.view(self.packed_rows, self.packed_cols))
+
+    def _unpack(self, weight_tensor: torch.Tensor) -> list[torch.Tensor]:
+        """Return per-layer ``[W|b]`` views of a packed parameter tensor."""
+        flat = weight_tensor.reshape(-1)
+        out = []
+        for shape, off in zip(self._layer_shapes, self._offsets):
+            n = math.prod(shape)
+            out.append(flat[off:off + n].view(shape))
+        return out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        layers_wb = self._unpack(self.weights)
+        for i, wb in enumerate(layers_wb):
+            W = wb[:, :-1]
+            b = wb[:, -1]
+            x = F.linear(x, W, b)
+            if i < len(layers_wb) - 1:  # no activation on final layer
+                x = self.act(x)
+        return x
+
+
+if __name__ == "__main__":
+    hidden = [2, 10, 50, 50, 1]
+    net = AllFusedExperimental(hidden)
+    print(f"n_params (single tensor): {sum(p.numel() for p in net.parameters()):,}")
+    print(f"layer_shapes: {net._layer_shapes}")
+    x = torch.randn(4, 2)
+    y = net(x)
+    print(f"forward ok -> {y.shape}")

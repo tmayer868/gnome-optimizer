@@ -1,8 +1,18 @@
 """Wave-equation PINN: AdamW vs SOAP vs Gnome.
 
 PDE:  u_tt - c²·u_xx = 0,    c = 2,    x ∈ [0, 1],  t ∈ [0, 1]
-ICs:  u(0, x) = sin(πx) + 0.5·sin(2cπx),   u_t(0, x) = 0
+ICs:  u(0, x) = sin(πx) + 0.5·sin(mπx),   u_t(0, x) = 0
 BCs:  u(t, 0) = u(t, 1) = 0    (Dirichlet)
+
+``m`` is ``--second-mode``. Mode ``m`` contributes ``sin(mπx)cos(cmπt)``,
+which solves the same PDE with the same Dirichlet BCs for any ``m``, so the
+flag selects a published benchmark without changing the problem class:
+
+    --second-mode 4   sin(πx)cos(2πt) + 0.5·sin(4πx)cos(8πt)   (jaxpi, default)
+    --second-mode 3   sin(πx)cos(2πt) + 0.5·sin(3πx)cos(6πt)   (Double-PINN)
+
+Lower ``m`` is an easier target, so numbers at different ``m`` compare only
+against the paper using that ``m``, never against each other.
 
 The second-order linear wave equation (jaxpi's wave benchmark, c=2). Two
 things make it its own kind of hard: (1) the residual has an exact
@@ -82,6 +92,15 @@ X_MIN, X_MAX = 0.0, 1.0
 C_SPEED = 2.0
 A_COEFF = 0.5
 
+# Spatial mode number of the second component. Mode ``m`` contributes
+# ``sin(m·πx)·cos(c·m·πt)``, which satisfies ``u_tt - c²u_xx = 0`` for any m
+# and vanishes at x = 0, 1 — so the whole family shares one PDE, one domain
+# and one set of BCs, and differs only in which harmonic rides on top of the
+# fundamental. Set from ``--second-mode``; see that flag for the two published
+# choices. Module-level rather than threaded through the residuals because
+# ``u_exact`` and ``ic_u_residual`` are also called from the eval path.
+SECOND_MODE = 2.0 * C_SPEED
+
 
 # ========================= Input embeddings =========================
 
@@ -96,11 +115,11 @@ class NoEmbed(nn.Module):
 class PeriodicEmbed(nn.Module):
     """``[t, cos(πx), sin(πx), cos(πt), sin(πt)]`` — period-2 in x (spectral aid on wave; it
     does not enforce the Dirichlet BC)."""
-    n_freq = 10
-    out_dim = 2 + 4 *(n_freq-1)
+    n_freq = 3
+    out_dim = 2 + 4 * (n_freq-1)
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        in_features = [t ** n for n in range(1, self.n_freq)] + [t ** n for n in range(1, n_freq)]
+        in_features = [t, x]
         in_features += [torch.sin(n * math.pi * x) for n in range(1, self.n_freq)]
         in_features += [torch.cos(n * math.pi * x) for n in range(1, self.n_freq)]
         in_features += [torch.cos(n * math.pi * t) for n in range(1, self.n_freq)]
@@ -123,13 +142,12 @@ class FourierEmbed(nn.Module):
         proj_dim = (embed_dim) // 2
 
         # 1. Correct logic: Pass string name first, do NOT assign the function output to a variable
-        weights = torch.randn(3, embed_dim // 2) * scale
-        weights[:, 2] = .001 * weights[:, 2]
-        self.B = nn.Parameter(weights)
+        weights = torch.randn(2, embed_dim // 2) * scale
+        self.register_buffer("B", weights)
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         # Assuming t and x have shape (batch_size, 1)
-        p = torch.cat([t, x, torch.ones_like(x)], dim=1) @ self.B  # self.B is now safely available
+        p = torch.cat([t, x], dim=1) @ self.B  # self.B is now safely available
         return torch.cat([torch.sin(p), torch.cos(p)], dim=1)
 
 def build_embedding(embed: str, fourier_dim: int, fourier_scale: float
@@ -187,7 +205,7 @@ def build_model(arch: str, embed: nn.Module, hidden: int, depth: int,
     if arch == "fused":
         return FusedMLP(
             embed, hidden=hidden, depth=depth, fuse_every=fuse_every,
-            activation=nn.GELU,
+            activation=nn.Tanh,
             out_transform=_dirichlet_transform if hard_bc else None,
         )
     if arch == "modified":
@@ -210,8 +228,8 @@ def u_exact(t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     ``sin(πx)cos(cπt) + A·sin(2cπx)cos(4cπt)``."""
     return (
         torch.sin(math.pi * x) * torch.cos(C_SPEED * math.pi * t)
-        + A_COEFF * torch.sin(2 * C_SPEED * math.pi * x)
-        * torch.cos(4 * C_SPEED * math.pi * t)
+        + A_COEFF * torch.sin(SECOND_MODE * math.pi * x)
+        * torch.cos(C_SPEED * SECOND_MODE * math.pi * t)
     )
 
 
@@ -234,7 +252,7 @@ def pde_residual(
 def ic_residual(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """Displacement IC residual: ``u(0, x) - [sin(πx) + A·sin(2cπx)]``."""
     t0 = torch.zeros_like(x)
-    u0 = torch.sin(math.pi * x) + A_COEFF * torch.sin(2 * C_SPEED * math.pi * x)
+    u0 = torch.sin(math.pi * x) + A_COEFF * torch.sin(SECOND_MODE * math.pi * x)
     return model(t0, x) - u0
 
 
@@ -395,6 +413,19 @@ def parse_args() -> argparse.Namespace:
                         "grouping differs). 0 (default) fuses the whole "
                         "stack. --depth 4 leaves only k=2 hidden layers to "
                         "group, so raise --depth to give this room.")
+    p.add_argument("--second-mode", type=float, default=2.0 * C_SPEED,
+                   help="Spatial mode number m of the second component: the "
+                        "solution is sin(pi x)cos(c pi t) + A sin(m pi x)"
+                        "cos(c m pi t). Any m solves the same PDE with the "
+                        "same Dirichlet BCs, so this changes ONLY which "
+                        "harmonic sits on top of the fundamental. 4 "
+                        "(default) is jaxpi's benchmark, giving "
+                        "sin(4 pi x)cos(8 pi t); 3 is the Double-PINN "
+                        "paper's, giving sin(3 pi x)cos(6 pi t). Lower m is "
+                        "an easier target — less high-frequency content for "
+                        "the network to resolve — so runs at different m are "
+                        "NOT comparable to each other, only to the paper "
+                        "that uses that m.")
     p.add_argument("--arch",
                    choices=["mlp", "modified", "fused", "fused-modified"],
                    default="modified",
@@ -462,6 +493,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def train(args: argparse.Namespace) -> str:
+    # Rebind before any residual, reference or model construction: u_exact and
+    # ic_u_residual read it at call time.
+    global SECOND_MODE
+    SECOND_MODE = args.second_mode
+
     torch.manual_seed(args.seed)
     device = pick_device()
     embed = build_embedding(args.embed, args.fourier_dim, args.fourier_scale)
@@ -499,6 +535,7 @@ def train(args: argparse.Namespace) -> str:
         "hidden": args.hidden,
         "depth": args.depth,
         "c_speed": C_SPEED,
+        "second_mode": SECOND_MODE,
         "n_pde": args.n_pde,
         "n_ic": args.n_ic,
         "n_bc": args.n_bc,

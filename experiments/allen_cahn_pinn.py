@@ -150,17 +150,16 @@ class FourierEmbed(nn.Module):
             raise ValueError(f"--embed-dim must be even, got {embed_dim}")
         if scale <= 0.0:
             raise ValueError(f"--embed-scale must be positive, got {scale}")
-        self.out_dim = embed_dim
+        self.out_dim = embed_dim + 2
         # sin and cos of each projection, hence embed_dim // 2 columns.
-        weights = torch.randn(3, embed_dim // 2) * scale
-        weights[:, 2] = .01 * weights[:, 2]
-        self.B = nn.Parameter(weights)
+        weights = torch.randn(2, embed_dim // 2) * scale
+        self.register_buffer("B", weights)
 
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        raw_vars = torch.cat([t, x, torch.ones_like(x)], dim=1)
+        raw_vars = torch.cat([t, x], dim=1)
         p = raw_vars @ self.B
-        return torch.cat([torch.sin(p), torch.cos(p)], dim=1)
+        return torch.cat([raw_vars, torch.sin(p), torch.cos(p)], dim=1)
 
 
 def build_embedding(embed: str, embed_dim: int = 256,
