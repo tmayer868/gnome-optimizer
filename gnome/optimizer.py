@@ -24,7 +24,7 @@ into a second-order method:
    curvature is well-conditioned it never binds, but it prevents blow-ups
    from small denominators while the eigenbasis is still warming up.
 
-Gnome supports three explicit loss types — chosen via the ``loss`` constructor
+Gnome supports four explicit loss types — chosen via the ``loss`` constructor
 arg — so that the curvature scaling is unambiguous and reduction-independent:
 
   * ``loss='mse'`` — mean-squared error for regression. The intrinsic output
@@ -45,6 +45,11 @@ arg — so that the curvature scaling is unambiguous and reduction-independent:
     so ``S = <y_hat, detach(v)>.sum() / sqrt(K)`` estimates the same GGN
     as ``cce`` without a discrete label draw. Lower per-step variance at
     the same aux batch size ``K``.
+  * ``loss='bce_hutchinson'`` — binary cross-entropy with logits and a
+    Rademacher Hutchinson factorization of its diagonal output Hessian.
+    With ``p = sigmoid(logits)``, the detached probe is
+    ``sqrt(p * (1 - p)) * R`` and the main loss is summed over output
+    coordinates then averaged over the batch.
 
 Because the optimizer owns both the loss and the surrogate, your two
 closures just return ``(y_hat, y)`` for the main batch and the aux batch
@@ -105,6 +110,49 @@ from torch.optim.optimizer import Optimizer
 import math
 
 ClosureReturn = Tuple[torch.Tensor, torch.Tensor]
+MergeDims = Union[bool, str, Sequence[Sequence[int]]]
+
+
+def _normalize_merge_dims(
+    merge_dims: MergeDims,
+) -> Union[bool, Tuple[Tuple[int, ...], ...]]:
+    """Normalize the dimension-merging configuration.
+
+    ``False`` disables merging, while ``True`` and ``"greedy"`` select the
+    historical size-bounded greedy grouping. An explicit partition is a
+    sequence of axis groups, for example ``((0,), (1,), (2, 3))`` for
+    ``[O][I][HW]``. Explicit partitions must cover axes ``0..N-1`` exactly
+    once; they apply only to N-dimensional tensors, leaving parameters of
+    other ranks unmerged.
+    """
+    if merge_dims is False or merge_dims is None:
+        return False
+    if merge_dims is True or merge_dims == "greedy":
+        return True
+    if isinstance(merge_dims, str):
+        raise ValueError(
+            f"Invalid merge_dims mode {merge_dims!r}; expected False, True, "
+            "'greedy', or an explicit axis partition"
+        )
+
+    try:
+        partition = tuple(tuple(group) for group in merge_dims)
+    except TypeError as exc:
+        raise ValueError(
+            "merge_dims partition must be a sequence of non-empty axis groups"
+        ) from exc
+    if not partition or any(not group for group in partition):
+        raise ValueError("merge_dims partition groups must be non-empty")
+
+    axes = tuple(axis for group in partition for axis in group)
+    if any(not isinstance(axis, int) or isinstance(axis, bool) for axis in axes):
+        raise ValueError("merge_dims partition axes must be integers")
+    if sorted(axes) != list(range(len(axes))):
+        raise ValueError(
+            "merge_dims partition must cover axes 0..N-1 exactly once; "
+            f"got {partition}"
+        )
+    return partition
 
 
 def _prefer_cpu(t: torch.Tensor) -> bool:
@@ -229,6 +277,9 @@ class Gnome(Optimizer):
             is the usual safeguard, but a global norm clip can help on steps
             where the raw gradient spikes.
         loss: One of ``"mse"`` (mean-squared error for regression),
+            ``"bce_hutchinson"`` (binary cross-entropy with logits and a
+            Rademacher Hutchinson factorization of the diagonal output
+            Hessian),
             ``"cce"`` (softmax cross-entropy with Fisher-sampling surrogate),
             or ``"cce_hutchinson"`` (softmax cross-entropy with a Rademacher
             Hutchinson factorization of the output Hessian; same main loss
@@ -236,8 +287,16 @@ class Gnome(Optimizer):
             both the main loss and the surrogate internally so that the
             scaling is consistent; the user's closure only needs to return
             ``(y_hat, y)``.
-        merge_dims: Whether to merge conv-layer dimensions before forming
-            Kronecker factors.
+        merge_dims: Dimension grouping used before forming Kronecker factors.
+            ``False`` (default) leaves every tensor axis separate. ``True`` or
+            ``"greedy"`` uses the historical greedy grouping, combining
+            contiguous axes until the next product would exceed
+            ``max_precond_dim``. An explicit partition such as
+            ``((0,), (1,), (2, 3))`` gives a convolution weight the grouping
+            ``[O][I][HW]``. A partition covering N axes applies only to
+            N-dimensional parameters; parameters of other ranks stay
+            unmerged. For ``channels_last``, explicit axis numbers refer to
+            the internally normalized channels-first order.
         precondition_1d: Build a Kronecker factor for 1D parameters as well.
         data_format: ``"channels_first"`` or ``"channels_last"`` for the
             ``merge_dims`` layout convention.
@@ -291,7 +350,7 @@ class Gnome(Optimizer):
         trust_radius: Optional[float] = 1.0,
         norm_free: bool = False,
         loss: str = "mse",
-        merge_dims: bool = False,
+        merge_dims: MergeDims = False,
         precondition_1d: bool = False,
         data_format: str = "channels_first",
         diagnostics: Optional[Callable[[dict], None]] = None,
@@ -322,13 +381,15 @@ class Gnome(Optimizer):
                 raise ValueError(
                     f"metrics values must be callable; not callable: {bad}"
                 )
-        if loss not in ("mse", "cce", "cce_hutchinson"):
+        if loss not in ("mse", "bce_hutchinson", "cce", "cce_hutchinson"):
             raise ValueError(
                 f"Invalid loss mode: {loss!r}; "
-                f"expected 'mse', 'cce', or 'cce_hutchinson'."
+                f"expected 'mse', 'bce_hutchinson', 'cce', "
+                "or 'cce_hutchinson'."
             )
         if data_format not in ("channels_first", "channels_last"):
             raise ValueError(f"Invalid data_format: {data_format!r}")
+        merge_dims = _normalize_merge_dims(merge_dims)
 
         defaults = dict(
             lr=lr,
@@ -526,26 +587,105 @@ class Gnome(Optimizer):
     # SOAP machinery: dim merging, Kronecker factor maintenance, projection
     # ------------------------------------------------------------------
 
-    def _merge_dims(self, grad: torch.Tensor, max_precond_dim: int) -> torch.Tensor:
-        if self._data_format == "channels_last" and grad.dim() == 4:
-            grad = grad.permute(0, 3, 1, 2)
-        shape = grad.shape
-        new_shape = []
-        curr = 1
-        for sh in shape:
-            nxt = curr * sh
-            if nxt > max_precond_dim:
-                if curr > 1:
-                    new_shape.append(curr)
-                    curr = sh
+    def _reshape_for_preconditioner(
+        self,
+        tensor: torch.Tensor,
+        max_precond_dim: int,
+        merge_dims: MergeDims,
+    ) -> Tuple[torch.Tensor, dict]:
+        """Group tensor axes and return metadata needed to undo the reshape."""
+        spec = _normalize_merge_dims(merge_dims)
+        original_shape = tuple(tensor.shape)
+        identity_meta = {
+            "applied": False,
+            "original_shape": original_shape,
+        }
+        if spec is False:
+            return tensor, identity_meta
+
+        # An explicit N-axis partition is intended for N-dimensional
+        # parameters (for example conv kernels) and leaves other parameter
+        # ranks alone. This lets one optimizer group conv weights without
+        # accidentally flattening its Linear weights.
+        if spec is not True:
+            partition_rank = sum(len(group) for group in spec)
+            if tensor.dim() != partition_rank:
+                return tensor, identity_meta
+
+        channels_last = self._data_format == "channels_last" and tensor.dim() == 4
+        if channels_last:
+            tensor = tensor.permute(0, 3, 1, 2)
+        canonical_shape = tuple(tensor.shape)
+
+        if spec is True:
+            merged_sizes = []
+            current_size = 1
+            for size in canonical_shape:
+                next_size = current_size * size
+                if next_size > max_precond_dim:
+                    if current_size > 1:
+                        merged_sizes.append(current_size)
+                        current_size = size
+                    else:
+                        merged_sizes.append(size)
+                        current_size = 1
                 else:
-                    new_shape.append(sh)
-                    curr = 1
-            else:
-                curr = nxt
-        if curr > 1 or not new_shape:
-            new_shape.append(curr)
-        return grad.reshape(new_shape)
+                    current_size = next_size
+            if current_size > 1 or not merged_sizes:
+                merged_sizes.append(current_size)
+            axis_order = tuple(range(tensor.dim()))
+            merged_shape = tuple(merged_sizes)
+        else:
+            partition = spec
+            axis_order = tuple(axis for group in partition for axis in group)
+            if axis_order != tuple(range(tensor.dim())):
+                tensor = tensor.permute(axis_order)
+            merged_shape = tuple(
+                math.prod(canonical_shape[axis] for axis in group)
+                for group in partition
+            )
+        metadata = {
+            "applied": True,
+            "original_shape": original_shape,
+            "canonical_shape": canonical_shape,
+            "axis_order": axis_order,
+            "channels_last": channels_last,
+        }
+        return tensor.reshape(merged_shape), metadata
+
+    def _restore_merged_dims(
+        self,
+        tensor: torch.Tensor,
+        metadata: dict,
+    ) -> torch.Tensor:
+        """Undo :meth:`_reshape_for_preconditioner`, including axis permutation."""
+        if not metadata["applied"]:
+            return tensor
+
+        canonical_shape = metadata["canonical_shape"]
+        axis_order = metadata["axis_order"]
+        permuted_shape = tuple(canonical_shape[axis] for axis in axis_order)
+        tensor = tensor.reshape(permuted_shape)
+
+        if axis_order != tuple(range(len(axis_order))):
+            inverse_order = [0] * len(axis_order)
+            for current_axis, original_axis in enumerate(axis_order):
+                inverse_order[original_axis] = current_axis
+            tensor = tensor.permute(inverse_order)
+        if metadata["channels_last"]:
+            tensor = tensor.permute(0, 2, 3, 1)
+        return tensor.reshape(metadata["original_shape"])
+
+    def _merge_dims(
+        self,
+        grad: torch.Tensor,
+        max_precond_dim: int,
+        merge_dims: MergeDims = True,
+    ) -> torch.Tensor:
+        """Return the grouped view; ``True`` preserves historical greedy behavior."""
+        return self._reshape_for_preconditioner(
+            grad, max_precond_dim, merge_dims
+        )[0]
 
     def _init_preconditioner(
         self,
@@ -555,7 +695,7 @@ class Gnome(Optimizer):
         shampoo_beta: float,
         max_precond_dim: int,
         precondition_1d: bool,
-        merge_dims: bool,
+        merge_dims: MergeDims,
     ) -> None:
         state["GG"] = []
         # Keep the factors in the same precision used by eigh/QR: float64 for
@@ -572,7 +712,10 @@ class Gnome(Optimizer):
                     )
                 )
         else:
-            ref = self._merge_dims(grad, max_precond_dim) if merge_dims else grad
+            ref = (
+                self._merge_dims(grad, max_precond_dim, merge_dims)
+                if merge_dims else grad
+            )
             for sh in ref.shape:
                 if sh > max_precond_dim:
                     state["GG"].append([])
@@ -589,15 +732,13 @@ class Gnome(Optimizer):
         self,
         grad: torch.Tensor,
         state: dict,
-        merge_dims: bool,
+        merge_dims: MergeDims,
         max_precond_dim: int,
     ) -> torch.Tensor:
-        original_shape = grad.shape
-        permuted_shape = None
         if merge_dims:
-            if grad.dim() == 4 and self._data_format == "channels_last":
-                permuted_shape = grad.permute(0, 3, 1, 2).shape
-            grad = self._merge_dims(grad, max_precond_dim)
+            grad, merge_metadata = self._reshape_for_preconditioner(
+                grad, max_precond_dim, merge_dims
+            )
         for mat in state["Q"]:
             if len(mat) > 0:
                 # Q is stored in the decomposition's working precision
@@ -608,25 +749,20 @@ class Gnome(Optimizer):
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
         if merge_dims:
-            if self._data_format == "channels_last" and len(original_shape) == 4:
-                grad = grad.reshape(permuted_shape).permute(0, 2, 3, 1)
-            else:
-                grad = grad.reshape(original_shape)
+            grad = self._restore_merged_dims(grad, merge_metadata)
         return grad
 
     def _project_back(
         self,
         grad: torch.Tensor,
         state: dict,
-        merge_dims: bool,
+        merge_dims: MergeDims,
         max_precond_dim: int,
     ) -> torch.Tensor:
-        original_shape = grad.shape
-        permuted_shape = None
         if merge_dims:
-            if self._data_format == "channels_last" and grad.dim() == 4:
-                permuted_shape = grad.permute(0, 3, 1, 2).shape
-            grad = self._merge_dims(grad, max_precond_dim)
+            grad, merge_metadata = self._reshape_for_preconditioner(
+                grad, max_precond_dim, merge_dims
+            )
         for mat in state["Q"]:
             if len(mat) > 0:
                 grad = torch.tensordot(grad, mat.to(grad.dtype), dims=[[0], [1]])
@@ -634,10 +770,7 @@ class Gnome(Optimizer):
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
         if merge_dims:
-            if self._data_format == "channels_last" and len(original_shape) == 4:
-                grad = grad.reshape(permuted_shape).permute(0, 2, 3, 1)
-            else:
-                grad = grad.reshape(original_shape)
+            grad = self._restore_merged_dims(grad, merge_metadata)
         return grad
 
     def _update_preconditioner(
@@ -645,7 +778,7 @@ class Gnome(Optimizer):
         G_s: torch.Tensor,
         state: dict,
         max_precond_dim: int,
-        merge_dims: bool,
+        merge_dims: MergeDims,
         precondition_1d: bool,
     ) -> None:
         """Update the Kronecker factors from the surrogate gradient G_s and,
@@ -674,7 +807,10 @@ class Gnome(Optimizer):
                     1 - state["shampoo_beta"],
                 )
         else:
-            ref = self._merge_dims(G_s, max_precond_dim) if merge_dims else G_s
+            ref = (
+                self._merge_dims(G_s, max_precond_dim, merge_dims)
+                if merge_dims else G_s
+            )
             for idx, sh in enumerate(ref.shape):
                 if sh <= max_precond_dim:
                     outer = torch.tensordot(
@@ -719,7 +855,7 @@ class Gnome(Optimizer):
         self,
         state: dict,
         max_precond_dim: int,
-        merge_dims: bool,
+        merge_dims: MergeDims,
     ) -> None:
         """Incrementally refresh the eigenbasis via one power iteration + QR.
 
@@ -742,12 +878,10 @@ class Gnome(Optimizer):
         gnd_m = state["gnd_m"]
 
         # Apply merge_dims to gnd_m so the per-factor dimensions line up.
-        orig_shape = gnd_m.shape
-        permuted_shape = None
         if merge_dims:
-            if self._data_format == "channels_last" and len(orig_shape) == 4:
-                permuted_shape = gnd_m.permute(0, 3, 1, 2).shape
-            gnd_m_view = self._merge_dims(gnd_m, max_precond_dim)
+            gnd_m_view, merge_metadata = self._reshape_for_preconditioner(
+                gnd_m, max_precond_dim, merge_dims
+            )
         else:
             gnd_m_view = gnd_m
 
@@ -777,10 +911,7 @@ class Gnome(Optimizer):
             new_Q.append(Q)
 
         if merge_dims:
-            if self._data_format == "channels_last" and len(orig_shape) == 4:
-                gnd_m_view = gnd_m_view.reshape(permuted_shape).permute(0, 2, 3, 1)
-            else:
-                gnd_m_view = gnd_m_view.reshape(orig_shape)
+            gnd_m_view = self._restore_merged_dims(gnd_m_view, merge_metadata)
 
         state["gnd_m"] = gnd_m_view
         state["Q"] = new_Q
@@ -798,10 +929,16 @@ class Gnome(Optimizer):
         MSE: ``((y_hat - y) ** 2).sum() / B`` — sum over output dim, mean
         over batch. Equivalent to ``F.mse_loss(reduction='sum') / B``.
 
+        BCE-Hutchinson: ``binary_cross_entropy_with_logits(..., sum) / B``.
+
         CCE: ``F.cross_entropy(y_hat, y, reduction='mean')``.
         """
         if self._loss_mode == "mse":
             return ((y_hat - y) ** 2).sum() / y_hat.shape[0]
+        if self._loss_mode == "bce_hutchinson":
+            return F.binary_cross_entropy_with_logits(
+                y_hat, y, reduction="sum"
+            ) / y_hat.shape[0]
         # cce, cce_hutchinson — both train against the same CCE main loss;
         # only the surrogate construction differs between them.
         return F.cross_entropy(y_hat, y, reduction="mean")
@@ -836,6 +973,11 @@ class Gnome(Optimizer):
         and ``S = <logits, detach(v)>.sum() / sqrt(K)`` gives the same GGN
         estimator as the Fisher-sampling branch without drawing a discrete
         label. Lower per-step variance for the same K.
+
+        BCE-Hutchinson: for logits ``z`` and ``p = sigmoid(z)``, the output
+        Hessian is diagonal with entries ``p(1-p)``. Drawing per-element
+        Rademacher ``R`` gives ``v = sqrt(p(1-p)) * R`` and
+        ``S = <z, detach(v)>.sum() / sqrt(K)``.
         """
         K = aux_idx.shape[0]
         inv_sqrt_K = K ** -0.5
@@ -856,6 +998,14 @@ class Gnome(Optimizer):
                 R = _rademacher_like(sqrt_p)
                 c = (sqrt_p * R).sum(dim=-1, keepdim=True)
                 v = sqrt_p * R - c * probs
+            return (logits * v).sum() * inv_sqrt_K
+
+        if self._loss_mode == "bce_hutchinson":
+            logits = y_hat[aux_idx]
+            with torch.no_grad():
+                probs = torch.sigmoid(logits.detach())
+                scale = (probs * (1.0 - probs)).sqrt()
+                v = scale * _rademacher_like(scale)
             return (logits * v).sum() * inv_sqrt_K
 
         # MSE: known intrinsic L'' = 2, no double-backward needed.

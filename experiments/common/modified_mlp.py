@@ -279,7 +279,7 @@ class FusedMLP(nn.Module):
         confound the one variable this class exists to isolate.
         """
         w = torch.empty(c * hidden, hidden + 1)
-        bound = math.sqrt(6.0) / math.sqrt(hidden)
+        bound = math.sqrt(3.0) / math.sqrt(hidden)
         for i in range(c):
             nn.init.uniform_(w[i * hidden:(i + 1) * hidden], -bound, bound)
             w[i * hidden:(i + 1) * hidden,-1] = 0.0

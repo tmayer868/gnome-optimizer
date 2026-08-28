@@ -35,6 +35,15 @@ than going to zero.
     uv run python -m experiments.cifar100 --optimizer soap             --seed 0
     uv run python -m experiments.cifar100 --optimizer adamw            --seed 0
 
+Gnome's and SOAP's convolution-factor partition can be selected independently:
+
+    --merge-dims none      # [O][I][H][W], historical experiment default
+    --merge-dims greedy    # size-bounded greedy grouping
+    --merge-dims spatial   # [O][I][HW]
+    --merge-dims patch     # [O][IHW]
+
+The option is deliberately ignored by AdamW.
+
 CIFAR-100 downloads once via torchvision (~170MB) and is cached under
 ``experiments/data``.
 """
@@ -43,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import time
 import warnings
 
 import torch
@@ -63,6 +73,13 @@ from experiments.common.resnet import build_model, MODEL_NAMES
 EXPERIMENT = "cifar100"
 DEFAULT_DATA_DIR = "experiments/data"
 NUM_CLASSES = 100
+
+MERGE_DIMS_MODES = {
+    "none": False,
+    "greedy": True,
+    "spatial": ((0,), (1,), (2, 3)),
+    "patch": ((0,), (1, 2, 3)),
+}
 
 # Standard CIFAR-100 per-channel statistics.
 CIFAR100_MEAN = (0.5071, 0.4865, 0.4409)
@@ -151,6 +168,7 @@ def build_optimizer(
     name: str, params, lr: float, weight_decay: float,
     beta1: float = 0.9, beta2: float = 0.99, eps: float = 1e-6,
     trust_region: float = 1.0, aux_batch_size: int = 32,
+    merge_dims: str = "none",
 ):
     """Return ``(optimizer, config)``.
 
@@ -165,31 +183,55 @@ def build_optimizer(
     common_gnome = dict(
         lr=lr, weight_decay=weight_decay,
         betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
-        precondition_frequency=10,
+        precondition_frequency=20,
         trust_radius=(trust_region if trust_region > 0 else None),
         # CIFAR-100 moves 4.6 -> 2.6 loss inside ~200 steps, which is ~2 EMA
         # windows at beta2=0.99. Without this the curvature EMA is dominated by
         # the oldest (largest ||g_s||) entries in its window and tracks a scale
         # that is already stale. CCE has no residual-driven self-annealing to
         # lose here, unlike the MSE experiments.
-        norm_free=False,
-        precondition_1d=False,
+        norm_free=True,
+        precondition_1d=True,
     )
     if name in ("gnome_fisher", "gnome_hutchinson"):
+        try:
+            merge_dims_spec = MERGE_DIMS_MODES[merge_dims]
+        except KeyError as exc:
+            choices = ", ".join(MERGE_DIMS_MODES)
+            raise ValueError(
+                f"unknown merge-dims mode {merge_dims!r}; "
+                f"expected one of: {choices}"
+            ) from exc
         loss_mode = "cce" if name == "gnome_fisher" else "cce_hutchinson"
-        cfg = dict(common_gnome, loss=loss_mode)
+        cfg = dict(
+            common_gnome,
+            loss=loss_mode,
+            merge_dims=merge_dims_spec,
+        )
         opt = Gnome(params, **cfg)
         # aux_batch_size sizes the auxiliary batch the caller builds for
         # opt.step(...); it is not a Gnome constructor arg.
         cfg["aux_batch_size"] = aux_batch_size
+        cfg["merge_dims_mode"] = merge_dims
         return opt, cfg
     if name == "soap":
+        try:
+            merge_dims_spec = MERGE_DIMS_MODES[merge_dims]
+        except KeyError as exc:
+            choices = ", ".join(MERGE_DIMS_MODES)
+            raise ValueError(
+                f"unknown merge-dims mode {merge_dims!r}; "
+                f"expected one of: {choices}"
+            ) from exc
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
-            precondition_frequency=10, precondition_1d=False,
+            precondition_frequency=10, precondition_1d=True,
+            merge_dims=merge_dims_spec,
         )
-        return SOAP(params, **cfg), cfg
+        opt = SOAP(params, **cfg)
+        cfg["merge_dims_mode"] = merge_dims
+        return opt, cfg
     if name == "adamw":
         cfg = dict(lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999), eps=1e-8)
         return torch.optim.AdamW(params, **cfg), cfg
@@ -242,6 +284,7 @@ def main():
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
         beta1=args.beta1, beta2=args.beta2, eps=args.eps,
         trust_region=args.trust_region, aux_batch_size=args.aux_batch_size,
+        merge_dims=args.merge_dims,
     )
     K = opt_cfg.get("aux_batch_size", 0) if is_gnome else 0
 
@@ -276,20 +319,24 @@ def main():
     }
 
     if not args.quiet:
+        uses_merge_dims = is_gnome or args.optimizer == "soap"
+        merge_summary = f" merge_dims={args.merge_dims}" if uses_merge_dims else ""
         print(f"[{EXPERIMENT}] {args.optimizer} | {args.model}/{args.norm} | "
               f"params={hyperparameters['n_params']:,} | device={device}\n"
               f"  epochs={args.epochs} batch={args.batch_size} "
-              f"steps={total_steps} aux_K={K}", flush=True)
+              f"steps={total_steps} aux_K={K}{merge_summary}", flush=True)
 
     with RunLogger(EXPERIMENT, args.optimizer, args.seed, hyperparameters,
                    runs_dir=args.runs_dir) as run:
         step = 0
         best_top1 = 0.0
-        window_sum, window_n = 0.0, 0
+        window_sum, window_time_ms, window_n = 0.0, 0.0, 0
+        total_step_time_ms = 0.0
         for epoch in range(args.epochs):
             model.train()
             perm = torch.randperm(n_train)
             for i in range(0, n_train, args.batch_size):
+                step_started = time.perf_counter()
                 idx = perm[i:i + args.batch_size]
                 # Augment on CPU, then transfer. Two reasons, both load-bearing:
                 # the pad temporary never reaches device memory, and — more
@@ -332,6 +379,7 @@ def main():
                     opt.step()
 
                 loss_val = float(loss.detach().item())
+                step_time_ms = (time.perf_counter() - step_started) * 1000.0
                 if diverged(loss_val):
                     # Localize the failure before exiting. The fork that
                     # matters: are the *parameters* already non-finite (so the
@@ -353,17 +401,26 @@ def main():
                           flush=True)
                     run.finish(completed=False, diverged=True, diverged_step=step)
                     raise SystemExit(DIVERGED_EXIT)
-                run.log_train(step, loss=loss_val, lr=lr_now)
+                run.log_train(
+                    step,
+                    loss=loss_val,
+                    lr=lr_now,
+                    step_time_ms=step_time_ms,
+                )
                 window_sum += loss_val
+                window_time_ms += step_time_ms
+                total_step_time_ms += step_time_ms
                 window_n += 1
                 step += 1
 
                 if (not args.quiet) and args.log_every > 0 and step % args.log_every == 0:
                     avg = window_sum / max(window_n, 1)
+                    ms_per_step = window_time_ms / max(window_n, 1)
                     print(f"    step {step:6d}  epoch {epoch:3d}  "
                           f"train_loss[last {window_n}]={avg:.4f}  lr={lr_now:.2e}",
+                          f"{ms_per_step:.1f} ms/step",
                           flush=True)
-                    window_sum, window_n = 0.0, 0
+                    window_sum, window_time_ms, window_n = 0.0, 0.0, 0
 
             val_loss, top1, top5 = evaluate(model, x_val, y_val, args.batch_size)
             best_top1 = max(best_top1, top1)
@@ -373,10 +430,13 @@ def main():
                 print(f"  epoch {epoch:3d}/{args.epochs}  val_loss={val_loss:.4f}  "
                       f"top1={top1*100:.2f}%  top5={top5*100:.2f}%", flush=True)
 
+        mean_step_time_ms = total_step_time_ms / max(step, 1)
         run.finish(completed=True, final_top1=top1, best_top1=best_top1,
-                   final_val_loss=val_loss)
+                   final_val_loss=val_loss,
+                   mean_step_time_ms=mean_step_time_ms)
     print(f"[{EXPERIMENT}] done → final_top1={top1*100:.2f}%  "
-          f"best_top1={best_top1*100:.2f}%", flush=True)
+          f"best_top1={best_top1*100:.2f}%  "
+          f"mean={mean_step_time_ms:.1f} ms/step", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -409,6 +469,14 @@ def parse_args() -> argparse.Namespace:
                    help="Aux batch K for the Gnome surrogate, drawn as a subset "
                         "of the main batch. Cheap here: the Hutchinson "
                         "surrogate's per-sample tensor is only (K, 100).")
+    p.add_argument(
+        "--merge-dims",
+        choices=tuple(MERGE_DIMS_MODES),
+        default="none",
+        help="Gnome/SOAP convolution-factor grouping: 'none'=[O][I][H][W], "
+             "'greedy'=existing size-bounded merge, 'spatial'=[O][I][HW], "
+             "or 'patch'=[O][IHW]. Ignored by AdamW.",
+    )
     p.add_argument("--model", choices=MODEL_NAMES, default="resnet12",
                    help="Architecture (default resnet12).")
     p.add_argument("--norm", choices=["gn", "bn"], default="gn",

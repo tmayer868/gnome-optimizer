@@ -162,9 +162,9 @@ $$
 
 The estimator is unbiased at every batch size. $K$ controls **variance**, not bias: with the $1/\sqrt K$ scaling, $\mathbb{E}\|g_s\|^2$ is independent of $K$ but $\mathrm{Var}(g_s)$ decreases as $K$ grows. The $1/\sqrt K$ normalization thus decouples the surrogate's scale from the aux batch size $K$ entirely, so `eps` and `trust_radius` calibrate against a fixed-scale surrogate regardless of $K$. (`tests/test_surrogate_scaling.py` pins this empirically across $K \in \{1,4,16,64\}$.)
 
-The explicit per-sample sum is the uniform notation that handles all three losses in §5. For MSE and BCE, $A_k$ doesn't depend on $k$ (it's either constant or a per-element function of detached logits), and the sum collapses into a single inner product over `(batch × output_dim)` axes. Both losses can be written in batched-tensor form. For CCE, $A_k$ varies per sample through the softmax probabilities $p_k$, so the sum is genuinely a per-sample operation.
+The explicit per-sample sum is the uniform notation that handles all four loss modes in §5. For MSE and BCE, $A_k$ is diagonal (either constant or a per-element function of detached logits), and the sum collapses into a single inner product over `(batch × output_dim)` axes. Both losses can be written in batched-tensor form. For CCE, $A_k$ varies per sample through the softmax probabilities $p_k$, so the sum is genuinely a per-sample operation.
 
-So the entire construction reduces to: **given a loss, write down a closed-form square root $A$ of its output Hessian.** Section 5 collects $A$ for each loss family. The optimizer currently exposes three via the `loss=` argument: `'mse'`, `'cce'`, and `'cce_hutchinson'`. BCE is included below to show the recipe generalizes (it is the diagonal special case of CCE), not as a shipped option.
+So the entire construction reduces to: **given a loss, write down a closed-form square root $A$ of its output Hessian.** Section 5 collects $A$ for each loss family. The optimizer exposes four modes via the `loss=` argument: `'mse'`, `'bce_hutchinson'`, `'cce'`, and `'cce_hutchinson'`. BCE intentionally has only the Hutchinson construction; there is no separate sampling variant.
 
 - **MSE**: $H_y = 2I$, so $A = \sqrt 2 \, I$.
 - **BCE**: $H_y = \mathrm{diag}(p(1-p))$, so $A = \mathrm{diag}\!\big(\sqrt{p(1-p)}\big)$.
@@ -198,7 +198,7 @@ Two notes:
 
 ### 5.2 BCE (binary cross-entropy with logits)
 
-*Not a shipped `loss=` option. Described here for completeness, since it is the diagonal special case of the CCE surrogate in §5.3.*
+Shipped as `loss='bce_hutchinson'`. It is the diagonal special case of the CCE surrogate in §5.3 and intentionally has no separate sampling variant.
 
 Per-element: predict logit $z$, target $y \in \{0, 1\}$, with $p = \sigma(z)$ and
 
