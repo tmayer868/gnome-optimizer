@@ -22,6 +22,15 @@ downloads and decodes — a minute or two, then reused).
     uv run python -m experiments.utkface --optimizer gnome --seed 0
     uv run python -m experiments.utkface --optimizer soap  --seed 0 --cosine-decay 0
     uv run python -m experiments.utkface --optimizer adamw --seed 0 --cosine-decay 0
+
+Gnome and SOAP convolution-factor partitions use the same modes as CIFAR-100:
+
+    --merge-dims none      # [O][I][H][W], historical experiment default
+    --merge-dims greedy    # size-bounded greedy grouping
+    --merge-dims spatial   # [O][I][HW]
+    --merge-dims patch     # [O][IHW]
+
+The option is ignored by AdamW.
 """
 
 from __future__ import annotations
@@ -55,6 +64,13 @@ EXPERIMENT = "utkface"
 # schema.) Swap this constant to use any UTKFace repo exposing `image`+`age`.
 HF_DATASET = "nu-delta/utkface"
 DEFAULT_CACHE_DIR = "experiments/data/utkface_hf"
+
+MERGE_DIMS_MODES = {
+    "none": False,
+    "greedy": True,
+    "spatial": ((0,), (1,), (2, 3)),
+    "patch": ((0,), (1, 2, 3)),
+}
 
 # UTKFace ages run 0-116. Map with a round upper bound of 120 so every
 # sample lands strictly inside [-1, 1]: target = age / 60 - 1. The
@@ -244,33 +260,47 @@ def augment_batch(
 
 def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_decay,
                     eps=1e-6, beta1=0.9, beta2=0.99,
-                    trust_region=1.0):
+                    trust_region=1.0, merge_dims="none"):
     """Return ``(optimizer, config, scheduler)``.
 
     Every optimizer gets the same linear-warmup + cosine-decay schedule, to a
     ``cosine_decay`` final-LR fraction. On MSE, 1.0 (warmup then constant) is
     the natural setting for Gnome, whose step self-anneals with the residual.
     """
+    if name in ("gnome", "soap"):
+        try:
+            merge_dims_spec = MERGE_DIMS_MODES[merge_dims]
+        except KeyError as exc:
+            choices = ", ".join(MERGE_DIMS_MODES)
+            raise ValueError(
+                f"unknown merge-dims mode {merge_dims!r}; "
+                f"expected one of: {choices}"
+            ) from exc
+
     if name == "gnome":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
             precondition_frequency=10,
             trust_radius=(trust_region if trust_region > 0 else None),
-            loss="mse", precondition_1d=False, norm_free=False
+            loss="mse", precondition_1d=False, norm_free=False,
+            merge_dims=merge_dims_spec,
         )
         opt = Gnome(params, **cfg)
         # aux_batch_size sizes the auxiliary batch the caller builds for
         # opt.step(...); it is not a Gnome constructor arg. Recorded in the
         # returned config for logging and to set K below.
         cfg["aux_batch_size"] = 10
+        cfg["merge_dims_mode"] = merge_dims
     elif name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
             precondition_frequency=10, precondition_1d=False,
+            merge_dims=merge_dims_spec,
         )
         opt = SOAP(params, **cfg)
+        cfg["merge_dims_mode"] = merge_dims
     elif name == "adamw":
         cfg = dict(lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999), eps=1e-8)
         opt = torch.optim.AdamW(params, **cfg)
@@ -290,8 +320,10 @@ def main():
     torch.manual_seed(args.seed)
     device = pick_device()
 
-    print(f"[{EXPERIMENT}] {args.optimizer} | loading UTKFace ({HF_DATASET})...",
-          flush=True)
+    uses_merge_dims = args.optimizer in ("gnome", "soap")
+    merge_summary = f" | merge_dims={args.merge_dims}" if uses_merge_dims else ""
+    print(f"[{EXPERIMENT}] {args.optimizer}{merge_summary} | "
+          f"loading UTKFace ({HF_DATASET})...", flush=True)
     x_train_cpu, y_train_cpu, x_val, y_val = load_utkface_data(
         seed=args.seed, val_frac=args.val_frac, image_size=args.image_size,
     )
@@ -310,6 +342,7 @@ def main():
         args.warmup_steps, total_steps, args.cosine_decay, eps=args.eps,
         beta1=args.beta1, beta2=args.beta2,
         trust_region=args.trust_region,
+        merge_dims=args.merge_dims,
     )
     K = opt_cfg.get("aux_batch_size", 20) if args.optimizer == "gnome" else 0
 
@@ -450,6 +483,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--beta2", type=float, default=0.99,
                    help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
     p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument(
+        "--merge-dims",
+        choices=tuple(MERGE_DIMS_MODES),
+        default="none",
+        help="Gnome/SOAP convolution-factor grouping: 'none'=[O][I][H][W], "
+             "'greedy'=size-bounded greedy merging, 'spatial'=[O][I][HW], "
+             "or 'patch'=[O][IHW]. Ignored by AdamW.",
+    )
     p.add_argument("--model", choices=MODEL_NAMES, default="resnet12",
                    help="Architecture. resnet12 (default) is a custom net "
                         "between resnet8 and resnet18.")

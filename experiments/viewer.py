@@ -40,39 +40,62 @@ INDEX_HTML = r"""<!doctype html>
 <title>gnome-optimizer run viewer</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1"></script>
 <style>
+  :root {
+    color-scheme: dark;
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface-raised: #1c2128;
+    --border: #30363d;
+    --border-muted: #21262d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent-a: #58a6ff;
+    --accent-b: #ff7b72;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--bg); }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-         margin: 0; padding: 14px 18px; color: #1a1a1a; }
+         margin: 0; padding: 14px 18px; color: var(--text);
+         background: var(--bg); }
   h2 { margin: 0 0 12px 0; font-size: 18px; }
-  h3 { margin: 14px 0 6px 0; font-size: 13px; color: #555;
+  h3 { margin: 14px 0 6px 0; font-size: 13px; color: var(--muted);
        text-transform: uppercase; letter-spacing: 0.04em; }
   .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
          margin-bottom: 8px; font-size: 13px; }
   .row label { display: flex; gap: 6px; align-items: center; }
-  select { padding: 4px 6px; min-width: 360px; font-size: 12px;
-           border: 1px solid #c0c0c0; border-radius: 4px; }
+  select, input[type="number"] { color: var(--text); background: var(--surface);
+           border: 1px solid var(--border); border-radius: 4px; }
+  select { padding: 4px 6px; min-width: 360px; font-size: 12px; }
+  input[type="number"] { padding: 3px 5px; }
+  select:focus, input:focus { outline: 2px solid var(--accent-a);
+                              outline-offset: 1px; }
+  input[type="checkbox"] { accent-color: var(--accent-a); }
   select.metric { min-width: 120px; }
   .chart-wrap { width: 100%; max-width: 1200px; height: 300px;
-                margin-bottom: 8px; }
+                margin-bottom: 8px; padding: 8px; background: var(--surface);
+                border: 1px solid var(--border-muted); border-radius: 6px; }
   .summary { display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
              max-width: 1200px; margin-bottom: 12px; }
-  .summary > div { background: #f8f8f8; padding: 8px 12px; border-radius: 4px;
+  .summary > div { background: var(--surface); padding: 8px 12px;
+                   border: 1px solid var(--border-muted); border-radius: 4px;
                    font-size: 12px; }
   .summary code { font-family: ui-monospace, "Cascadia Code", Menlo, monospace; }
   table { font-size: 12px; border-collapse: collapse; max-width: 1200px;
-          width: 100%; }
-  td, th { border-bottom: 1px solid #eee; padding: 4px 8px; text-align: left;
+          width: 100%; background: var(--surface); border: 1px solid var(--border); }
+  td, th { border-bottom: 1px solid var(--border-muted); padding: 4px 8px; text-align: left;
            vertical-align: top; }
-  th { background: #f4f4f4; }
-  tr.diff td:nth-child(2), tr.diff td:nth-child(3) { background: #fff8d6; }
+  th { background: var(--surface-raised); }
+  tr:last-child td { border-bottom: 0; }
+  tr.diff td:nth-child(2), tr.diff td:nth-child(3) { background: #2d2a1f; }
   .num { text-align: right; font-variant-numeric: tabular-nums;
          font-family: ui-monospace, "Cascadia Code", Menlo, monospace; }
-  .a-color { color: #1f77b4; font-weight: 600; }
-  .b-color { color: #d62728; font-weight: 600; }
+  .a-color { color: var(--accent-a); font-weight: 600; }
+  .b-color { color: var(--accent-b); font-weight: 600; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 10px;
           font-size: 11px; margin-left: 6px; }
-  .ok { background: #d4edda; color: #155724; }
-  .pending { background: #fff3cd; color: #856404; }
-  #status { font-size: 11px; color: #777; }
+  .ok { background: #173b2a; color: #7ee2a8; }
+  .pending { background: #3d3215; color: #eac55f; }
+  #status, .hint { font-size: 11px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -108,7 +131,7 @@ INDEX_HTML = r"""<!doctype html>
   <label>train smoothing:
     <input type="number" id="smoothing-window" value="100" min="1" max="10000" step="10"
            style="width: 70px;" />
-    <span style="color:#777; font-size:11px;">steps (1 = raw)</span>
+    <span class="hint">steps (1 = raw)</span>
   </label>
 </div>
 
@@ -124,8 +147,11 @@ INDEX_HTML = r"""<!doctype html>
 <div id="meta"></div>
 
 <script>
-const COLOR_A = "#1f77b4";
-const COLOR_B = "#d62728";
+const COLOR_A = "#58a6ff";
+const COLOR_B = "#ff7b72";
+const CHART_TEXT = "#c9d1d9";
+const CHART_GRID = "rgba(139, 148, 158, 0.18)";
+const CHART_BORDER = "#484f58";
 
 function makeChart(id, xLabel, yLabel) {
   const ctx = document.getElementById(id).getContext("2d");
@@ -136,11 +162,32 @@ function makeChart(id, xLabel, yLabel) {
       responsive: true, maintainAspectRatio: false, animation: false,
       parsing: false,
       scales: {
-        x: { type: "linear", title: { display: true, text: xLabel } },
-        y: { type: "logarithmic", title: { display: true, text: yLabel } },
+        x: {
+          type: "linear",
+          title: { display: true, text: xLabel, color: CHART_TEXT },
+          ticks: { color: CHART_TEXT },
+          grid: { color: CHART_GRID },
+          border: { color: CHART_BORDER },
+        },
+        y: {
+          type: "logarithmic",
+          title: { display: true, text: yLabel, color: CHART_TEXT },
+          ticks: { color: CHART_TEXT },
+          grid: { color: CHART_GRID },
+          border: { color: CHART_BORDER },
+        },
       },
       elements: { point: { radius: 0 }, line: { borderWidth: 1.5, tension: 0 } },
-      plugins: { legend: { display: true, position: "top", align: "end" } },
+      plugins: {
+        legend: {
+          display: true, position: "top", align: "end",
+          labels: { color: CHART_TEXT },
+        },
+        tooltip: {
+          backgroundColor: "#1c2128", titleColor: "#f0f6fc",
+          bodyColor: CHART_TEXT, borderColor: CHART_BORDER, borderWidth: 1,
+        },
+      },
     },
   });
 }

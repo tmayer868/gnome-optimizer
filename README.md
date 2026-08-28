@@ -60,10 +60,28 @@ for x, y in loader:
     loss = opt.step(main_closure, aux_closure) # returns the main loss
 ```
 
+For binary or multi-label classification, pass raw logits and floating-point targets with
+the same shape, and select the BCE-Hutchinson loss:
+
+```python
+opt = Gnome(model.parameters(), lr=1e-3, loss="bce_hutchinson")
+
+def main_closure():
+    return model(x), targets.float()       # logits and targets shaped [B, ...]
+
+def aux_closure():
+    return model(x_aux), targets_aux.float()
+```
+
+This mode uses binary cross-entropy with logits, summed over each sample's output
+coordinates and averaged over the batch. Its curvature surrogate uses independent
+Rademacher probes scaled by the square root of the Bernoulli output Hessian.
+
 Key arguments:
 
-- `loss` — `"mse"` (regression), `"cce"` (softmax cross-entropy, Fisher surrogate), or
-  `"cce_hutchinson"` (cross-entropy, lower-variance Rademacher surrogate).
+- `loss` — `"mse"` (regression), `"bce_hutchinson"` (binary cross-entropy with logits and
+  a Rademacher surrogate), `"cce"` (softmax cross-entropy, Fisher surrogate), or
+  `"cce_hutchinson"` (softmax cross-entropy, lower-variance Rademacher surrogate).
 - `lr` — Gnome owns no schedule; it is a stock `torch.optim.Optimizer`, so any
   `torch.optim.lr_scheduler` drives it as it would AdamW. On MSE the Gauss-Newton step
   self-anneals as the residual shrinks, so decay is optional there in a way it isn't for

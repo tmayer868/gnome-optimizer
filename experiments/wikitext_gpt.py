@@ -209,7 +209,8 @@ def load_wikitext103(seq_len: int, batch_size: int, seed: int):
 # ========================= Optimizer factory =========================
 
 def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float,
-                               trust_region: float = 1.0):
+                               trust_region: float = 1.0,
+                               max_grad_norm: float | None = None):
     """Construct one of the four supported optimizers.
 
     Both Gnome variants share every hyperparameter except ``loss=`` so the
@@ -226,10 +227,12 @@ def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float
     """
     common_gnome = dict(
         lr=lr, weight_decay=weight_decay,
-        betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-4,
-        precondition_frequency=10,
+        betas=(0.9, 0.99), shampoo_beta=0.99, eps=1e-12,
+        precondition_frequency=20,
         trust_radius=(trust_region if trust_region > 0 else None),
+        max_grad_norm=max_grad_norm,
         precondition_1d=False,
+        norm_free=False
     )
     # aux_batch_size sizes the auxiliary batch the caller builds for
     # opt.step(...); it is not a Gnome constructor arg (see K below, and the
@@ -248,7 +251,7 @@ def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float
     if name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
-            betas=(0.9, 0.95), shampoo_beta=0.95, eps=1e-8,
+            betas=(0.9, 0.99), shampoo_beta=0.99, eps=1e-8,
             precondition_frequency=10, precondition_1d=False,
         )
         return SOAP(params, **cfg), cfg
@@ -315,8 +318,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup-steps", type=int, default=100)
     p.add_argument("--weight-decay", type=float, default=1e-5)
     p.add_argument("--max-grad-norm", type=float, default=1.0,
-                   help="Global-norm gradient clipping for non-Gnome paths. "
-                        "Gnome uses its own l2 trust region instead.")
+                   help="Global-norm gradient clipping. Gnome applies it "
+                        "internally to the main gradient; other optimizers "
+                        "use torch.nn.utils.clip_grad_norm_.")
     p.add_argument("--seq-len", type=int, default=128)
     p.add_argument("--n-layer", type=int, default=10)
     p.add_argument("--n-head", type=int, default=8)
@@ -367,7 +371,7 @@ def main():
 
     opt, opt_cfg = build_optimizer_and_config(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
-        trust_region=args.trust_region,
+        trust_region=args.trust_region, max_grad_norm=args.max_grad_norm,
     )
     K = opt_cfg.get("aux_batch_size", 4) if args.optimizer.startswith("gnome") else 0
 

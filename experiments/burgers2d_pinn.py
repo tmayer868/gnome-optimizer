@@ -76,13 +76,14 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import os
 import time
 
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
 
-from gnome import Gnome, stack_residuals
+from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
@@ -92,6 +93,7 @@ from experiments.common import (
     current_lr,
     pick_device,
 )
+from experiments.common import MLP as _SharedMLP, ConcatEmbed
 
 
 EXPERIMENT = "burgers2d_pinn"
@@ -122,7 +124,7 @@ def exact_solution(
 
 # ========================= Model =========================
 
-class PINN(nn.Module):
+class PINN(_SharedMLP):
     """Maps ``(t, x, y) → u`` via a plain tanh MLP.
 
     ``depth`` counts *total* linear layers, so ``depth = 11`` is the paper's
@@ -130,18 +132,7 @@ class PINN(nn.Module):
     """
 
     def __init__(self, hidden: int = 20, depth: int = 11):
-        super().__init__()
-        assert depth >= 2
-        layers: list[nn.Module] = [nn.Linear(3, hidden), nn.Tanh()]
-        for _ in range(depth - 2):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, 1)]
-        self.net = nn.Sequential(*layers)
-
-    def forward(
-        self, t: torch.Tensor, x: torch.Tensor, y: torch.Tensor
-    ) -> torch.Tensor:
-        return self.net(torch.cat([t, x, y], dim=1))
+        super().__init__(ConcatEmbed(3), hidden=hidden, depth=depth)
 
 
 # ========================= Residuals =========================
@@ -393,6 +384,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-eval-x", type=int, default=201,
                    help="Points per spatial axis in the fixed eval grid "
                         "(201 -> spacing 0.005, just under the 0.008 front).")
+    p.add_argument("--diagnostics-every", type=int, default=0,
+                   help="Log Gnome's internal state — curvature spectrum, LM "
+                        "damping, trust-region usage — every N steps to a "
+                        "sibling runs/.../{run_id}.diag.jsonl. 0 (default) "
+                        "disables it entirely. Gnome only: SOAP and AdamW "
+                        "expose no such hook.")
+    p.add_argument("--diagnostics-params", type=str, default=None,
+                   help="Comma-separated parameter indices to log, e.g. "
+                        "'0,4'. Default logs every parameter, which is one "
+                        "record per tensor per logged step — narrow it to "
+                        "keep the file readable.")
     p.add_argument("--log-every", type=int, default=100,
                    help="Log a val entry (running train mean + per-term "
                         "diagnostics on a fresh probe batch) every N steps.")
@@ -426,6 +428,8 @@ def train(args: argparse.Namespace) -> str:
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
+        # Non-zero means a sibling {run_id}.diag.jsonl exists.
+        "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
         "steps": args.steps,
         "dtype": args.dtype,
@@ -452,6 +456,30 @@ def train(args: argparse.Namespace) -> str:
         runs_dir=args.runs_dir,
     )
 
+    # Optional optimizer-internals log. Kept in its own file rather than as
+    # extra records in the run's JSONL: it is one record per *parameter* per
+    # logged step, so it would outnumber the training records several times
+    # over and slow load_run() down for everyone not looking at it.
+    diag = None
+    if args.diagnostics_every > 0:
+        if args.optimizer != "gnome":
+            raise SystemExit(
+                f"--diagnostics-every is Gnome-only; --optimizer "
+                f"{args.optimizer} exposes no diagnostics hook."
+            )
+        diag_params = (
+            None if not args.diagnostics_params
+            else [int(s) for s in args.diagnostics_params.split(",")]
+        )
+        diag_path = os.path.join(
+            os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
+        )
+        diag = JsonlDiagnostics(diag_path, params=diag_params)
+        # Plain attributes, so this attaches to the already-built optimizer —
+        # which is what lets the file be named after the run id.
+        opt.diagnostics = diag
+        opt.diagnostics_every = args.diagnostics_every
+
     if not args.quiet:
         print(
             f"[{EXPERIMENT}] {args.optimizer} | params={n_params:,} | "
@@ -463,6 +491,9 @@ def train(args: argparse.Namespace) -> str:
     eval_coords, u_ref = make_eval_set(
         args.n_eval_t, args.n_eval_x, device, dtype)
 
+    if diag is not None and not args.quiet:
+        print(f"  diagnostics every {args.diagnostics_every} steps "
+              f"→ {diag.path}", flush=True)
     t_start = time.perf_counter()
     window: list[float] = []
     last_avg = last_rel_l2 = float("nan")
@@ -498,6 +529,8 @@ def train(args: argparse.Namespace) -> str:
 
         loss_val = float(loss.detach().item())
         if diverged(loss_val):
+            if diag is not None:
+                diag.close()
             run.finish(completed=False, diverged=True, diverged_step=step)
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
             raise SystemExit(DIVERGED_EXIT)
@@ -527,6 +560,9 @@ def train(args: argparse.Namespace) -> str:
                 )
             window.clear()
 
+    if diag is not None:
+        diag.close()
+        print(f"[{EXPERIMENT}] diagnostics → {diag.path}")
     path = run.finish(
         completed=True,
         final_avg_train=last_avg, best_avg_train=best_avg,

@@ -51,7 +51,10 @@ constant, which suits Gnome on MSE since its step self-anneals as the
 residual shrinks).
 
 Reference: jaxpi's ``allen_cahn.mat`` (auto-downloaded to
-``experiments/data/``), the Chebfun solution for this benchmark.
+``experiments/data/``), the Chebfun solution for this benchmark.  A finer,
+independently generated spectral reference can be selected with
+``--reference highres`` after running
+``uv run -m experiments.generate_allen_cahn_reference``.
 
 Usage:
 
@@ -59,6 +62,8 @@ Usage:
     uv run -m experiments.allen_cahn_pinn --optimizer soap  --arch mlp
     uv run -m experiments.allen_cahn_pinn --optimizer gnome \
         --embed fourier --embed-dim 32 --embed-scale 10
+    uv run -m experiments.allen_cahn_pinn --optimizer gnome \
+        --diagnostics-every 500 --diagnostics-params 0
     uv run -m experiments.allen_cahn_pinn --optimizer adamw --arch modified
     uv run -m experiments.allen_cahn_pinn --optimizer gnome --embed periodic
 """
@@ -75,16 +80,21 @@ import torch
 import torch.autograd as autograd
 import torch.nn as nn
 
-from gnome import Gnome, stack_residuals
+from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
+    FusedMLP,
+    FusedModifiedMLP,
+    ModifiedMLP,
     diverged,
     RunLogger,
     cosine_scheduler,
     current_lr,
     pick_device,
+    FusedLinear
 )
+from experiments.common import MLP as _SharedMLP, ConcatEmbed
 
 
 EXPERIMENT = "allen_cahn_pinn"
@@ -143,17 +153,16 @@ class FourierEmbed(nn.Module):
             raise ValueError(f"--embed-dim must be even, got {embed_dim}")
         if scale <= 0.0:
             raise ValueError(f"--embed-scale must be positive, got {scale}")
-        self.out_dim = embed_dim
+        self.out_dim = embed_dim + 2
         # sin and cos of each projection, hence embed_dim // 2 columns.
-        weights = torch.randn(3, embed_dim // 2) * scale
-        weights[:, 2] = .01 * weights[:, 2]
-        self.B = nn.Parameter(weights)
+        weights = torch.randn(2, embed_dim // 2) * scale
+        self.register_buffer("B", weights)
 
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        raw_vars = torch.cat([t, x, torch.ones_like(x)], dim=1)
+        raw_vars = torch.cat([t, x], dim=1)
         p = raw_vars @ self.B
-        return torch.cat([torch.sin(p), torch.cos(p)], dim=1)
+        return torch.cat([raw_vars, torch.sin(p), torch.cos(p)], dim=1)
 
 
 def build_embedding(embed: str, embed_dim: int = 256,
@@ -167,66 +176,38 @@ def build_embedding(embed: str, embed_dim: int = 256,
     raise ValueError(f"unknown embedding: {embed}")
 
 
-class MLP(nn.Module):
+class MLP(_SharedMLP):
     """Plain tanh MLP over an input embedding: ``(t, x) → u``.
 
     ``depth`` = number of Linear layers.
     """
 
     def __init__(self, embed: nn.Module, hidden: int = 256, depth: int = 4):
-        super().__init__()
-        assert depth >= 2
-        self.embed = embed
-        d = embed.out_dim
-        layers: list[nn.Module] = [nn.Linear(d, hidden), nn.Tanh()]
-        for _ in range(depth - 2):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, 1)]
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return self.net(self.embed(t, x))
+        super().__init__(embed, hidden=hidden, depth=depth)
 
 
-class ModifiedMLP(nn.Module):
-    """Modified MLP (Wang, Teng & Perdikaris 2021): ``(t, x) → u``.
+def build_model(arch: str, embed: nn.Module, hidden: int, depth: int,
+                fuse_every: int = 0) -> nn.Module:
+    """``(t, x) → u``. The input embedding is whatever ``--embed`` selects.
 
-    Two input encoders ``u, v`` gate every hidden layer:
-    ``h = tanh(W_l h);  h = h·u + (1-h)·v``. ``depth`` = number of gated
-    hidden layers. Architecture only — no random weight factorization or
-    Fourier features (those are jaxpi-pipeline pieces, deliberately not
-    ported here); the input embedding is whatever ``--embed`` selects.
+    ``fused`` and ``fused-modified`` are the same function classes as ``mlp``
+    and ``modified`` respectively — they differ only in how the weights are
+    grouped into parameter tensors, which is what Gnome preconditions over.
+    ``--fuse-every 1`` is the control for both: one tensor per layer,
+    bit-identical initialization, one variable. Note the fusable run differs —
+    ``depth - 2`` layers for ``fused``, ``depth - 1`` for ``fused-modified``,
+    whose first gated layer consumes the embedding and cannot share a tensor.
     """
-
-    def __init__(self, embed: nn.Module, hidden: int = 256, depth: int = 4):
-        super().__init__()
-        assert depth >= 1
-        self.embed = embed
-        d = embed.out_dim
-        self.enc_u = nn.Linear(d, hidden)
-        self.enc_v = nn.Linear(d, hidden)
-        self.layers = nn.ModuleList(
-            [nn.Linear(d if i == 0 else hidden, hidden) for i in range(depth)]
-        )
-        self.out = nn.Linear(hidden, 1)
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        z = self.embed(t, x)
-        u = torch.tanh(self.enc_u(z))
-        v = torch.tanh(self.enc_v(z))
-        h = z
-        for layer in self.layers:
-            h = torch.tanh(layer(h))
-            h = h * u + (1.0 - h) * v
-        return self.out(h)
-
-
-def build_model(arch: str, embed: nn.Module, hidden: int, depth: int
-                ) -> nn.Module:
     if arch == "mlp":
         return MLP(embed, hidden=hidden, depth=depth)
     if arch == "modified":
         return ModifiedMLP(embed, hidden=hidden, depth=depth)
+    if arch == "fused":
+        return FusedMLP(embed, hidden=hidden, depth=depth,
+                        fuse_every=fuse_every)
+    if arch == "fused-modified":
+        return FusedModifiedMLP(embed, hidden=hidden, depth=depth,
+                                fuse_every=fuse_every)
     raise ValueError(f"unknown arch: {arch}")
 
 
@@ -320,6 +301,7 @@ def term_losses(model: nn.Module, batch) -> dict[str, float]:
 # ========================= Reference solution + eval =========================
 
 DEFAULT_REF_CACHE_DIR = "experiments/data"
+HIGHRES_REFERENCE_NAME = "allen_cahn_highres.mat"
 REFERENCE_URL = (
     "https://raw.githubusercontent.com/PredictiveIntelligenceLab/jaxpi/"
     "pirate/examples/allen_cahn/data/allen_cahn.mat"
@@ -328,25 +310,41 @@ REFERENCE_URL = (
 
 def allen_cahn_reference(
     cache_path: str | None = None,
+    *,
+    reference: str = "jaxpi",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """jaxpi's Chebfun Allen-Cahn reference (``allen_cahn.mat``).
+    """Load a jaxpi or independently generated Allen-Cahn reference.
 
-    Auto-downloaded to ``experiments/data/``. Returns ``(t, x, u)`` with
-    shapes ``(nt,)``, ``(nx,)``, ``(nt, nx)`` — CPU float32, ``u[0]`` the IC.
+    The jaxpi reference is downloaded on demand.  The high-resolution
+    reference must first be generated with
+    ``python -m experiments.generate_allen_cahn_reference``.  Returns
+    ``(t, x, u)`` as CPU float64 tensors with shapes ``(nt,)``, ``(nx,)``,
+    ``(nt, nx)`` and ``u[0]`` the initial condition.
     """
     import scipy.io
 
+    if reference not in {"jaxpi", "highres"}:
+        raise ValueError(f"unknown Allen-Cahn reference: {reference!r}")
     if cache_path is None:
-        cache_path = os.path.join(DEFAULT_REF_CACHE_DIR, "allen_cahn.mat")
+        filename = (
+            "allen_cahn.mat" if reference == "jaxpi" else HIGHRES_REFERENCE_NAME
+        )
+        cache_path = os.path.join(DEFAULT_REF_CACHE_DIR, filename)
     if not os.path.isfile(cache_path):
+        if reference == "highres":
+            raise FileNotFoundError(
+                f"High-resolution reference not found at {cache_path!r}. "
+                "Generate it with: uv run -m "
+                "experiments.generate_allen_cahn_reference"
+            )
         os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         print(f"[{EXPERIMENT}] downloading reference {REFERENCE_URL} ...",
               flush=True)
         urllib.request.urlretrieve(REFERENCE_URL, cache_path)
     data = scipy.io.loadmat(cache_path)
-    u = torch.as_tensor(data["usol"], dtype=torch.float32)
-    t = torch.as_tensor(data["t"].flatten(), dtype=torch.float32)
-    x = torch.as_tensor(data["x"].flatten(), dtype=torch.float32)
+    u = torch.as_tensor(data["usol"], dtype=torch.float64)
+    t = torch.as_tensor(data["t"].flatten(), dtype=torch.float64)
+    x = torch.as_tensor(data["x"].flatten(), dtype=torch.float64)
     return t, x, u
 
 
@@ -429,9 +427,22 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--optimizer", required=True,
                    choices=["gnome", "soap", "adamw"])
-    p.add_argument("--arch", choices=["mlp", "modified"], default="modified",
-                   help="Network: plain tanh MLP or the gated modified MLP "
-                        "(Wang et al. 2021). --hidden / --depth control both.")
+    p.add_argument("--arch",
+                   choices=["mlp", "modified", "fused", "fused-modified"],
+                   default="modified",
+                   help="Network: plain tanh MLP, the gated modified MLP "
+                        "(Wang et al. 2021), or 'fused' — the plain MLP with "
+                        "[W|b] merged per layer and hidden layers grouped "
+                        "per --fuse-every. --hidden / --depth control all "
+                        "three.")
+    p.add_argument("--fuse-every", type=int, default=0,
+                   help="--arch fused only: consecutive hidden layers per "
+                        "parameter tensor. 1 = one tensor per layer, the "
+                        "control every larger value is compared against "
+                        "(identical function and initialization, only the "
+                        "grouping differs). 0 (default) fuses the whole "
+                        "stack. Note --depth 4 leaves only k=2 hidden layers "
+                        "to group, so raise --depth to give this room.")
     p.add_argument("--embed", choices=["none", "periodic", "fourier"],
                    default="none",
                    help="Input embedding. 'none' feeds raw [t, x] and keeps "
@@ -498,6 +509,26 @@ def parse_args() -> argparse.Namespace:
                         "curvature estimate is reading round-off; float64 "
                         "moves that floor out of the way. MPS has no double "
                         "support, so this falls back to CPU there.")
+    p.add_argument(
+        "--reference",
+        choices=["jaxpi", "highres"],
+        default="jaxpi",
+        help="Reference used for rel_l2. 'jaxpi' is the published 201x512 "
+             "Chebfun table and remains the compatibility default. "
+             "'highres' uses experiments/data/allen_cahn_highres.mat, "
+             "generated by experiments.generate_allen_cahn_reference.",
+    )
+    p.add_argument("--diagnostics-every", type=int, default=0,
+                   help="Log Gnome's internal state — curvature spectrum, LM "
+                        "damping, trust-region usage — every N steps to a "
+                        "sibling runs/.../{run_id}.diag.jsonl. 0 (default) "
+                        "disables it entirely. Gnome only: SOAP and AdamW "
+                        "expose no such hook.")
+    p.add_argument("--diagnostics-params", type=str, default=None,
+                   help="Comma-separated parameter indices to log, e.g. "
+                        "'0,4'. Default logs every parameter, which is one "
+                        "record per tensor per logged step — narrow it to "
+                        "keep the file readable.")
     p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--quiet", action="store_true")
@@ -523,7 +554,7 @@ def train(args: argparse.Namespace) -> str:
     model = build_model(
         args.arch,
         build_embedding(args.embed, args.embed_dim, args.embed_scale),
-        args.hidden, args.depth,
+        args.hidden, args.depth, args.fuse_every,
     ).to(device)
     opt, opt_cfg, scheduler = build_optimizer(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
@@ -541,10 +572,16 @@ def train(args: argparse.Namespace) -> str:
     hyperparameters = {
         "optimizer": args.optimizer,
         "arch": args.arch,
+        # Realized chunk sizes, not the raw flag: 0 and any value >= depth-2
+        # both mean "one chunk", and the sweep needs those runs to compare
+        # equal. None for the archs that have no such grouping.
+        "fuse_every": getattr(model, "chunks", None),
         "embed": args.embed,
         "embed_dim": args.embed_dim if args.embed == "fourier" else None,
         "embed_scale": args.embed_scale if args.embed == "fourier" else None,
         "blocks": ["pde", "ic", "bc"] if use_bc else ["pde", "ic"],
+        # Non-zero means a sibling {run_id}.diag.jsonl exists for this run.
+        "diagnostics_every": args.diagnostics_every,
         "steps": args.steps,
         "hidden": args.hidden,
         "depth": args.depth,
@@ -559,6 +596,7 @@ def train(args: argparse.Namespace) -> str:
         "t_domain": (T_MIN, T_MAX),
         "device": str(device),
         "dtype": str(torch.get_default_dtype()),
+        "reference": args.reference,
         **{f"opt.{k}": v for k, v in opt_cfg.items()},
     }
     run = RunLogger(
@@ -568,6 +606,30 @@ def train(args: argparse.Namespace) -> str:
         hyperparameters=hyperparameters,
         runs_dir=args.runs_dir,
     )
+
+    # Optional optimizer-internals log. Kept in its own file rather than as
+    # extra records in the run's JSONL: it is one record per *parameter* per
+    # logged step, so it would outnumber the training records several times
+    # over and slow load_run() down for everyone not looking at it.
+    diag = None
+    if args.diagnostics_every > 0:
+        if args.optimizer != "gnome":
+            raise SystemExit(
+                f"--diagnostics-every is Gnome-only; --optimizer "
+                f"{args.optimizer} exposes no diagnostics hook."
+            )
+        diag_params = (
+            None if not args.diagnostics_params
+            else [int(s) for s in args.diagnostics_params.split(",")]
+        )
+        diag_path = os.path.join(
+            os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
+        )
+        diag = JsonlDiagnostics(diag_path, params=diag_params)
+        # Plain attributes, so this attaches to the already-built optimizer —
+        # which is what lets the file be named after the run id.
+        opt.diagnostics = diag
+        opt.diagnostics_every = args.diagnostics_every
 
     if not args.quiet:
         blocks = "pde+ic+bc" if use_bc else "pde+ic (exact periodic BC)"
@@ -581,11 +643,17 @@ def train(args: argparse.Namespace) -> str:
             f"blocks={blocks}",
             flush=True,
         )
-        print("  loading / downloading reference solution...", flush=True)
-    t_ref, x_ref, u_ref = allen_cahn_reference()
-    # The .mat reference is float32; match the run dtype so float64 eval works.
+        if diag is not None:
+            print(f"  diagnostics every {args.diagnostics_every} steps "
+                  f"→ {diag.path}", flush=True)
+        print(f"  loading reference solution ({args.reference})...", flush=True)
+    t_ref, x_ref, u_ref = allen_cahn_reference(reference=args.reference)
+    # Evaluate in the run dtype. Both .mat files retain float64 on disk, so a
+    # --float64 run now also gets a genuinely float64 reference tensor.
     dt = torch.get_default_dtype()
     t_ref, x_ref, u_ref = t_ref.to(dt), x_ref.to(dt), u_ref.to(dt)
+    if not args.quiet:
+        print(f"  reference grid={u_ref.shape[0]}x{u_ref.shape[1]}", flush=True)
 
     t_start = time.perf_counter()
     window: list[float] = []
@@ -620,6 +688,8 @@ def train(args: argparse.Namespace) -> str:
         loss_val = float(loss.detach().item())
         if diverged(loss_val):
             run.finish(completed=False, diverged=True, diverged_step=step)
+            if diag is not None:
+                diag.close()
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.",
                   flush=True)
             raise SystemExit(DIVERGED_EXIT)
@@ -653,6 +723,9 @@ def train(args: argparse.Namespace) -> str:
         final_avg_train=last_avg, best_avg_train=best_avg,
         final_rel_l2=last_rel_l2, best_rel_l2=best_rel_l2,
     )
+    if diag is not None:
+        diag.close()
+        print(f"[{EXPERIMENT}] diagnostics → {diag.path}")
     print(f"[{EXPERIMENT}] saved → {path}")
     print(f"  final avg_train={last_avg:.4e}  best={best_avg:.4e}")
     print("  final " + "  ".join(f"{k}={v:.3e}" for k, v in last_terms.items()))

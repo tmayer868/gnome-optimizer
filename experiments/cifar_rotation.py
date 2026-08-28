@@ -26,6 +26,15 @@ the cache with ``experiments/cifar100.py``.)
     uv run python -m experiments.cifar_rotation --optimizer gnome --seed 0
     uv run python -m experiments.cifar_rotation --optimizer soap  --seed 0 --cosine-decay 0
     uv run python -m experiments.cifar_rotation --optimizer adamw --seed 0 --cosine-decay 0
+
+Gnome and SOAP convolution-factor partitions use the same modes as CIFAR-100:
+
+    --merge-dims none      # [O][I][H][W], historical experiment default
+    --merge-dims greedy    # size-bounded greedy grouping
+    --merge-dims spatial   # [O][I][HW]
+    --merge-dims patch     # [O][IHW]
+
+The option is ignored by AdamW.
 """
 
 from __future__ import annotations
@@ -52,6 +61,13 @@ from experiments.common.resnet import build_model, MODEL_NAMES
 
 EXPERIMENT = "cifar_rotation"
 DEFAULT_DATA_DIR = "experiments/data"
+
+MERGE_DIMS_MODES = {
+    "none": False,
+    "greedy": True,
+    "spatial": ((0,), (1,), (2, 3)),
+    "patch": ((0,), (1, 2, 3)),
+}
 
 # Rotations are sampled uniformly from [-ANGLE_RANGE_DEG, +ANGLE_RANGE_DEG];
 # the regression target is angle / ANGLE_RANGE_DEG, so it lands in [-1, 1].
@@ -144,7 +160,7 @@ def load_cifar100_tensors(data_dir: str = DEFAULT_DATA_DIR):
 
 def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_decay,
                     eps=1e-6, beta1=0.9, beta2=0.99,
-                    trust_region=1.0):
+                    trust_region=1.0, merge_dims="none"):
     """Return ``(optimizer, config, scheduler)`` with conv-friendly defaults.
 
     Every optimizer gets the same linear-warmup + cosine-decay schedule, to a
@@ -153,6 +169,16 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
     off — the small 1D norm gamma/beta tensors carry no cross-coordinate
     structure worth a Kronecker factor.
     """
+    if name in ("gnome", "soap"):
+        try:
+            merge_dims_spec = MERGE_DIMS_MODES[merge_dims]
+        except KeyError as exc:
+            choices = ", ".join(MERGE_DIMS_MODES)
+            raise ValueError(
+                f"unknown merge-dims mode {merge_dims!r}; "
+                f"expected one of: {choices}"
+            ) from exc
+
     if name == "gnome":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
@@ -160,20 +186,24 @@ def build_optimizer(name, params, lr, weight_decay, warmup, total_steps, cosine_
             precondition_frequency=10,
             loss="mse", precondition_1d=False,
             trust_radius=(trust_region if trust_region > 0 else None),
-            norm_free=False
+            norm_free=False,
+            merge_dims=merge_dims_spec,
         )
         opt = Gnome(params, **cfg)
         # aux_batch_size sizes the auxiliary batch the caller builds for
         # opt.step(...); it is not a Gnome constructor arg. Recorded in the
         # returned config for logging and to set K below.
         cfg["aux_batch_size"] = 10
+        cfg["merge_dims_mode"] = merge_dims
     elif name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
             precondition_frequency=10, precondition_1d=False,
+            merge_dims=merge_dims_spec,
         )
         opt = SOAP(params, **cfg)
+        cfg["merge_dims_mode"] = merge_dims
     elif name == "adamw":
         cfg = dict(lr=lr, weight_decay=weight_decay, betas=(0.9, 0.999), eps=1e-8)
         opt = torch.optim.AdamW(params, **cfg)
@@ -193,7 +223,10 @@ def main():
     torch.manual_seed(args.seed)
     device = pick_device()
 
-    print(f"[{EXPERIMENT}] {args.optimizer} | loading CIFAR-100...", flush=True)
+    uses_merge_dims = args.optimizer in ("gnome", "soap")
+    merge_summary = f" | merge_dims={args.merge_dims}" if uses_merge_dims else ""
+    print(f"[{EXPERIMENT}] {args.optimizer}{merge_summary} | "
+          "loading CIFAR-100...", flush=True)
     x_train_cpu, x_val_cpu = load_cifar100_tensors()
     n_train = int(x_train_cpu.shape[0])
 
@@ -213,6 +246,7 @@ def main():
         args.warmup_steps, total_steps, args.cosine_decay, eps=args.eps,
         beta1=args.beta1, beta2=args.beta2,
         trust_region=args.trust_region,
+        merge_dims=args.merge_dims,
     )
     K = opt_cfg.get("aux_batch_size", 10) if args.optimizer == "gnome" else 0
 
@@ -344,7 +378,15 @@ def parse_args() -> argparse.Namespace:
                    help="First-moment (momentum) EMA for Gnome and SOAP.")
     p.add_argument("--beta2", type=float, default=0.99,
                    help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
-    p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--weight-decay", type=float, default=0.00)
+    p.add_argument(
+        "--merge-dims",
+        choices=tuple(MERGE_DIMS_MODES),
+        default="none",
+        help="Gnome/SOAP convolution-factor grouping: 'none'=[O][I][H][W], "
+             "'greedy'=size-bounded greedy merging, 'spatial'=[O][I][HW], "
+             "or 'patch'=[O][IHW]. Ignored by AdamW.",
+    )
     p.add_argument("--model", choices=MODEL_NAMES, default="resnet12",
                    help="Architecture (default resnet12).")
     p.add_argument("--norm", choices=["gn", "bn"], default="gn",

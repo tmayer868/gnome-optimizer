@@ -9,9 +9,14 @@ MPS note: torch.linalg.eigh and torch.linalg.qr are not implemented on MPS.
 Both are run on CPU and moved back to the original device.
 """
 
+import math
+from itertools import chain
+from typing import Tuple
+
 import torch
 import torch.optim as optim
-from itertools import chain
+
+from gnome.optimizer import MergeDims, _normalize_merge_dims
 
 
 def _to_cpu_and_back(tensor, fn):
@@ -37,7 +42,12 @@ class SOAP(optim.Optimizer):
         precondition_frequency (int): How often to update the preconditioner
             (default: 10).
         max_precond_dim (int): Maximum preconditioner dimension (default: 10000).
-        merge_dims (bool): Whether to merge gradient dimensions (default: False).
+        merge_dims: Dimension grouping used before forming Kronecker factors.
+            ``False`` keeps one factor per tensor axis. ``True`` or
+            ``"greedy"`` uses SOAP's historical size-bounded greedy merging.
+            An explicit partition such as ``((0,), (1,), (2, 3))`` produces
+            ``[O][I][HW]`` factors for a convolution weight. A partition is
+            applied only to tensors with the same number of axes.
         precondition_1d (bool): Whether to precondition 1D gradients
             (default: False).
         normalize_grads (bool): Whether to normalize gradients per layer
@@ -58,12 +68,13 @@ class SOAP(optim.Optimizer):
         weight_decay: float = 0.01,
         precondition_frequency: int = 10,
         max_precond_dim: int = 10000,
-        merge_dims: bool = False,
+        merge_dims: MergeDims = False,
         precondition_1d: bool = False,
         normalize_grads: bool = False,
         data_format: str = "channels_first",
         correct_bias: bool = True,
     ):
+        merge_dims = _normalize_merge_dims(merge_dims)
         defaults = {
             "lr": lr,
             "betas": betas,
@@ -80,31 +91,105 @@ class SOAP(optim.Optimizer):
         super().__init__(params, defaults)
         self._data_format = data_format
 
-    def merge_dims(self, grad, max_precond_dim):
-        """Merges gradient dimensions until their product <= max_precond_dim."""
+    def _reshape_for_preconditioner(
+        self,
+        tensor: torch.Tensor,
+        max_precond_dim: int,
+        merge_dims: MergeDims,
+    ) -> Tuple[torch.Tensor, dict]:
+        """Group tensor axes and return metadata needed to undo the reshape."""
+        spec = _normalize_merge_dims(merge_dims)
+        original_shape = tuple(tensor.shape)
+        identity_meta = {
+            "applied": False,
+            "original_shape": original_shape,
+        }
+        if spec is False:
+            return tensor, identity_meta
+
+        # Explicit partitions target tensors of one particular rank. This lets
+        # a convolution partition coexist with Linear and normalization
+        # parameters in the same optimizer without reshaping those tensors.
+        if spec is not True:
+            partition_rank = sum(len(group) for group in spec)
+            if tensor.dim() != partition_rank:
+                return tensor, identity_meta
+
         assert self._data_format in ["channels_first", "channels_last"]
-        if self._data_format == "channels_last" and grad.dim() == 4:
-            grad = grad.permute(0, 3, 1, 2)
-        shape = grad.shape
-        new_shape = []
+        channels_last = self._data_format == "channels_last" and tensor.dim() == 4
+        if channels_last:
+            tensor = tensor.permute(0, 3, 1, 2)
+        canonical_shape = tuple(tensor.shape)
 
-        curr_shape = 1
-        for sh in shape:
-            temp_shape = curr_shape * sh
-            if temp_shape > max_precond_dim:
-                if curr_shape > 1:
-                    new_shape.append(curr_shape)
-                    curr_shape = sh
+        if spec is True:
+            merged_sizes = []
+            current_size = 1
+            for size in canonical_shape:
+                next_size = current_size * size
+                if next_size > max_precond_dim:
+                    if current_size > 1:
+                        merged_sizes.append(current_size)
+                        current_size = size
+                    else:
+                        merged_sizes.append(size)
+                        current_size = 1
                 else:
-                    new_shape.append(sh)
-                    curr_shape = 1
-            else:
-                curr_shape = temp_shape
+                    current_size = next_size
+            if current_size > 1 or not merged_sizes:
+                merged_sizes.append(current_size)
+            axis_order = tuple(range(tensor.dim()))
+            merged_shape = tuple(merged_sizes)
+        else:
+            axis_order = tuple(axis for group in spec for axis in group)
+            if axis_order != tuple(range(tensor.dim())):
+                tensor = tensor.permute(axis_order)
+            merged_shape = tuple(
+                math.prod(canonical_shape[axis] for axis in group)
+                for group in spec
+            )
 
-        if curr_shape > 1 or len(new_shape) == 0:
-            new_shape.append(curr_shape)
+        metadata = {
+            "applied": True,
+            "original_shape": original_shape,
+            "canonical_shape": canonical_shape,
+            "axis_order": axis_order,
+            "channels_last": channels_last,
+        }
+        return tensor.reshape(merged_shape), metadata
 
-        return grad.reshape(new_shape)
+    def _restore_merged_dims(
+        self,
+        tensor: torch.Tensor,
+        metadata: dict,
+    ) -> torch.Tensor:
+        """Undo grouping, including explicit axis and data-format permutations."""
+        if not metadata["applied"]:
+            return tensor
+
+        canonical_shape = metadata["canonical_shape"]
+        axis_order = metadata["axis_order"]
+        permuted_shape = tuple(canonical_shape[axis] for axis in axis_order)
+        tensor = tensor.reshape(permuted_shape)
+
+        if axis_order != tuple(range(len(axis_order))):
+            inverse_order = [0] * len(axis_order)
+            for current_axis, original_axis in enumerate(axis_order):
+                inverse_order[original_axis] = current_axis
+            tensor = tensor.permute(inverse_order)
+        if metadata["channels_last"]:
+            tensor = tensor.permute(0, 2, 3, 1)
+        return tensor.reshape(metadata["original_shape"])
+
+    def merge_dims(
+        self,
+        grad: torch.Tensor,
+        max_precond_dim: int,
+        merge_dims: MergeDims = True,
+    ) -> torch.Tensor:
+        """Return the grouped view; ``True`` preserves historical behavior."""
+        return self._reshape_for_preconditioner(
+            grad, max_precond_dim, merge_dims
+        )[0]
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -194,7 +279,7 @@ class SOAP(optim.Optimizer):
 
     def init_preconditioner(self, grad, state, precondition_frequency=10,
                             shampoo_beta=0.95, max_precond_dim=10000,
-                            precondition_1d=False, merge_dims=False):
+                            precondition_1d=False, merge_dims: MergeDims = False):
         """Initializes the preconditioner matrices (L and R in the paper)."""
         state["GG"] = []
         if grad.dim() == 1:
@@ -206,7 +291,7 @@ class SOAP(optim.Optimizer):
                 )
         else:
             if merge_dims:
-                grad = self.merge_dims(grad, max_precond_dim)
+                grad = self.merge_dims(grad, max_precond_dim, merge_dims)
             for sh in grad.shape:
                 if sh > max_precond_dim:
                     state["GG"].append([])
@@ -217,13 +302,12 @@ class SOAP(optim.Optimizer):
         state["precondition_frequency"] = precondition_frequency
         state["shampoo_beta"] = shampoo_beta
 
-    def project(self, grad, state, merge_dims=False, max_precond_dim=10000):
+    def project(self, grad, state, merge_dims: MergeDims = False,
+                max_precond_dim=10000):
         """Projects the gradient onto the eigenbases of the preconditioner."""
-        original_shape = grad.shape
-        if merge_dims:
-            if grad.dim() == 4 and self._data_format == "channels_last":
-                permuted_shape = grad.permute(0, 3, 1, 2).shape
-            grad = self.merge_dims(grad, max_precond_dim)
+        grad, merge_metadata = self._reshape_for_preconditioner(
+            grad, max_precond_dim, merge_dims
+        )
 
         for mat in state["Q"]:
             if len(mat) > 0:
@@ -235,20 +319,14 @@ class SOAP(optim.Optimizer):
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
 
-        if merge_dims:
-            if self._data_format == "channels_last" and len(original_shape) == 4:
-                grad = grad.reshape(permuted_shape).permute(0, 2, 3, 1)
-            else:
-                grad = grad.reshape(original_shape)
-        return grad
+        return self._restore_merged_dims(grad, merge_metadata)
 
-    def project_back(self, grad, state, merge_dims=False, max_precond_dim=10000):
+    def project_back(self, grad, state, merge_dims: MergeDims = False,
+                     max_precond_dim=10000):
         """Projects the gradient back to the original space."""
-        original_shape = grad.shape
-        if merge_dims:
-            if self._data_format == "channels_last" and grad.dim() == 4:
-                permuted_shape = grad.permute(0, 3, 1, 2).shape
-            grad = self.merge_dims(grad, max_precond_dim)
+        grad, merge_metadata = self._reshape_for_preconditioner(
+            grad, max_precond_dim, merge_dims
+        )
 
         for mat in state["Q"]:
             if len(mat) > 0:
@@ -257,15 +335,11 @@ class SOAP(optim.Optimizer):
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
 
-        if merge_dims:
-            if self._data_format == "channels_last" and len(original_shape) == 4:
-                grad = grad.reshape(permuted_shape).permute(0, 2, 3, 1)
-            else:
-                grad = grad.reshape(original_shape)
-        return grad
+        return self._restore_merged_dims(grad, merge_metadata)
 
     def update_preconditioner(self, grad, state,
-                              max_precond_dim=10000, merge_dims=False,
+                              max_precond_dim=10000,
+                              merge_dims: MergeDims = False,
                               precondition_1d=False):
         """Updates preconditioner matrices and eigenbases."""
         if state["Q"] is not None:
@@ -286,7 +360,7 @@ class SOAP(optim.Optimizer):
                 )
         else:
             if merge_dims:
-                new_grad = self.merge_dims(grad, max_precond_dim)
+                new_grad = self.merge_dims(grad, max_precond_dim, merge_dims)
                 for idx, sh in enumerate(new_grad.shape):
                     if sh <= max_precond_dim:
                         outer_product = torch.tensordot(
@@ -342,7 +416,8 @@ class SOAP(optim.Optimizer):
             final.append(Q)
         return final
 
-    def get_orthogonal_matrix_QR(self, state, max_precond_dim=10000, merge_dims=False):
+    def get_orthogonal_matrix_QR(self, state, max_precond_dim=10000,
+                                 merge_dims: MergeDims = False):
         """Computes eigenbases via one power iteration step + torch.linalg.qr.
 
         Runs qr on CPU when the tensor is on MPS (qr is not implemented for MPS).
@@ -350,13 +425,9 @@ class SOAP(optim.Optimizer):
         precond_list = state["GG"]
         orth_list = state["Q"]
 
-        orig_shape = state["exp_avg_sq"].shape
-        if self._data_format == "channels_last" and len(orig_shape) == 4:
-            permuted_shape = state["exp_avg_sq"].permute(0, 3, 1, 2).shape
-        if merge_dims:
-            exp_avg_sq = self.merge_dims(state["exp_avg_sq"], max_precond_dim)
-        else:
-            exp_avg_sq = state["exp_avg_sq"]
+        exp_avg_sq, merge_metadata = self._reshape_for_preconditioner(
+            state["exp_avg_sq"], max_precond_dim, merge_dims
+        )
 
         final = []
         for ind, (m, o) in enumerate(zip(precond_list, orth_list)):
@@ -383,11 +454,7 @@ class SOAP(optim.Optimizer):
                 Q = Q.to(dtype=m.data.dtype)
             final.append(Q)
 
-        if merge_dims:
-            if self._data_format == "channels_last" and len(orig_shape) == 4:
-                exp_avg_sq = exp_avg_sq.reshape(permuted_shape).permute(0, 2, 3, 1)
-            else:
-                exp_avg_sq = exp_avg_sq.reshape(orig_shape)
-
-        state["exp_avg_sq"] = exp_avg_sq
+        state["exp_avg_sq"] = self._restore_merged_dims(
+            exp_avg_sq, merge_metadata
+        )
         return final
