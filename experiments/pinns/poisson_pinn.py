@@ -33,9 +33,9 @@ which suits Gnome on MSE since its step self-anneals as the residual shrinks).
 
 Usage:
 
-    uv run -m experiments.poisson_pinn --optimizer gnome --seed 0
-    uv run -m experiments.poisson_pinn --optimizer soap  --seed 0
-    uv run -m experiments.poisson_pinn --optimizer adamw --seed 0
+    uv run -m experiments.pinns.poisson_pinn --optimizer gnome --seed 0
+    uv run -m experiments.pinns.poisson_pinn --optimizer soap  --seed 0
+    uv run -m experiments.pinns.poisson_pinn --optimizer adamw --seed 0
 """
 
 from __future__ import annotations
@@ -60,7 +60,7 @@ from gnome import (
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
-    ConcatEmbed,
+    ConcatEmbedding,
     FusedMLP,
     diverged,
     RunLogger,
@@ -85,7 +85,7 @@ class PINN(_SharedMLP):
     """Maps ``(x, y) → u`` via a plain tanh MLP."""
 
     def __init__(self, hidden: int = 64, depth: int = 5):
-        super().__init__(ConcatEmbed(2), hidden=hidden, depth=depth)
+        super().__init__(ConcatEmbedding(2), hidden=hidden, depth=depth)
 
 
 def build_model(
@@ -111,7 +111,8 @@ def build_model(
         return PINN(hidden=hidden, depth=depth)
     if arch == "fused":
         return FusedMLP(
-            ConcatEmbed(2), hidden=hidden, depth=depth, fuse_every=fuse_every,
+            ConcatEmbedding(2), hidden=hidden, depth=depth,
+            fuse_every=fuse_every,
         )
     raise ValueError(f"unknown arch: {arch}")
 

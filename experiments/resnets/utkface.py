@@ -19,9 +19,9 @@ Dataset: the full ``nu-delta/utkface`` (~23.7k images, columns
 ``datasets`` and cached under ``experiments/data/utkface_hf/`` (first call
 downloads and decodes — a minute or two, then reused).
 
-    uv run python -m experiments.utkface --optimizer gnome --seed 0
-    uv run python -m experiments.utkface --optimizer soap  --seed 0 --cosine-decay 0
-    uv run python -m experiments.utkface --optimizer adamw --seed 0 --cosine-decay 0
+    uv run python -m experiments.resnets.utkface --optimizer gnome --seed 0
+    uv run python -m experiments.resnets.utkface --optimizer soap  --seed 0 --cosine-decay 0
+    uv run python -m experiments.resnets.utkface --optimizer adamw --seed 0 --cosine-decay 0
 
 Gnome and SOAP convolution-factor partitions use the same modes as CIFAR-100:
 

@@ -929,9 +929,9 @@ git clone https://github.com/tmayer868/gnome-optimizer && cd gnome-optimizer
 uv sync --extra experiments
 
 uv run python -m experiments.ols_regression              --optimizer gnome --lr 0.1
-uv run python -m experiments.poisson_pinn                --optimizer gnome --steps 50000
-uv run python -m experiments.burgers_pinn                --optimizer gnome --steps 75000
-uv run python -m experiments.kuramoto_sivashinsky_pinn   --optimizer gnome --steps 100000
+uv run python -m experiments.pinns.poisson_pinn                --optimizer gnome --steps 50000
+uv run python -m experiments.pinns.burgers_pinn                --optimizer gnome --steps 75000
+uv run python -m experiments.pinns.kuramoto_sivashinsky_pinn   --optimizer gnome --steps 100000
 ```
 
 Swap `--optimizer soap` or `adamw` for the baselines. The schedule protocol from §1 is

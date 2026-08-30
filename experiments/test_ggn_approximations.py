@@ -1,7 +1,7 @@
 """Measure how well Gnome's separable bases diagonalize a Poisson PINN GGN.
 
 This experiment uses the same manufactured 2D Poisson problem as
-``experiments.poisson_pinn``:
+``experiments.pinns.poisson_pinn``:
 
     -Δu = 2π² sin(πx) sin(πy),  (x, y) in (0, 1)²,
       u = 0,                    (x, y) on the boundary.

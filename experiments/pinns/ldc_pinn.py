@@ -64,7 +64,7 @@ singularity; the difference between the two is a direct measurement of how
 much of the floor is the corner treatment.
 
 Reference: jaxpi's ``ldc_Re{Re}.mat`` (256x256 grid, auto-downloaded to
-``experiments/data/``). Relative L2 is reported on the stacked ``(u,v)``
+``experiments/reference_solutions/``). Relative L2 is reported on the stacked ``(u,v)``
 field, with the per-component errors logged alongside.
 
 All optimizers share the chosen network so the only variable is the
@@ -82,12 +82,12 @@ function each iteration — so its points are drawn once and held constant.
 
 Usage::
 
-    uv run -m experiments.ldc_pinn --optimizer gnome
-    uv run -m experiments.ldc_pinn --optimizer soap
-    uv run -m experiments.ldc_pinn --optimizer adamw+lbfgs
+    uv run -m experiments.pinns.ldc_pinn --optimizer gnome
+    uv run -m experiments.pinns.ldc_pinn --optimizer soap
+    uv run -m experiments.pinns.ldc_pinn --optimizer adamw+lbfgs
 
     # short smoke on the first rung only
-    uv run -m experiments.ldc_pinn --optimizer gnome \\
+    uv run -m experiments.pinns.ldc_pinn --optimizer gnome \\
         --re-stages 100 --stage-steps 2000 --log-every 200
 """
 
@@ -106,7 +106,7 @@ import torch.nn as nn
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.baselines import SOAP
 from experiments.common import (
-    ConcatEmbed,
+    ConcatEmbedding,
     DIVERGED_EXIT,
     ModifiedMLP,
     diverged,
@@ -115,7 +115,11 @@ from experiments.common import (
     current_lr,
     pick_device,
 )
-from experiments.common import MLP as _SharedMLP, ConcatEmbed
+from experiments.common import MLP as _SharedMLP
+from experiments.reference_solutions import (
+    REFERENCE_SOLUTIONS_DIR,
+    cached_reference_path,
+)
 
 
 EXPERIMENT = "ldc_pinn"
@@ -137,7 +141,7 @@ class MLP(_SharedMLP):
     """
 
     def __init__(self, hidden: int = 256, depth: int = 4):
-        super().__init__(ConcatEmbed(2), hidden=hidden, depth=depth,
+        super().__init__(ConcatEmbedding(2), hidden=hidden, depth=depth,
                          out_features=3)
 
 
@@ -153,7 +157,7 @@ def build_model(arch: str, hidden: int, depth: int) -> nn.Module:
         return MLP(hidden=hidden, depth=depth)
     if arch == "modified":
         return ModifiedMLP(
-            ConcatEmbed(2), hidden=hidden, depth=depth, out_features=3
+            ConcatEmbedding(2), hidden=hidden, depth=depth, out_features=3
         )
     raise ValueError(f"unknown arch: {arch}")
 
@@ -301,7 +305,7 @@ def term_losses(model: nn.Module, batch, nu: float) -> dict[str, float]:
 
 # ========================= Reference solution + eval =========================
 
-DEFAULT_REF_CACHE_DIR = "experiments/data"
+DEFAULT_REF_CACHE_DIR = str(REFERENCE_SOLUTIONS_DIR)
 REFERENCE_URL_FMT = (
     "https://raw.githubusercontent.com/PredictiveIntelligenceLab/jaxpi/"
     "pirate/examples/ldc/data/ldc_Re{re}.mat"
@@ -312,7 +316,8 @@ AVAILABLE_RE = (100, 400, 1000, 1600, 3200, 5000)
 def ldc_reference(re: int, cache_dir: str | None = None):
     """jaxpi's lid-driven-cavity reference at Reynolds number ``re``.
 
-    Auto-downloaded to ``experiments/data/``. Returns ``(x, y, u, v)`` with
+    Auto-downloaded to ``experiments/reference_solutions/``. Returns
+    ``(x, y, u, v)`` with
     shapes ``(nx,)``, ``(ny,)``, ``(nx, ny)``, ``(nx, ny)`` — the fields are
     indexed ``[x_index, y_index]`` (``meshgrid(..., indexing='ij')``).
 
@@ -326,6 +331,10 @@ def ldc_reference(re: int, cache_dir: str | None = None):
         )
     cache_dir = cache_dir or DEFAULT_REF_CACHE_DIR
     cache_path = os.path.join(cache_dir, f"ldc_Re{re}.mat")
+    if cache_dir == DEFAULT_REF_CACHE_DIR:
+        cache_path = cached_reference_path(
+            f"ldc_Re{re}.mat", [f"experiments/data/ldc_Re{re}.mat"]
+        )
     if not os.path.isfile(cache_path):
         os.makedirs(cache_dir, exist_ok=True)
         url = REFERENCE_URL_FMT.format(re=re)

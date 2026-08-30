@@ -2,8 +2,9 @@
 """Sequential batch runner for hyperparameter sweeps.
 
 Edit ``RUNS`` below — a list of dicts, one per run. Each dict must have an
-``"experiment"`` key naming ``experiments/<experiment>.py``; every other key
-becomes a CLI flag on that experiment (underscores → dashes, so
+``"experiment"`` key naming an experiment module by its leaf name (for
+example, ``"poisson_pinn"``); every other key becomes a CLI flag on that
+experiment (underscores → dashes, so
 ``"cosine_decay": 0.0`` → ``--cosine-decay 0.0``). A **bool** value is treated
 as a flag: ``True`` adds ``--key``, ``False`` omits it (for ``store_true`` /
 ``store_false`` args like ``--quiet`` or ``--no-augment``).
@@ -187,16 +188,47 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # separately and does NOT fail the batch.
 DIVERGED_EXIT = 3
 
+EXPERIMENT_PACKAGES = {
+    "pinns": {
+        "allen_cahn_pinn",
+        "burgers2d_pinn",
+        "burgers_pinn",
+        "convection_pinn",
+        "generate_allen_cahn_reference",
+        "helmholtz_pinn",
+        "inviscid_burgers_pinn",
+        "kdv_pinn",
+        "kuramoto_sivashinsky_pinn",
+        "ldc_pinn",
+        "navier_stokes_pinn",
+        "poisson5d_pinn",
+        "poisson_pinn",
+        "reaction_pinn",
+        "wave_pinn",
+    },
+    "resnets": {"cifar100", "cifar_rotation", "grating_freq", "utkface"},
+    "transformers": {"wikitext_gpt"},
+}
+
+
+def experiment_module(experiment: str) -> str:
+    """Resolve a sweep experiment leaf name to its importable module path."""
+    if "." in experiment:
+        return f"experiments.{experiment}"
+    for package, names in EXPERIMENT_PACKAGES.items():
+        if experiment in names:
+            return f"experiments.{package}.{experiment}"
+    return f"experiments.{experiment}"
+
 
 def build_cmd(run: dict) -> list[str]:
-    """Turn one run dict into a ``python -m experiments.<exp> --flag val ...``
-    argv list."""
+    """Turn one run dict into a ``python -m <module> --flag val ...`` argv list."""
     run = dict(run)  # don't mutate the caller's dict
     try:
         experiment = run.pop("experiment")
     except KeyError:
         raise SystemExit(f"run is missing the required 'experiment' key: {run}")
-    cmd = [sys.executable, "-u", "-m", f"experiments.{experiment}"]
+    cmd = [sys.executable, "-u", "-m", experiment_module(experiment)]
     for key, val in run.items():
         flag = "--" + key.replace("_", "-")
         if isinstance(val, bool):

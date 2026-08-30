@@ -51,21 +51,20 @@ constant, which suits Gnome on MSE since its step self-anneals as the
 residual shrinks).
 
 Reference: jaxpi's ``allen_cahn.mat`` (auto-downloaded to
-``experiments/data/``), the Chebfun solution for this benchmark.  A finer,
+``experiments/reference_solutions/``), the Chebfun solution for this benchmark. A finer,
 independently generated spectral reference can be selected with
-``--reference highres`` after running
-``uv run -m experiments.generate_allen_cahn_reference``.
+``--reference highres`` and is generated and cached automatically on first use.
 
 Usage:
 
-    uv run -m experiments.allen_cahn_pinn --optimizer gnome --arch modified
-    uv run -m experiments.allen_cahn_pinn --optimizer soap  --arch mlp
-    uv run -m experiments.allen_cahn_pinn --optimizer gnome \
+    uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --arch modified
+    uv run -m experiments.pinns.allen_cahn_pinn --optimizer soap  --arch mlp
+    uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome \
         --embed fourier --embed-dim 32 --embed-scale 10
-    uv run -m experiments.allen_cahn_pinn --optimizer gnome \
+    uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome \
         --diagnostics-every 500 --diagnostics-params 0
-    uv run -m experiments.allen_cahn_pinn --optimizer adamw --arch modified
-    uv run -m experiments.allen_cahn_pinn --optimizer gnome --embed periodic
+    uv run -m experiments.pinns.allen_cahn_pinn --optimizer adamw --arch modified
+    uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --embed periodic
 """
 
 from __future__ import annotations
@@ -92,9 +91,16 @@ from experiments.common import (
     cosine_scheduler,
     current_lr,
     pick_device,
-    FusedLinear
+    FusedLinear,
+    ConcatEmbedding,
+    PeriodicEmbedding,
+    TrainableFourierEmbedding,
 )
-from experiments.common import MLP as _SharedMLP, ConcatEmbed
+from experiments.common import MLP as _SharedMLP
+from experiments.reference_solutions import (
+    REFERENCE_SOLUTIONS_DIR,
+    cached_reference_path,
+)
 
 
 EXPERIMENT = "allen_cahn_pinn"
@@ -105,74 +111,19 @@ X_MIN, X_MAX = -1.0, 1.0
 
 # ========================= Models =========================
 
-class RawEmbed(nn.Module):
-    """``[t, x]`` — the raw coordinates. Periodicity must be imposed softly."""
-    out_dim = 2
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return torch.cat([t, x], dim=1)
-
-
-class PeriodicEmbed(nn.Module):
-    """``[t, cos(πx), sin(πx)]`` — exactly period-2 in x.
-
-    The domain ``[-1, 1]`` has width ``L = 2``, so ``k = 2π/L = π``. Any
-    function of these features repeats with period ``L`` by construction,
-    so ``u`` and *all* of its x-derivatives match at the endpoints to
-    machine precision. That makes the soft BC block redundant.
-    """
-    out_dim = 3
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        k = 2.0 * math.pi / (X_MAX - X_MIN)
-        return torch.cat([t, torch.cos(k * x), torch.sin(k * x)], dim=1)
-
-
-class FourierEmbed(nn.Module):
-    """Trainable Fourier features over raw ``(t, x)``: ``[sin(zB), cos(zB)]``
-    with ``z = [t, x]`` and ``B`` initialized ``~ N(0, scale²)``.
-
-    ``B`` is an ``nn.Parameter``, so the frequencies are *learned* rather
-    than frozen at init (unlike Tancik et al. 2020 and jaxpi, which both
-    keep them fixed). ``scale`` therefore sets the starting bandwidth, not
-    the final one — the network can migrate frequencies during training. It
-    still matters as an initialization: too high and the loss surface starts
-    rough enough that the optimizer struggles to move ``B`` usefully at all.
-
-    Because the projection is over raw ``x`` rather than the periodic
-    features, the frequencies are not multiples of ``k = 2π/L`` and the
-    network is **not** exactly period-2 in x. The soft BC block is therefore
-    kept for this embedding (three blocks, as with ``--embed none``).
-    """
-
-    out_dim: int
-
-    def __init__(self, embed_dim: int = 256, scale: float = 10.0):
-        super().__init__()
-        if embed_dim % 2 != 0:
-            raise ValueError(f"--embed-dim must be even, got {embed_dim}")
-        if scale <= 0.0:
-            raise ValueError(f"--embed-scale must be positive, got {scale}")
-        self.out_dim = embed_dim + 2
-        # sin and cos of each projection, hence embed_dim // 2 columns.
-        weights = torch.randn(2, embed_dim // 2) * scale
-        self.register_buffer("B", weights)
-
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        raw_vars = torch.cat([t, x], dim=1)
-        p = raw_vars @ self.B
-        return torch.cat([raw_vars, torch.sin(p), torch.cos(p)], dim=1)
-
 
 def build_embedding(embed: str, embed_dim: int = 256,
                     scale: float = 10.0) -> nn.Module:
     if embed == "none":
-        return RawEmbed()
+        return ConcatEmbedding(2)
     if embed == "periodic":
-        return PeriodicEmbed()
+        return PeriodicEmbedding(
+            2, wavenumber=2.0 * math.pi / (X_MAX - X_MIN)
+        )
     if embed == "fourier":
-        return FourierEmbed(embed_dim, scale)
+        return TrainableFourierEmbedding(
+            2, embed_dim, scale, include_input=True
+        )
     raise ValueError(f"unknown embedding: {embed}")
 
 
@@ -238,7 +189,7 @@ def bc_residual(model: nn.Module, t: torch.Tensor) -> torch.Tensor:
     ``u_x(t, -1) - u_x(t, 1)``, stacked (C¹ periodicity).
 
     Only used with ``--embed none``; the periodic embedding makes this
-    identically zero (see ``PeriodicEmbed``).
+    identically zero (see ``PeriodicEmbedding``).
     """
     x_l = torch.full_like(t, X_MIN, requires_grad=True)
     x_r = torch.full_like(t, X_MAX, requires_grad=True)
@@ -300,7 +251,7 @@ def term_losses(model: nn.Module, batch) -> dict[str, float]:
 
 # ========================= Reference solution + eval =========================
 
-DEFAULT_REF_CACHE_DIR = "experiments/data"
+DEFAULT_REF_CACHE_DIR = str(REFERENCE_SOLUTIONS_DIR)
 HIGHRES_REFERENCE_NAME = "allen_cahn_highres.mat"
 REFERENCE_URL = (
     "https://raw.githubusercontent.com/PredictiveIntelligenceLab/jaxpi/"
@@ -315,9 +266,8 @@ def allen_cahn_reference(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Load a jaxpi or independently generated Allen-Cahn reference.
 
-    The jaxpi reference is downloaded on demand.  The high-resolution
-    reference must first be generated with
-    ``python -m experiments.generate_allen_cahn_reference``.  Returns
+    The jaxpi reference is downloaded on demand. The high-resolution spectral
+    reference is generated and cached on demand. Returns
     ``(t, x, u)`` as CPU float64 tensors with shapes ``(nt,)``, ``(nx,)``,
     ``(nt, nx)`` and ``u[0]`` the initial condition.
     """
@@ -329,18 +279,25 @@ def allen_cahn_reference(
         filename = (
             "allen_cahn.mat" if reference == "jaxpi" else HIGHRES_REFERENCE_NAME
         )
-        cache_path = os.path.join(DEFAULT_REF_CACHE_DIR, filename)
+        cache_path = cached_reference_path(
+            filename, [os.path.join("experiments/data", filename)]
+        )
     if not os.path.isfile(cache_path):
         if reference == "highres":
-            raise FileNotFoundError(
-                f"High-resolution reference not found at {cache_path!r}. "
-                "Generate it with: uv run -m "
-                "experiments.generate_allen_cahn_reference"
+            from experiments.pinns.generate_allen_cahn_reference import (
+                generate_allen_cahn_reference,
             )
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        print(f"[{EXPERIMENT}] downloading reference {REFERENCE_URL} ...",
-              flush=True)
-        urllib.request.urlretrieve(REFERENCE_URL, cache_path)
+            print(
+                f"[{EXPERIMENT}] high-resolution reference missing; "
+                "generating it now...",
+                flush=True,
+            )
+            generate_allen_cahn_reference(cache_path)
+        else:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            print(f"[{EXPERIMENT}] downloading reference {REFERENCE_URL} ...",
+                  flush=True)
+            urllib.request.urlretrieve(REFERENCE_URL, cache_path)
     data = scipy.io.loadmat(cache_path)
     u = torch.as_tensor(data["usol"], dtype=torch.float64)
     t = torch.as_tensor(data["t"].flatten(), dtype=torch.float64)
@@ -515,8 +472,9 @@ def parse_args() -> argparse.Namespace:
         default="jaxpi",
         help="Reference used for rel_l2. 'jaxpi' is the published 201x512 "
              "Chebfun table and remains the compatibility default. "
-             "'highres' uses experiments/data/allen_cahn_highres.mat, "
-             "generated by experiments.generate_allen_cahn_reference.",
+             "'highres' uses experiments/reference_solutions/"
+             "allen_cahn_highres.mat and generates it automatically when "
+             "missing.",
     )
     p.add_argument("--diagnostics-every", type=int, default=0,
                    help="Log Gnome's internal state — curvature spectrum, LM "

@@ -66,11 +66,11 @@ reproduce 3881 parameters on the nose.
 
 Usage::
 
-    uv run -m experiments.burgers2d_pinn --optimizer gnome --seed 0
-    uv run -m experiments.burgers2d_pinn --optimizer soap  --seed 0
-    uv run -m experiments.burgers2d_pinn --optimizer adamw --seed 0
+    uv run -m experiments.pinns.burgers2d_pinn --optimizer gnome --seed 0
+    uv run -m experiments.pinns.burgers2d_pinn --optimizer soap  --seed 0
+    uv run -m experiments.pinns.burgers2d_pinn --optimizer adamw --seed 0
     # paper protocol (20k iters, float64):
-    uv run -m experiments.burgers2d_pinn --optimizer gnome --dtype float64
+    uv run -m experiments.pinns.burgers2d_pinn --optimizer gnome --dtype float64
 """
 
 from __future__ import annotations
@@ -93,7 +93,7 @@ from experiments.common import (
     current_lr,
     pick_device,
 )
-from experiments.common import MLP as _SharedMLP, ConcatEmbed
+from experiments.common import MLP as _SharedMLP, ConcatEmbedding
 
 
 EXPERIMENT = "burgers2d_pinn"
@@ -132,7 +132,7 @@ class PINN(_SharedMLP):
     """
 
     def __init__(self, hidden: int = 20, depth: int = 11):
-        super().__init__(ConcatEmbed(3), hidden=hidden, depth=depth)
+        super().__init__(ConcatEmbedding(3), hidden=hidden, depth=depth)
 
 
 # ========================= Residuals =========================

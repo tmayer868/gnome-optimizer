@@ -47,11 +47,11 @@ estimator.
 
 Usage:
 
-    uv run -m experiments.convection_pinn --optimizer gnome --beta 40
-    uv run -m experiments.convection_pinn --optimizer adamw --beta 40
-    uv run -m experiments.convection_pinn --optimizer gnome --beta 40 \\
+    uv run -m experiments.pinns.convection_pinn --optimizer gnome --beta 40
+    uv run -m experiments.pinns.convection_pinn --optimizer adamw --beta 40
+    uv run -m experiments.pinns.convection_pinn --optimizer gnome --beta 40 \\
         --embed periodic --arch modified
-    uv run -m experiments.convection_pinn --optimizer gnome \\
+    uv run -m experiments.pinns.convection_pinn --optimizer gnome \\
         --arch fused-modified --fuse-every 2 --depth 6
 """
 
@@ -70,7 +70,7 @@ from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
-    ConcatEmbed,
+    ConcatEmbedding,
     FusedMLP,
     FusedModifiedMLP,
     MLP,
@@ -80,6 +80,7 @@ from experiments.common import (
     cosine_scheduler,
     current_lr,
     pick_device,
+    PeriodicEmbedding,
 )
 
 
@@ -91,42 +92,14 @@ X_MIN, X_MAX = 0.0, 2.0 * math.pi
 
 # ========================= Models =========================
 
-class RawEmbed(nn.Module):
-    """``[t, x]`` — the raw coordinates. Periodicity must be imposed softly."""
-    out_dim = 2
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return torch.cat([t, x], dim=1)
-
-
-class PeriodicEmbed(nn.Module):
-    """``[t, cos(x), sin(x)]`` — exactly 2π-periodic in x.
-
-    The domain has width ``L = 2π``, so the fundamental wavenumber is
-    ``k = 2π/L = 1`` and the raw ``cos``/``sin`` are already the right
-    features. Any function of these repeats with period ``L`` by
-    construction, so the soft BC block is redundant and is dropped.
-
-    Worth noting for this problem specifically: the exact solution
-    ``sin(x - βt) = sin(x)cos(βt) - cos(x)sin(βt)`` is *linear* in these two
-    features with t-dependent coefficients. The periodic embedding therefore
-    hands the network a basis in which the answer is unusually easy to
-    express — which is a real confound when comparing against published
-    numbers that use raw ``(t, x)``. ``--embed none`` is the default for
-    that reason.
-    """
-    out_dim = 3
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        k = 2.0 * math.pi / (X_MAX - X_MIN)
-        return torch.cat([t, torch.cos(k * x), torch.sin(k * x)], dim=1)
-
 
 def build_embedding(embed: str) -> nn.Module:
     if embed == "none":
-        return RawEmbed()
+        return ConcatEmbedding(2)
     if embed == "periodic":
-        return PeriodicEmbed()
+        return PeriodicEmbedding(
+            2, wavenumber=2.0 * math.pi / (X_MAX - X_MIN)
+        )
     raise ValueError(f"unknown embedding: {embed}")
 
 

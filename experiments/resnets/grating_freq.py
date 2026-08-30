@@ -32,9 +32,9 @@ Three things are randomized per sample, each closing a specific shortcut:
                the product and brings that to ~0.15, so most of the task now
                requires estimating *where* the energy sits, not how much.
 
-    uv run python -m experiments.grating_freq --optimizer gnome --seed 0
-    uv run python -m experiments.grating_freq --optimizer soap  --seed 0 --cosine-decay 0
-    uv run python -m experiments.grating_freq --optimizer adamw --seed 0 --cosine-decay 0
+    uv run python -m experiments.resnets.grating_freq --optimizer gnome --seed 0
+    uv run python -m experiments.resnets.grating_freq --optimizer soap  --seed 0 --cosine-decay 0
+    uv run python -m experiments.resnets.grating_freq --optimizer adamw --seed 0 --cosine-decay 0
 """
 
 from __future__ import annotations

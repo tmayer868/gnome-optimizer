@@ -55,11 +55,11 @@ memory), so at the paper's N=3500 it is a Thunder/CUDA job, not a laptop one.
 
 Usage::
 
-    uv run -m experiments.poisson5d_pinn --optimizer gnome --seed 0 --lr 1e-2
-    uv run -m experiments.poisson5d_pinn --optimizer soap  --seed 0
-    uv run -m experiments.poisson5d_pinn --optimizer adamw --seed 0
+    uv run -m experiments.pinns.poisson5d_pinn --optimizer gnome --seed 0 --lr 1e-2
+    uv run -m experiments.pinns.poisson5d_pinn --optimizer soap  --seed 0
+    uv run -m experiments.pinns.poisson5d_pinn --optimizer adamw --seed 0
     # reference natural-gradient line (GPU/float64):
-    uv run -m experiments.poisson5d_pinn --optimizer engdw --lr 5.2289e-2
+    uv run -m experiments.pinns.poisson5d_pinn --optimizer engdw --lr 5.2289e-2
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ from torch.func import functional_call, jacfwd, jacrev, vmap
 
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.common import FusedLinear
-from experiments.common import MLP as _SharedMLP, ConcatEmbed
+from experiments.common import MLP as _SharedMLP, ConcatEmbedding
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
@@ -106,7 +106,7 @@ class PINN(_SharedMLP):
     """
 
     def __init__(self, d_in: int, hidden: int = 64, depth: int = 5):
-        super().__init__(ConcatEmbed(d_in), hidden=hidden, depth=depth)
+        super().__init__(ConcatEmbedding(d_in), hidden=hidden, depth=depth)
 
 
 # ========================= Exact solution + forcing =========================

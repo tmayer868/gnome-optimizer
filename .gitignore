@@ -1,6 +1,11 @@
 # Experiment outputs and cached data (regenerated / re-downloaded on demand)
 runs/
 experiments/data/
+experiments/reference_solutions/*.mat
+experiments/reference_solutions/*.pt
+experiments/reference_solutions/*.download
+experiments/reference_solutions/*.tmp
+/kdv.mat
 
 # Python
 __pycache__/

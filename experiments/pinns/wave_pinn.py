@@ -35,10 +35,11 @@ Architecture options (all share the optimizer, so it's the only variable):
       does NOT enforce wave's *Dirichlet* BC (cos(πx)≠0 at the boundaries);
       it only helps spectrally. It's the embedding that makes sense for the
       *periodic* AC problem.
-    - ``fourier``: fixed random Fourier features (Tancik et al. 2020) of
-      ``(t, x)`` — ``[sin(zB), cos(zB)]`` with ``B ~ N(0, scale²)``. The
-      spectral aid the wave solution's high modes want; ``--fourier-scale``
-      is the key knob (jaxpi uses 10 for wave). ``B`` is fixed, not trained.
+    - ``fourier``: trainable Fourier features of ``(t, x)`` —
+      ``[sin(zB), cos(zB)]`` with ``B`` initialized from ``N(0, scale²)``.
+      The spectral aid the wave solution's high modes want;
+      ``--fourier-scale`` controls the initial frequency spread (jaxpi uses
+      10 for wave), after which optimization can move the frequencies.
 * ``--hard-bc`` — enforce the Dirichlet BC by construction via the output
   transform ``u = sin(πx)·N(t, x)`` (vanishes at x = 0, 1). When set, the
   soft ``bc`` loss block is dropped (it would be identically zero). This is
@@ -51,9 +52,9 @@ its Gauss-Newton step self-anneals). Reference: analytic (no download).
 
 Usage:
 
-    uv run -m experiments.wave_pinn --optimizer gnome --arch modified \\
+    uv run -m experiments.pinns.wave_pinn --optimizer gnome --arch modified \\
         --embed fourier --fourier-scale 10 --hard-bc
-    uv run -m experiments.wave_pinn --optimizer soap  --arch mlp --embed none
+    uv run -m experiments.pinns.wave_pinn --optimizer soap  --arch mlp --embed none
 """
 
 from __future__ import annotations
@@ -79,9 +80,12 @@ from experiments.common import (
     pick_device,
 )
 from experiments.common import (
+    ConcatEmbedding,
     MLP as _SharedMLP,
     FusedMLP,
     FusedModifiedMLP,
+    PeriodicEmbedding,
+    TrainableFourierEmbedding,
 )
 
 
@@ -104,60 +108,18 @@ SECOND_MODE = 2.0 * C_SPEED
 
 # ========================= Input embeddings =========================
 
-class NoEmbed(nn.Module):
-    """Raw ``(t, x)``."""
-    out_dim = 2
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return torch.cat([t, x], dim=1)
-
-
-class PeriodicEmbed(nn.Module):
-    """``[t, cos(πx), sin(πx), cos(πt), sin(πt)]`` — period-2 in x (spectral aid on wave; it
-    does not enforce the Dirichlet BC)."""
-    n_freq = 3
-    out_dim = 2 + 4 * (n_freq-1)
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        in_features = [t, x]
-        in_features += [torch.sin(n * math.pi * x) for n in range(1, self.n_freq)]
-        in_features += [torch.cos(n * math.pi * x) for n in range(1, self.n_freq)]
-        in_features += [torch.cos(n * math.pi * t) for n in range(1, self.n_freq)]
-        in_features += [torch.sin(n * math.pi * t) for n in range(1, self.n_freq)]
-        return torch.cat(in_features, dim=1)
-
-
-class FourierEmbed(nn.Module):
-    """Random Fourier features (Tancik et al. 2020): embeds ``(t, x)`` as
-    ``[sin(zB), cos(zB), t, x]``. Total output dimension matches ``embed_dim``.
-    """
-
-    def __init__(self, embed_dim: int = 128, scale: float = 2.0):
-        super().__init__()
-        assert embed_dim % 2 == 0, "fourier embed_dim must be even"
-        self.out_dim = embed_dim
-
-        # Calculate the size needed for the projection
-        # We subtract 2 because t and x (2 features) are concatenated at the end
-        proj_dim = (embed_dim) // 2
-
-        # 1. Correct logic: Pass string name first, do NOT assign the function output to a variable
-        weights = torch.randn(2, embed_dim // 2) * scale
-        self.register_buffer("B", weights)
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        # Assuming t and x have shape (batch_size, 1)
-        p = torch.cat([t, x], dim=1) @ self.B  # self.B is now safely available
-        return torch.cat([torch.sin(p), torch.cos(p)], dim=1)
-
 def build_embedding(embed: str, fourier_dim: int, fourier_scale: float
                     ) -> nn.Module:
     if embed == "none":
-        return NoEmbed()
+        return ConcatEmbedding(2)
     if embed == "periodic":
-        return PeriodicEmbed()
+        return PeriodicEmbedding(
+            2, n_harmonics=3, wavenumber=math.pi
+        )
     if embed == "fourier":
-        return FourierEmbed(fourier_dim, fourier_scale)
+        return TrainableFourierEmbedding(
+            2, fourier_dim, fourier_scale
+        )
     raise ValueError(f"unknown embed: {embed}")
 
 
@@ -432,13 +394,14 @@ def parse_args() -> argparse.Namespace:
                    help="Network: plain tanh MLP or the gated modified MLP.")
     p.add_argument("--embed", choices=["none", "periodic", "fourier"],
                    default="fourier",
-                   help="Input embedding. 'fourier' = fixed random Fourier "
+                   help="Input embedding. 'fourier' = trainable Fourier "
                         "features (the spectral aid wave wants).")
     p.add_argument("--fourier-dim", type=int, default=128,
                    help="Fourier embedding output dim (even). --embed fourier.")
     p.add_argument("--fourier-scale", type=float, default=8.0,
-                   help="Fourier frequency spread (B ~ N(0, scale²)). THE knob "
-                        "— jaxpi uses ~10 for wave; sweep it. --embed fourier.")
+                   help="Initial Fourier frequency spread "
+                        "(B ~ N(0, scale²)); B is trained with the model. "
+                        "jaxpi uses ~10 for wave. --embed fourier.")
     p.add_argument("--hard-bc", action="store_true",
                    help="Enforce Dirichlet u=0 by construction via "
                         "u = sin(πx)·N(t,x); drops the soft bc loss block.")
@@ -530,6 +493,7 @@ def train(args: argparse.Namespace) -> str:
         "embed": args.embed,
         "fourier_dim": args.fourier_dim if args.embed == "fourier" else None,
         "fourier_scale": args.fourier_scale if args.embed == "fourier" else None,
+        "fourier_trainable": args.embed == "fourier",
         "hard_bc": args.hard_bc,
         "steps": args.steps,
         "hidden": args.hidden,

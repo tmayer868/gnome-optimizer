@@ -21,11 +21,11 @@ kernels, not just Linear layers) on real data, without a fragile external
 dataset — CIFAR-100 downloads once via torchvision and is cached. The class
 labels are discarded: only the pixels matter, since the target is the rotation
 angle. (This used to pull CIFAR-10; same images at heart, and CIFAR-100 shares
-the cache with ``experiments/cifar100.py``.)
+the cache with ``experiments/resnets/cifar100.py``.)
 
-    uv run python -m experiments.cifar_rotation --optimizer gnome --seed 0
-    uv run python -m experiments.cifar_rotation --optimizer soap  --seed 0 --cosine-decay 0
-    uv run python -m experiments.cifar_rotation --optimizer adamw --seed 0 --cosine-decay 0
+    uv run python -m experiments.resnets.cifar_rotation --optimizer gnome --seed 0
+    uv run python -m experiments.resnets.cifar_rotation --optimizer soap  --seed 0 --cosine-decay 0
+    uv run python -m experiments.resnets.cifar_rotation --optimizer adamw --seed 0 --cosine-decay 0
 
 Gnome and SOAP convolution-factor partitions use the same modes as CIFAR-100:
 

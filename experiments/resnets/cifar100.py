@@ -30,10 +30,10 @@ where Gnome's step self-anneals as the residual shrinks: cross-entropy
 gradients do not self-anneal, since the Fisher stays O(1) at the optimum rather
 than going to zero.
 
-    uv run python -m experiments.cifar100 --optimizer gnome_hutchinson --seed 0
-    uv run python -m experiments.cifar100 --optimizer gnome_fisher     --seed 0
-    uv run python -m experiments.cifar100 --optimizer soap             --seed 0
-    uv run python -m experiments.cifar100 --optimizer adamw            --seed 0
+    uv run python -m experiments.resnets.cifar100 --optimizer gnome_hutchinson --seed 0
+    uv run python -m experiments.resnets.cifar100 --optimizer gnome_fisher     --seed 0
+    uv run python -m experiments.resnets.cifar100 --optimizer soap             --seed 0
+    uv run python -m experiments.resnets.cifar100 --optimizer adamw            --seed 0
 
 Gnome's and SOAP's convolution-factor partition can be selected independently:
 

@@ -28,10 +28,10 @@ Requires ``datasets`` + ``transformers`` (the ``llm`` extra):
 
 Usage:
 
-    uv run -m experiments.wikitext_gpt --optimizer gnome_hutchinson --seed 0
-    uv run -m experiments.wikitext_gpt --optimizer gnome_fisher     --seed 0
-    uv run -m experiments.wikitext_gpt --optimizer soap             --seed 0
-    uv run -m experiments.wikitext_gpt --optimizer adamw            --seed 0
+    uv run -m experiments.transformers.wikitext_gpt --optimizer gnome_hutchinson --seed 0
+    uv run -m experiments.transformers.wikitext_gpt --optimizer gnome_fisher     --seed 0
+    uv run -m experiments.transformers.wikitext_gpt --optimizer soap             --seed 0
+    uv run -m experiments.transformers.wikitext_gpt --optimizer adamw            --seed 0
 
 The first run downloads ~500MB of WikiText-103 and tokenizes it (~5
 minutes); HuggingFace caches the tokenized result so re-runs skip both.

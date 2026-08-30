@@ -98,8 +98,9 @@ See the PINN experiments and [`docs/method.md`](docs/method.md) §8 for details.
 
 ## Running the experiments
 
-Each experiment is a module under `experiments/`, run from the repo root. Every run streams
-an append-only JSONL log to `runs/<experiment>/<run_id>.jsonl` (see below).
+Each experiment is a module under `experiments/`, grouped into `pinns`, `resnets`, and
+`transformers` where applicable, and run from the repo root. Every run streams an
+append-only JSONL log to `runs/<experiment>/<run_id>.jsonl` (see below).
 
 **Regression** (runs on CPU/MPS/GPU; needs the `experiments` extra for plots):
 
@@ -115,10 +116,10 @@ a decay schedule.
 downloaded automatically on first run):
 
 ```bash
-uv run python -m experiments.poisson_pinn                --optimizer gnome --steps 50000
-uv run python -m experiments.burgers_pinn                --optimizer gnome --steps 75000
-uv run python -m experiments.kuramoto_sivashinsky_pinn   --optimizer gnome --steps 100000
-uv run python -m experiments.navier_stokes_pinn          --optimizer gnome --steps 200000
+uv run python -m experiments.pinns.poisson_pinn                --optimizer gnome --steps 50000
+uv run python -m experiments.pinns.burgers_pinn                --optimizer gnome --steps 75000
+uv run python -m experiments.pinns.kuramoto_sivashinsky_pinn   --optimizer gnome --steps 100000
+uv run python -m experiments.pinns.navier_stokes_pinn          --optimizer gnome --steps 200000
 ```
 
 Each takes `--optimizer gnome|soap|adamw`. **Schedule protocol:** every optimizer, Gnome
@@ -129,7 +130,7 @@ warmup-then-constant, which is where Gnome is happiest on MSE since its step alr
 self-anneals. So a plain run already gets the standard cosine decay:
 
 ```bash
-uv run python -m experiments.poisson_pinn --optimizer soap --steps 50000
+uv run python -m experiments.pinns.poisson_pinn --optimizer soap --steps 50000
 ```
 
 Set `--cosine-decay 1` to disable decay entirely (raw SOAP/AdamW), or e.g. `0.1` to decay to
@@ -138,7 +139,7 @@ Set `--cosine-decay 1` to disable decay entirely (raw SOAP/AdamW), or e.g. `0.1`
 **WikiText-103 GPT** (needs the `llm` extra + a GPU; downloads the dataset on first run):
 
 ```bash
-uv run python -m experiments.wikitext_gpt --optimizer gnome_hutchinson --max-steps 30000
+uv run python -m experiments.transformers.wikitext_gpt --optimizer gnome_hutchinson --max-steps 30000
 ```
 
 `--optimizer` is `gnome_hutchinson`, `gnome_fisher`, `soap`, or `adamw`. Cross-entropy

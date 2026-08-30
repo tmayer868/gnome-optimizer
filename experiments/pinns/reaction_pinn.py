@@ -34,10 +34,10 @@ x-derivatives, so only C0 agreement is part of the canonical problem.
 
 Usage:
 
-    uv run -m experiments.reaction_pinn --optimizer gnome --rho 5
-    uv run -m experiments.reaction_pinn --optimizer adamw --rho 5
-    uv run -m experiments.reaction_pinn --optimizer soap --rho 10
-    uv run -m experiments.reaction_pinn --optimizer gnome --rho 5 \
+    uv run -m experiments.pinns.reaction_pinn --optimizer gnome --rho 5
+    uv run -m experiments.pinns.reaction_pinn --optimizer adamw --rho 5
+    uv run -m experiments.pinns.reaction_pinn --optimizer soap --rho 10
+    uv run -m experiments.pinns.reaction_pinn --optimizer gnome --rho 5 \
         --arch fused-modified --fuse-every 2 --depth 6
 """
 
@@ -64,6 +64,8 @@ from experiments.common import (
     current_lr,
     diverged,
     pick_device,
+    ConcatEmbedding,
+    PeriodicEmbedding,
 )
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
 
@@ -100,29 +102,12 @@ def exact_solution(
 
 # ========================= Models =========================
 
-class RawEmbed(nn.Module):
-    """Raw ``[t, x]`` inputs; periodicity is imposed as a soft block."""
-
-    out_dim = 2
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return torch.cat([t, x], dim=1)
-
-
-class PeriodicEmbed(nn.Module):
-    """``[t, cos(x), sin(x)]``; exactly 2*pi-periodic in x."""
-
-    out_dim = 3
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return torch.cat([t, torch.cos(x), torch.sin(x)], dim=1)
-
 
 def build_embedding(name: str) -> nn.Module:
     if name == "none":
-        return RawEmbed()
+        return ConcatEmbedding(2)
     if name == "periodic":
-        return PeriodicEmbed()
+        return PeriodicEmbedding(2, wavenumber=1.0)
     raise ValueError(f"unknown embedding: {name}")
 
 

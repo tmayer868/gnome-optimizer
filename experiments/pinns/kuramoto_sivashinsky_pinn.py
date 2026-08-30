@@ -68,10 +68,10 @@ phase, its points are drawn once and held constant.
 
 Usage:
 
-    uv run -m experiments.kuramoto_sivashinsky_pinn --optimizer gnome --seed 0
-    uv run -m experiments.kuramoto_sivashinsky_pinn --optimizer soap  --seed 0
-    uv run -m experiments.kuramoto_sivashinsky_pinn --optimizer adamw+lbfgs
-    uv run -m experiments.kuramoto_sivashinsky_pinn --optimizer gnome \\
+    uv run -m experiments.pinns.kuramoto_sivashinsky_pinn --optimizer gnome --seed 0
+    uv run -m experiments.pinns.kuramoto_sivashinsky_pinn --optimizer soap  --seed 0
+    uv run -m experiments.pinns.kuramoto_sivashinsky_pinn --optimizer adamw+lbfgs
+    uv run -m experiments.pinns.kuramoto_sivashinsky_pinn --optimizer gnome \\
         --arch modified --embed periodic
 """
 
@@ -96,8 +96,14 @@ from experiments.common import (
     cosine_scheduler,
     current_lr,
     pick_device,
+    ConcatEmbedding,
+    PeriodicEmbedding,
 )
-from experiments.common import MLP as _SharedMLP, ConcatEmbed
+from experiments.common import MLP as _SharedMLP
+from experiments.reference_solutions import (
+    REFERENCE_SOLUTIONS_DIR,
+    cached_reference_path,
+)
 
 
 EXPERIMENT = "kuramoto_sivashinsky_pinn"
@@ -109,33 +115,14 @@ L_DOMAIN = X_MAX - X_MIN
 
 # ========================= Model =========================
 
-class RawEmbed(nn.Module):
-    """``[t, x]`` — the raw coordinates. Periodicity must be imposed softly."""
-    out_dim = 2
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return torch.cat([t, x], dim=1)
-
-
-class PeriodicEmbed(nn.Module):
-    """``[t, cos(2πx/L), sin(2πx/L)]`` — exactly period-L in x.
-
-    Any function of these features repeats with period ``L = X_MAX - X_MIN``
-    by construction, so ``u`` and *all* of its x-derivatives match at the
-    endpoints to machine precision. That makes the soft BC block redundant.
-    """
-    out_dim = 3
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        k = 2.0 * math.pi / L_DOMAIN
-        return torch.cat([t, torch.cos(k * x), torch.sin(k * x)], dim=1)
-
 
 def build_embedding(embed: str) -> nn.Module:
     if embed == "none":
-        return RawEmbed()
+        return ConcatEmbedding(2)
     if embed == "periodic":
-        return PeriodicEmbed()
+        return PeriodicEmbedding(
+            2, wavenumber=2.0 * math.pi / L_DOMAIN
+        )
     raise ValueError(f"unknown embedding: {embed}")
 
 
@@ -199,7 +186,7 @@ def bc_residual(model: nn.Module, t: torch.Tensor) -> torch.Tensor:
     higher derivatives to match interior values.
 
     Only used with ``--embed none``; the periodic embedding makes this
-    identically zero (see ``PeriodicEmbed``).
+    identically zero (see ``PeriodicEmbedding``).
     """
     x_l = torch.full_like(t, X_MIN, requires_grad=True)
     x_r = torch.full_like(t, X_MAX, requires_grad=True)
@@ -257,7 +244,7 @@ def term_losses(model: nn.Module, batch, use_bc: bool = True
 
 # ========================= Reference solution + eval =========================
 
-DEFAULT_REF_CACHE_DIR = "experiments/data"
+DEFAULT_REF_CACHE_DIR = str(REFERENCE_SOLUTIONS_DIR)
 
 
 def ks_reference(
@@ -281,8 +268,14 @@ def ks_reference(
     ``(nt, nx)`` — CPU float32, snapshots at ``t = i·(T_MAX/(nt-1))``.
     """
     if cache_path is None:
-        cache_path = os.path.join(
-            DEFAULT_REF_CACHE_DIR, f"ks_reference_nx{nx}_nt{nt}.pt"
+        filename = f"ks_reference_nx{nx}_nt{nt}_dt{dt:.12g}.pt"
+        legacy_paths = (
+            [os.path.join("experiments/data", f"ks_reference_nx{nx}_nt{nt}.pt")]
+            if dt == 0.025
+            else []
+        )
+        cache_path = cached_reference_path(
+            filename, legacy_paths
         )
     if cache_path and os.path.isfile(cache_path):
         blob = torch.load(cache_path, weights_only=True)

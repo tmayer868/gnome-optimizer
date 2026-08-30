@@ -22,7 +22,7 @@ loss-weight tuning (all block weights default to 1).
 Reference data is Raissi's ``cylinder_nektar_wake.mat`` from
 ``maziarraissi/PINNs`` on GitHub — DNS at Re=100, 5000 spatial points × 200
 time snapshots in the wake region ``x ∈ [1, 8], y ∈ [-2, 2]``. Downloaded to
-``experiments/data/`` on first run and cached.
+``experiments/reference_solutions/`` on first run and cached.
 
 Network outputs ``(u, v, p)`` directly (no streamfunction parameterization),
 so continuity enters as an explicit residual block — giving Gnome the harder
@@ -34,9 +34,9 @@ which suits Gnome since its step self-anneals as the residual shrinks).
 
 Usage:
 
-    uv run -m experiments.navier_stokes_pinn --optimizer gnome --seed 0
-    uv run -m experiments.navier_stokes_pinn --optimizer soap  --seed 0
-    uv run -m experiments.navier_stokes_pinn --optimizer adamw --seed 0
+    uv run -m experiments.pinns.navier_stokes_pinn --optimizer gnome --seed 0
+    uv run -m experiments.pinns.navier_stokes_pinn --optimizer soap  --seed 0
+    uv run -m experiments.pinns.navier_stokes_pinn --optimizer adamw --seed 0
 """
 
 from __future__ import annotations
@@ -60,7 +60,8 @@ from experiments.common import (
     current_lr,
     pick_device,
 )
-from experiments.common import MLP as _SharedMLP, ConcatEmbed
+from experiments.common import MLP as _SharedMLP, ConcatEmbedding
+from experiments.reference_solutions import cached_reference_path, reference_path
 
 
 EXPERIMENT = "navier_stokes_pinn"
@@ -78,7 +79,7 @@ REFERENCE_URL = (
     "https://raw.githubusercontent.com/maziarraissi/PINNs/master/"
     "main/Data/cylinder_nektar_wake.mat"
 )
-DEFAULT_REF_CACHE = "experiments/data/cylinder_nektar_wake.mat"
+DEFAULT_REF_CACHE = reference_path("cylinder_nektar_wake.mat")
 
 
 # ========================= Model =========================
@@ -98,7 +99,7 @@ class PINN(_SharedMLP):
         lambda1_init: float = 0.0,
         lambda2_init: float = 0.0,
     ):
-        super().__init__(ConcatEmbed(3), hidden=hidden, depth=depth,
+        super().__init__(ConcatEmbedding(3), hidden=hidden, depth=depth,
                          out_features=3)
         self.lambda1 = nn.Parameter(torch.tensor(float(lambda1_init)))
         self.lambda2 = nn.Parameter(torch.tensor(float(lambda2_init)))
@@ -202,6 +203,11 @@ def term_losses(
 
 def download_reference(cache_path: str = DEFAULT_REF_CACHE) -> str:
     """Download Raissi's cylinder DNS data if not already cached on disk."""
+    if cache_path == DEFAULT_REF_CACHE:
+        cache_path = cached_reference_path(
+            "cylinder_nektar_wake.mat",
+            ["experiments/data/cylinder_nektar_wake.mat"],
+        )
     if os.path.isfile(cache_path):
         return cache_path
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)

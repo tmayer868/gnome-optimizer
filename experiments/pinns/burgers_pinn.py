@@ -20,9 +20,9 @@ which suits Gnome on MSE since its step self-anneals as the residual shrinks).
 
 Usage:
 
-    uv run -m experiments.burgers_pinn --optimizer gnome --seed 0
-    uv run -m experiments.burgers_pinn --optimizer soap  --seed 0
-    uv run -m experiments.burgers_pinn --optimizer adamw --seed 0
+    uv run -m experiments.pinns.burgers_pinn --optimizer gnome --seed 0
+    uv run -m experiments.pinns.burgers_pinn --optimizer soap  --seed 0
+    uv run -m experiments.pinns.burgers_pinn --optimizer adamw --seed 0
 """
 
 from __future__ import annotations
@@ -47,7 +47,12 @@ from experiments.common import (
     current_lr,
     pick_device,
 )
-from experiments.common import MLP as _SharedMLP, ConcatEmbed
+from experiments.common import MLP as _SharedMLP, ConcatEmbedding
+from experiments.reference_solutions import (
+    REFERENCE_SOLUTIONS_DIR,
+    cached_reference_path,
+    reference_path,
+)
 
 
 EXPERIMENT = "burgers_pinn"
@@ -66,7 +71,7 @@ JAXPI_REFERENCE_URL = (
     "https://raw.githubusercontent.com/PredictiveIntelligenceLab/jaxpi/"
     "pirate/examples/burgers/data/burgers.mat"
 )
-JAXPI_REFERENCE_CACHE = "experiments/data/burgers.mat"
+JAXPI_REFERENCE_CACHE = reference_path("burgers.mat")
 
 
 # ========================= Model =========================
@@ -75,7 +80,7 @@ class PINN(_SharedMLP):
     """Maps ``(t, x) → u`` via a plain tanh MLP."""
 
     def __init__(self, hidden: int = 20, depth: int = 9):
-        super().__init__(ConcatEmbed(2), hidden=hidden, depth=depth)
+        super().__init__(ConcatEmbedding(2), hidden=hidden, depth=depth)
 
 
 # ========================= Residuals =========================
@@ -141,7 +146,7 @@ def term_losses(model: nn.Module, batch) -> dict[str, float]:
 
 # ========================= Reference solution + eval =========================
 
-DEFAULT_REF_CACHE_DIR = "experiments/data"
+DEFAULT_REF_CACHE_DIR = str(REFERENCE_SOLUTIONS_DIR)
 
 
 def burgers_reference(
@@ -183,7 +188,15 @@ def burgers_reference(
     collide.
     """
     if cache_path is None:
-        cache_path = os.path.join(DEFAULT_REF_CACHE_DIR, f"burgers_reference_nx{nx}.pt")
+        filename = f"burgers_reference_nx{nx}_nt{nt}_nu{nu:.12g}.pt"
+        legacy_paths = (
+            [os.path.join("experiments/data", f"burgers_reference_nx{nx}.pt")]
+            if nt == 101 and nu == NU
+            else []
+        )
+        cache_path = cached_reference_path(
+            filename, legacy_paths
+        )
     import numpy as np
 
     if cache_path and os.path.isfile(cache_path):
@@ -252,7 +265,7 @@ def burgers_reference_jaxpi(
 
     File layout (Matlab v5): ``t (1, 201)``, ``x (1, 512)`` (both endpoints
     included), ``usol (201, 512)`` oriented ``(t, x)``. Downloaded on first use
-    and cached to disk (gitignored like all reference data).
+    and cached under ``experiments/reference_solutions``.
 
     Returns ``(t_grid, x_grid, u_grid)`` with shapes ``(201,)``, ``(512,)``,
     ``(201, 512)`` — CPU float32, matching ``burgers_reference`` so the same
@@ -266,6 +279,10 @@ def burgers_reference_jaxpi(
             "Install with `uv pip install scipy`."
         ) from e
 
+    if cache_path == JAXPI_REFERENCE_CACHE:
+        cache_path = cached_reference_path(
+            "burgers.mat", ["experiments/data/burgers.mat"]
+        )
     if not os.path.isfile(cache_path):
         os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
         print(

@@ -41,15 +41,16 @@ objective is the same function each iteration — so, unlike the Adam phase,
 its points are drawn once and held constant.
 
 ``--mu-sq`` controls the dispersive coefficient and defaults to ``0.022²``,
-the JAX-PI benchmark value.  A periodic Fourier/ETDRK4 reference is generated
-in memory for that coefficient at startup; the default solve takes well under
-a second and reproduces JAX-PI's static ``kdv.mat`` to about 1e-8 relative L2.
+the JAX-PI benchmark value. That default uses the common static ``kdv.mat``
+reference, downloading it from JAX-PI when missing and generating an equivalent
+ETDRK4 solution only when offline. Other coefficients get a matching Fourier/ETDRK4
+reference cached by solver parameters under ``experiments/reference_solutions``.
 
 Usage:
 
-    uv run -m experiments.kdv_pinn --optimizer gnome --arch modified
-    uv run -m experiments.kdv_pinn --optimizer soap  --arch mlp
-    uv run -m experiments.kdv_pinn --optimizer adamw+lbfgs --arch modified
+    uv run -m experiments.pinns.kdv_pinn --optimizer gnome --arch modified
+    uv run -m experiments.pinns.kdv_pinn --optimizer soap  --arch mlp
+    uv run -m experiments.pinns.kdv_pinn --optimizer adamw+lbfgs --arch modified
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ import argparse
 import math
 import os
 import time
+import urllib.request
 
 import numpy as np
 import torch
@@ -74,7 +76,9 @@ from experiments.common import (
     cosine_scheduler,
     current_lr,
     pick_device,
+    PeriodicEmbedding,
 )
+from experiments.reference_solutions import cached_reference_path, reference_path
 
 
 EXPERIMENT = "kdv_pinn"
@@ -86,23 +90,17 @@ DEFAULT_MU_SQ = 0.022 ** 2
 DEFAULT_REFERENCE_MODES = 511
 DEFAULT_REFERENCE_TIME_STEPS = 200
 DEFAULT_REFERENCE_SUBSTEPS = 20
+DEFAULT_REFERENCE_PATH = reference_path("kdv.mat")
+LEGACY_REFERENCE_PATHS = ("experiments/data/kdv.mat", "kdv.mat")
+# Raissi's ``main/Data/KdV.mat`` uses mu_sq=0.0025. JAX-PI's pirate branch
+# contains the coefficient-matched mu_sq=0.022**2 reference used here.
+KDV_URL = (
+    "https://raw.githubusercontent.com/PredictiveIntelligenceLab/jaxpi/"
+    "pirate/examples/kdv/data/kdv.mat"
+)
 
 
 # ========================= Models =========================
-class FourierEmbed(nn.Module):
-    def __init__(self, hidden, scale=10):
-        super(FourierEmbed, self).__init__()
-        self.linear = nn.Linear(2, hidden // 2)
-        nn.init.normal_(self.linear.weight, mean=0.0, std=scale)
-        nn.init.zeros_(self.linear.bias)  # or normal_ too, if you want bias randomized as well
-
-    def forward(self, x):
-        z = self.linear(x)
-        return torch.cat([torch.sin(z*torch.pi), torch.cos(z*torch.pi)], dim=1)
-
-
-
-
 class MLP(nn.Module):
     """Plain tanh MLP: ``(t, x) → u``. ``depth`` = number of Linear layers.
 
@@ -112,7 +110,8 @@ class MLP(nn.Module):
     def __init__(self, hidden: int = 256, depth: int = 4):
         super().__init__()
         assert depth >= 2
-        layers: list[nn.Module] = [nn.Linear(2, hidden), nn.Tanh()]
+        self.embed = PeriodicEmbedding(2, wavenumber=math.pi)
+        layers: list[nn.Module] = [nn.Linear(self.embed.out_dim, hidden), nn.Tanh()]
         for i in range(depth - 1):
             layers += [nn.Linear(hidden, hidden), nn.Tanh()]
         layers += [nn.Linear(hidden, 1)]
@@ -120,32 +119,18 @@ class MLP(nn.Module):
 
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([x, t], dim=1))
-
-
-
-class PeriodicEmbed(nn.Module):
-    """``[t, cos(πx), sin(πx)]`` — exactly period-2 in x, matching the
-    ``[-1, 1]`` x-domain. No parameters."""
-    out_dim = 3
-
-    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        return torch.cat(
-            [t, x, t*x], dim=1
-        )
-
+        return self.net(self.embed(t, x))
 
 def build_model(arch: str, hidden: int, depth: int) -> nn.Module:
-    """``(t, x) → u``.
-
-    Note the two arches do not share an input embedding: ``mlp`` feeds
-    ``[x, t]`` through a random Fourier layer, ``modified`` uses the
-    hard-coded period-2 ``[t, cos(πx), sin(πx)]``.
-    """
+    """``(t, x) → u`` with a shared period-2 spatial embedding."""
     if arch == "mlp":
         return MLP(hidden=hidden, depth=depth)
     if arch == "modified":
-        return ModifiedMLP(PeriodicEmbed(), hidden=hidden, depth=depth)
+        return ModifiedMLP(
+            PeriodicEmbedding(2, wavenumber=math.pi),
+            hidden=hidden,
+            depth=depth,
+        )
     raise ValueError(f"unknown arch: {arch}")
 
 
@@ -348,12 +333,130 @@ def build_engd_functions(
 
 # ========================= Reference solution + eval =========================
 
+def load_kdv_reference(
+    path: str = DEFAULT_REFERENCE_PATH,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Load ``kdv.mat``, generating the default reference when it is absent."""
+    try:
+        import scipy.io
+    except ImportError as e:
+        raise RuntimeError(
+            "scipy is required to load kdv.mat. Install the experiment "
+            "dependencies with `uv sync --extra experiments`."
+        ) from e
+
+    if path == DEFAULT_REFERENCE_PATH:
+        path = cached_reference_path("kdv.mat", LEGACY_REFERENCE_PATHS)
+    if not os.path.isfile(path):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        download_path = f"{path}.download"
+        print(
+            f"[{EXPERIMENT}] kdv.mat missing; downloading {KDV_URL} ...",
+            flush=True,
+        )
+        try:
+            urllib.request.urlretrieve(KDV_URL, download_path)
+            os.replace(download_path, path)
+        except Exception as error:
+            if os.path.isfile(download_path):
+                os.remove(download_path)
+            print(
+                f"[{EXPERIMENT}] KdV download failed ({error}); generating "
+                "the equivalent ETDRK4 reference instead...",
+                flush=True,
+            )
+            t_generated, x_generated, u_generated = kdv_reference(
+                DEFAULT_MU_SQ,
+                modes=DEFAULT_REFERENCE_MODES,
+                time_steps=DEFAULT_REFERENCE_TIME_STEPS,
+                substeps_per_output=DEFAULT_REFERENCE_SUBSTEPS,
+                use_cache=False,
+            )
+            temporary_path = f"{path}.tmp"
+            scipy.io.savemat(
+                temporary_path,
+                {
+                    "t": t_generated.numpy()[None, :],
+                    "x": x_generated.numpy()[None, :],
+                    "usol": u_generated.numpy(),
+                    "method": "Fourier ETDRK4",
+                    "mu_sq": np.float64(DEFAULT_MU_SQ),
+                    "modes": np.int64(DEFAULT_REFERENCE_MODES),
+                    "substeps_per_output": np.int64(
+                        DEFAULT_REFERENCE_SUBSTEPS
+                    ),
+                },
+                appendmat=False,
+                do_compression=True,
+            )
+            os.replace(temporary_path, path)
+
+    data = scipy.io.loadmat(path)
+    required = {"t", "x", "usol"}
+    missing = required.difference(data)
+    if missing:
+        raise ValueError(
+            f"invalid KdV reference {path!r}: missing {sorted(missing)}"
+        )
+
+    t = np.asarray(data["t"], dtype=np.float64).reshape(-1)
+    x = np.asarray(data["x"], dtype=np.float64).reshape(-1)
+    solution = np.asarray(data["usol"], dtype=np.float64)
+    if solution.shape != (t.size, x.size):
+        raise ValueError(
+            f"invalid KdV reference {path!r}: usol has shape "
+            f"{solution.shape}, expected {(t.size, x.size)}"
+        )
+    if not (
+        np.isfinite(t).all()
+        and np.isfinite(x).all()
+        and np.isfinite(solution).all()
+    ):
+        raise ValueError(f"invalid KdV reference {path!r}: non-finite values")
+    if not (
+        np.all(np.diff(t) > 0.0)
+        and np.all(np.diff(x) > 0.0)
+        and np.isclose(t[0], T_MIN)
+        and np.isclose(t[-1], T_MAX)
+        and np.isclose(x[0], X_MIN)
+        and np.isclose(x[-1], X_MAX)
+    ):
+        raise ValueError(
+            f"invalid KdV reference {path!r}: grid does not match the "
+            "configured time and space domains"
+        )
+
+    return (
+        torch.from_numpy(t.copy()),
+        torch.from_numpy(x.copy()),
+        torch.from_numpy(solution.copy()),
+    )
+
+
+def kdv_reference_cache_path(
+    mu_sq: float,
+    modes: int,
+    time_steps: int,
+    substeps_per_output: int,
+) -> str:
+    """Return the parameter-specific cache path for a generated KdV solve."""
+    filename = (
+        f"kdv_reference_mu{mu_sq:.12g}_modes{modes}_nt{time_steps}"
+        f"_substeps{substeps_per_output}.pt"
+    )
+    return cached_reference_path(
+        filename, [os.path.join("experiments/data", filename)]
+    )
+
+
 def kdv_reference(
     mu_sq: float = DEFAULT_MU_SQ,
     *,
     modes: int = DEFAULT_REFERENCE_MODES,
     time_steps: int = DEFAULT_REFERENCE_TIME_STEPS,
     substeps_per_output: int = DEFAULT_REFERENCE_SUBSTEPS,
+    cache_path: str | None = None,
+    use_cache: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Generate a periodic Fourier reference with fourth-order ETDRK4.
 
@@ -381,6 +484,16 @@ def kdv_reference(
             "substeps_per_output must be >= 1; "
             f"got {substeps_per_output}"
         )
+    if use_cache:
+        if cache_path is None:
+            cache_path = kdv_reference_cache_path(
+                mu_sq, modes, time_steps, substeps_per_output
+            )
+        if os.path.isfile(cache_path):
+            blob = torch.load(cache_path, weights_only=True)
+            return blob["t"], blob["x"], blob["u"]
+    else:
+        cache_path = None
 
     length = X_MAX - X_MIN
     t = np.linspace(T_MIN, T_MAX, time_steps + 1, dtype=np.float64)
@@ -451,11 +564,15 @@ def kdv_reference(
 
     x_closed = np.linspace(X_MIN, X_MAX, modes + 1, dtype=np.float64)
     solution_closed = np.concatenate([solution, solution[:, :1]], axis=1)
-    return (
+    result = (
         torch.from_numpy(t),
         torch.from_numpy(x_closed),
         torch.from_numpy(solution_closed),
     )
+    if cache_path is not None:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        torch.save({"t": result[0], "x": result[1], "u": result[2]}, cache_path)
+    return result
 
 
 def eval_rel_l2(
@@ -646,8 +763,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_MU_SQ,
         help="Dispersive u_xxx coefficient. Defaults to 0.022^2, the "
-             "JAX-PI benchmark value. A matching reference is generated "
-             "at startup.",
+             "JAX-PI benchmark value, which loads kdv.mat. A matching "
+             "reference is generated for other values.",
     )
     p.add_argument(
         "--reference-modes",
@@ -742,12 +859,14 @@ def parse_args() -> argparse.Namespace:
 def train(args: argparse.Namespace) -> str:
     if not math.isfinite(args.mu_sq) or args.mu_sq <= 0.0:
         raise ValueError(f"--mu-sq must be finite and positive; got {args.mu_sq}")
-    if args.reference_modes < 3 or args.reference_modes % 2 == 0:
+    use_mat_reference = args.mu_sq == DEFAULT_MU_SQ
+    if (not use_mat_reference
+            and (args.reference_modes < 3 or args.reference_modes % 2 == 0)):
         raise ValueError(
             "--reference-modes must be an odd integer >= 3; "
             f"got {args.reference_modes}"
         )
-    if args.reference_substeps < 1:
+    if not use_mat_reference and args.reference_substeps < 1:
         raise ValueError(
             "--reference-substeps must be >= 1; "
             f"got {args.reference_substeps}"
@@ -786,6 +905,17 @@ def train(args: argparse.Namespace) -> str:
     n_ic_aux = max(2, int(args.n_ic * args.aux_frac))
     n_bc_aux = max(2, int(args.n_bc * args.aux_frac))
     n_params = sum(p.numel() for p in model.parameters())
+    reference_cache_path = (
+        cached_reference_path("kdv.mat", LEGACY_REFERENCE_PATHS)
+        if use_mat_reference
+        else kdv_reference_cache_path(
+            args.mu_sq,
+            args.reference_modes,
+            DEFAULT_REFERENCE_TIME_STEPS,
+            args.reference_substeps,
+        )
+    )
+    reference_was_cached = os.path.isfile(reference_cache_path)
 
     hyperparameters = {
         # Non-zero means a sibling {run_id}.diag.jsonl exists.
@@ -806,10 +936,19 @@ def train(args: argparse.Namespace) -> str:
         "t_domain": (T_MIN, T_MAX),
         "eta": ETA,
         "mu_sq": args.mu_sq,
-        "reference_method": "Fourier ETDRK4",
-        "reference_modes": args.reference_modes,
+        "reference_method": (
+            "kdv.mat" if use_mat_reference else "Fourier ETDRK4"
+        ),
+        "reference_path": reference_cache_path,
+        "reference_modes": (
+            DEFAULT_REFERENCE_MODES
+            if use_mat_reference
+            else args.reference_modes
+        ),
         "reference_time_steps": DEFAULT_REFERENCE_TIME_STEPS,
-        "reference_substeps_per_output": args.reference_substeps,
+        "reference_substeps_per_output": (
+            None if use_mat_reference else args.reference_substeps
+        ),
         "device": str(device),
         "dtype": str(torch.get_default_dtype()),
         **{f"opt.{k}": v for k, v in opt_cfg.items()},
@@ -856,16 +995,36 @@ def train(args: argparse.Namespace) -> str:
             f"  mu_sq={args.mu_sq:.9g}",
             flush=True,
         )
-        print("  generating matching Fourier reference solution...", flush=True)
+        if use_mat_reference:
+            print(
+                f"  loading reference solution from {reference_cache_path}...",
+                flush=True,
+            )
+        elif reference_was_cached:
+            print(
+                f"  loading cached Fourier reference from "
+                f"{reference_cache_path}...",
+                flush=True,
+            )
+        else:
+            print(
+                "  generating matching Fourier reference solution...",
+                flush=True,
+            )
     reference_started = time.perf_counter()
-    t_ref, x_ref, u_ref = kdv_reference(
-        args.mu_sq,
-        modes=args.reference_modes,
-        substeps_per_output=args.reference_substeps,
-    )
+    if use_mat_reference:
+        t_ref, x_ref, u_ref = load_kdv_reference()
+    else:
+        t_ref, x_ref, u_ref = kdv_reference(
+            args.mu_sq,
+            modes=args.reference_modes,
+            substeps_per_output=args.reference_substeps,
+            cache_path=reference_cache_path,
+        )
     if not args.quiet:
         print(
-            f"  reference {u_ref.shape[0]}x{u_ref.shape[1]} generated in "
+            f"  reference {u_ref.shape[0]}x{u_ref.shape[1]} "
+            f"{'loaded' if reference_was_cached else 'generated'} in "
             f"{time.perf_counter() - reference_started:.2f}s",
             flush=True,
         )
