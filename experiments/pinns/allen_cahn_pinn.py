@@ -310,24 +310,35 @@ def eval_rel_l2(
     t_ref: torch.Tensor, x_ref: torch.Tensor, u_ref: torch.Tensor,
     device: torch.device, batch_size: int = 8192,
 ) -> float:
-    """Relative L2 error of the PINN prediction against ``u_ref`` on its grid."""
+    """Relative L2 with model inference native and all error math in float64."""
     nt, nx = u_ref.shape
     tt, xx = torch.meshgrid(t_ref, x_ref, indexing="ij")
-    t_flat = tt.reshape(-1, 1).to(device)
-    x_flat = xx.reshape(-1, 1).to(device)
+    model_dtype = next(
+        (parameter.dtype for parameter in model.parameters()
+         if parameter.is_floating_point()),
+        torch.get_default_dtype(),
+    )
+    t_flat = tt.reshape(-1, 1).to(device=device, dtype=model_dtype)
+    x_flat = xx.reshape(-1, 1).to(device=device, dtype=model_dtype)
+    # Keep float64 conversion off accelerators such as MPS, which has no
+    # float64 support. Transfer first, then promote using the CPU kernel.
+    u_ref64 = u_ref.detach().cpu().to(dtype=torch.float64)
     was_training = model.training
     model.eval()
     preds = []
     with torch.no_grad():
         for i in range(0, t_flat.shape[0], batch_size):
             preds.append(
-                model(t_flat[i:i + batch_size], x_flat[i:i + batch_size]).cpu()
+                model(t_flat[i:i + batch_size], x_flat[i:i + batch_size])
+                .detach()
+                .cpu()
+                .to(dtype=torch.float64)
             )
     if was_training:
         model.train()
     u_pred = torch.cat(preds).reshape(nt, nx)
-    num = (u_pred - u_ref).pow(2).sum().sqrt()
-    den = u_ref.pow(2).sum().sqrt()
+    num = (u_pred - u_ref64).pow(2).sum().sqrt()
+    den = u_ref64.pow(2).sum().sqrt()
     return float(num / den)
 
 
@@ -606,10 +617,11 @@ def train(args: argparse.Namespace) -> str:
                   f"→ {diag.path}", flush=True)
         print(f"  loading reference solution ({args.reference})...", flush=True)
     t_ref, x_ref, u_ref = allen_cahn_reference(reference=args.reference)
-    # Evaluate in the run dtype. Both .mat files retain float64 on disk, so a
-    # --float64 run now also gets a genuinely float64 reference tensor.
+    # Coordinates must match the model for inference. Keep the target in
+    # float64: eval_rel_l2 explicitly promotes predictions before error math.
     dt = torch.get_default_dtype()
-    t_ref, x_ref, u_ref = t_ref.to(dt), x_ref.to(dt), u_ref.to(dt)
+    t_ref, x_ref = t_ref.to(dt), x_ref.to(dt)
+    u_ref = u_ref.to(torch.float64)
     if not args.quiet:
         print(f"  reference grid={u_ref.shape[0]}x{u_ref.shape[1]}", flush=True)
 
