@@ -24,7 +24,7 @@ Two architectures, selectable via ``--arch``:
   The multi-block loss is the same plain ``gnome.stack_residuals``
   pattern with equal block weights used throughout these experiments.
 
-Three input embeddings, selectable via ``--embed`` (both architectures):
+Four input embeddings, selectable via ``--embed`` (all architectures):
 
 * ``none`` (default) feeds raw ``[t, x]`` and the periodic BC is imposed
   *softly*, as a third residual block matching ``u`` and ``u_x`` across
@@ -34,6 +34,9 @@ Three input embeddings, selectable via ``--embed`` (both architectures):
   machine precision for ``u`` and *every* x-derivative, so the soft BC
   block is redundant and is **dropped** (two blocks instead of three).
   This is how jaxpi imposes exact periodic BCs for Allen-Cahn.
+* ``polynomial`` feeds ``[t, 1-x², x(1-x²)]``. Endpoint values match
+  exactly, but endpoint spatial derivatives need not, so it keeps the
+  soft BC block (three blocks).
 * ``fourier`` feeds ``[sin(zB), cos(zB)]`` with ``z = [t, x]`` the raw
   coordinates and ``B`` a *trainable* matrix initialized ``~ N(0, scale²)``,
   sized by ``--embed-dim`` and ``--embed-scale``. The frequencies are
@@ -65,6 +68,7 @@ Usage:
         --diagnostics-every 500 --diagnostics-params 0
     uv run -m experiments.pinns.allen_cahn_pinn --optimizer adamw --arch modified
     uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --embed periodic
+    uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --embed polynomial
 """
 
 from __future__ import annotations
@@ -93,6 +97,7 @@ from experiments.common import (
     pick_device,
     FusedLinear,
     ConcatEmbedding,
+    PolynomialEmbedding,
     PeriodicEmbedding,
     TrainableFourierEmbedding,
 )
@@ -116,6 +121,8 @@ def build_embedding(embed: str, embed_dim: int = 256,
                     scale: float = 10.0) -> nn.Module:
     if embed == "none":
         return ConcatEmbedding(2)
+    if embed == "polynomial":
+        return PolynomialEmbedding()
     if embed == "periodic":
         return PeriodicEmbedding(
             2, wavenumber=2.0 * math.pi / (X_MAX - X_MIN)
@@ -188,8 +195,9 @@ def bc_residual(model: nn.Module, t: torch.Tensor) -> torch.Tensor:
     """Periodic BC residual: ``u(t, -1) - u(t, 1)`` and
     ``u_x(t, -1) - u_x(t, 1)``, stacked (C¹ periodicity).
 
-    Only used with ``--embed none``; the periodic embedding makes this
-    identically zero (see ``PeriodicEmbedding``).
+    Included in the loss for every embedding except ``periodic``, which
+    makes this identically zero. ``polynomial`` enforces matching values
+    but still needs the derivative residual.
     """
     x_l = torch.full_like(t, X_MIN, requires_grad=True)
     x_r = torch.full_like(t, X_MAX, requires_grad=True)
@@ -411,14 +419,17 @@ def parse_args() -> argparse.Namespace:
                         "grouping differs). 0 (default) fuses the whole "
                         "stack. Note --depth 4 leaves only k=2 hidden layers "
                         "to group, so raise --depth to give this room.")
-    p.add_argument("--embed", choices=["none", "periodic", "fourier"],
+    p.add_argument("--embed", choices=["none", "periodic", "polynomial", "fourier"],
                    default="none",
                    help="Input embedding. 'none' feeds raw [t, x] and keeps "
                         "the soft periodic BC block. 'periodic' feeds "
                         "[t, cos(pi x), sin(pi x)], making the network "
                         "exactly period-2 in x — periodicity then holds for "
                         "every derivative and the BC block is DROPPED (two "
-                        "blocks instead of three). 'fourier' feeds trainable "
+                        "blocks instead of three). 'polynomial' feeds "
+                        "[t, 1-x^2, x(1-x^2)]; endpoint values match, but "
+                        "derivatives need not, so it keeps the BC block. "
+                        "'fourier' feeds trainable "
                         "Fourier features [sin(zB), cos(zB)] over raw "
                         "z = [t, x]; not exactly periodic, so it KEEPS the "
                         "BC block. See --embed-dim / --embed-scale.")
@@ -519,6 +530,7 @@ def train(args: argparse.Namespace) -> str:
     # Only 'periodic' satisfies the BC block exactly, so it is the only one
     # that drops it. 'fourier' projects raw (t, x) at frequencies that are not
     # multiples of k, so it needs the soft BC block just as 'none' does.
+    # 'polynomial' matches endpoint values but still needs derivative matching.
     use_bc = args.embed != "periodic"
     model = build_model(
         args.arch,

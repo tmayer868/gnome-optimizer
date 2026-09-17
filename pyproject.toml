@@ -49,6 +49,11 @@ llm = [
 cifar = [
     "torchvision>=0.15",
 ]
+# Image-classification experiments, including CUB-200-2011.
+vision = [
+    "torchvision>=0.15",
+    "pillow>=10.0",
+]
 # UTKFace age-regression benchmark (kept for reference; not in the writeup):
 # HuggingFace datasets + Pillow for image decode.
 utkface = [

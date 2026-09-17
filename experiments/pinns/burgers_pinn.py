@@ -21,6 +21,7 @@ which suits Gnome on MSE since its step self-anneals as the residual shrinks).
 Usage:
 
     uv run -m experiments.pinns.burgers_pinn --optimizer gnome --seed 0
+    uv run -m experiments.pinns.burgers_pinn --optimizer gnome --float64
     uv run -m experiments.pinns.burgers_pinn --optimizer soap  --seed 0
     uv run -m experiments.pinns.burgers_pinn --optimizer adamw --seed 0
 """
@@ -63,7 +64,7 @@ NU = 0.01 / math.pi
 
 # jaxpi (Wang et al. 2025, arXiv:2502.00604) Burgers reference — the canonical
 # Raissi precomputed dataset their pirate-branch benchmark scores against. Used
-# as a *second* eval reference alongside our own spectral solve: at their ~4e-5
+# as a *second* eval reference alongside our Cole–Hopf reference: at their ~4e-5
 # accuracy level the reference field and eval grid are first-order terms, so a
 # rel_L2 is only directly comparable to their reported SOAP number on this exact
 # file and grid.
@@ -114,13 +115,14 @@ def bc_residual(model: nn.Module, t: torch.Tensor) -> torch.Tensor:
 # ========================= Sampling =========================
 
 def sample_batch(
-    n_pde: int, n_ic: int, n_bc: int, device: torch.device
+    n_pde: int, n_ic: int, n_bc: int, device: torch.device,
+    dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Independent uniform draws for collocation / IC / BC point sets."""
-    t_pde = torch.rand(n_pde, 1, device=device) * (T_MAX - T_MIN) + T_MIN
-    x_pde = torch.rand(n_pde, 1, device=device) * (X_MAX - X_MIN) + X_MIN
-    x_ic = torch.rand(n_ic, 1, device=device) * (X_MAX - X_MIN) + X_MIN
-    t_bc = torch.rand(n_bc, 1, device=device) * (T_MAX - T_MIN) + T_MIN
+    t_pde = torch.rand(n_pde, 1, device=device, dtype=dtype) * (T_MAX - T_MIN) + T_MIN
+    x_pde = torch.rand(n_pde, 1, device=device, dtype=dtype) * (X_MAX - X_MIN) + X_MIN
+    x_ic = torch.rand(n_ic, 1, device=device, dtype=dtype) * (X_MAX - X_MIN) + X_MIN
+    t_bc = torch.rand(n_bc, 1, device=device, dtype=dtype) * (T_MAX - T_MIN) + T_MIN
     return t_pde, x_pde, x_ic, t_bc
 
 
@@ -149,108 +151,116 @@ def term_losses(model: nn.Module, batch) -> dict[str, float]:
 DEFAULT_REF_CACHE_DIR = str(REFERENCE_SOLUTIONS_DIR)
 
 
+BURGERS_REFERENCE_METHOD = "cole_hopf_v1"
+BURGERS_QUADRATURE_ORDER = 256
+
+
+def burgers_cole_hopf(
+    t, x, nu: float = NU,
+    quadrature_order: int = BURGERS_QUADRATURE_ORDER,
+):
+    """Evaluate the Cole–Hopf solution on a Cartesian grid in NumPy float64.
+
+    For ``u(0,x) = -sin(pi*x)``, the heat potential starts at
+    ``exp(-cos(pi*x)/(2*pi*nu))``. Its Gaussian convolution gives u as a
+    weighted average of ``-sin(pi*(x-sqrt(4*nu*t)*z))``. Gauss–Hermite
+    quadrature integrates the Gaussian weight; exponent scaling avoids
+    overflow without changing the ratio. Odd periodic symmetry gives the
+    zero Dirichlet boundaries on [-1, 1].
+
+    At the benchmark viscosity and t in [0, 1], orders 256 and 512 agree
+    within 1e-14 absolute error. Other viscosities/time ranges require their
+    own quadrature convergence check. No spatial or temporal marching is used.
+    Returns a float64 array of shape (len(t), len(x)).
+    """
+    import numpy as np
+    from scipy.special import roots_hermite
+
+    if not math.isfinite(nu) or nu <= 0:
+        raise ValueError("nu must be finite and positive")
+    if quadrature_order < 1:
+        raise ValueError("quadrature_order must be positive")
+    t = np.asarray(t, dtype=np.float64)
+    x = np.asarray(x, dtype=np.float64)
+    if t.ndim != 1 or x.ndim != 1 or not np.isfinite(t).all() or not np.isfinite(x).all():
+        raise ValueError("t and x must be finite one-dimensional grids")
+    if (t < 0).any():
+        raise ValueError("t must be nonnegative")
+    nodes, weights = roots_hermite(quadrature_order)
+    u = np.empty((len(t), len(x)), dtype=np.float64)
+    for i, ti in enumerate(t):
+        if ti == 0:
+            u[i] = -np.sin(np.pi * x)
+            continue
+        phase = np.pi * (x[:, None] - np.sqrt(4 * nu * ti) * nodes)
+        exponent = -np.cos(phase) / (2 * np.pi * nu)
+        exponent -= exponent.max(axis=1, keepdims=True)
+        weighted = weights * np.exp(exponent)
+        u[i] = -(weighted * np.sin(phase)).sum(axis=1) / weighted.sum(axis=1)
+    return u
+
+
 def burgers_reference(
     nx: int = 1024, nt: int = 101, nu: float = NU,
     cache_path: str | None = None,
+    dtype: torch.dtype = torch.float64,
+    quadrature_order: int = BURGERS_QUADRATURE_ORDER,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fourier-spectral reference solution for Burgers.
+    """Cole–Hopf reference, computed and cached in float64 by default.
 
-    The IC ``u(0, x) = -sin(π x)`` is exactly periodic on ``[-1, 1)`` and
-    Burgers preserves the resulting antisymmetry, so the Dirichlet BCs
-    ``u(t, ±1) = 0`` are automatically enforced by a periodic Fourier
-    basis. The solver discretizes the spatial domain with ``nx`` Fourier
-    modes (``endpoint=False``), computes ``u_x`` and ``u_xx`` in spectral
-    space, applies 2/3-rule dealiasing to the nonlinear ``u·u_x`` product
-    to control aliasing of the shock front, and time-marches with RK4.
+    Keeps the previous evaluation grid: t in [0, 1], x in [-1, 1) with
+    shapes (nt,), (nx,), (nt, nx). Grid density controls sampling, not the
+    accuracy of the solution at each point. See ``burgers_cole_hopf`` for
+    quadrature accuracy. Explicit float32 output is supported but rounds
+    both coordinates and values; training always loads the float64 reference.
 
-    The number of RK4 substeps per snapshot scales as ``nx²`` so the
-    spectral parabolic CFL stays satisfied as resolution grows; at
-    ``nx = 256`` that's 50 substeps, at ``nx = 1024`` it's 800 substeps.
-
-    Reference accuracy as a function of ``nx`` (self-consistency vs the
-    next-finer grid)::
-
-        nx=256  vs nx=512  : rel_L2 ≈ 7e-3   ← under-resolves the shock
-        nx=512  vs nx=1024 : rel_L2 ≈ 4e-4
-        nx=1024 vs nx=2048 : rel_L2 ≈ 1e-6   ← converged
-
-    The default ``nx = 1024`` therefore puts the reference's own accuracy
-    well below any plausible PINN rel_L2 floor.
-
-    Central finite differences are *not* used here — at ``ν = 0.01/π`` the
-    cell Péclet number ``|u|·dx/ν`` is past the FD stability limit on
-    moderate grids and the solution NaN-s through the shock. The spectral
-    method has no such Péclet constraint.
-
-    Returns ``(t_grid, x_grid, u_grid)`` with shapes ``(nt,)``, ``(nx,)``,
-    ``(nt, nx)`` — CPU float32 tensors. Result is cached to disk under a
-    filename that encodes ``nx`` so caches at different resolutions don't
-    collide.
+    Versioned filenames and metadata prevent reuse of the old spectral
+    caches, whose relative L2 error was approximately 1.4e-6. Pass
+    ``cache_path=""`` to disable caching, including for convergence checks.
     """
-    if cache_path is None:
-        filename = f"burgers_reference_nx{nx}_nt{nt}_nu{nu:.12g}.pt"
-        legacy_paths = (
-            [os.path.join("experiments/data", f"burgers_reference_nx{nx}.pt")]
-            if nt == 101 and nu == NU
-            else []
-        )
-        cache_path = cached_reference_path(
-            filename, legacy_paths
-        )
     import numpy as np
 
+    if nx < 2 or nt < 2:
+        raise ValueError("nx and nt must be at least 2")
+    if dtype not in (torch.float32, torch.float64):
+        raise ValueError("reference dtype must be float32 or float64")
+    if not math.isfinite(nu) or nu <= 0 or quadrature_order < 1:
+        raise ValueError("nu and quadrature_order must be positive and finite")
+    metadata = dict(
+        method=BURGERS_REFERENCE_METHOD, nx=nx, nt=nt, nu=nu,
+        quadrature_order=quadrature_order, dtype=str(dtype),
+    )
+    if cache_path is None:
+        precision = "float64" if dtype == torch.float64 else "float32"
+        cache_path = reference_path(
+            f"burgers_{BURGERS_REFERENCE_METHOD}_nx{nx}_nt{nt}_nu{nu:.12g}"
+            f"_q{quadrature_order}_{precision}.pt"
+        )
     if cache_path and os.path.isfile(cache_path):
         blob = torch.load(cache_path, weights_only=True)
-        return blob["t"], blob["x"], blob["u"]
+        shapes = {"t": (nt,), "x": (nx,), "u": (nt, nx)}
+        if blob.get("metadata") == metadata and all(
+            isinstance(blob.get(key), torch.Tensor)
+            and blob[key].dtype == dtype and tuple(blob[key].shape) == shape
+            for key, shape in shapes.items()
+        ):
+            return blob["t"], blob["x"], blob["u"]
 
-    L = X_MAX - X_MIN
-    x = np.linspace(X_MIN, X_MAX, nx, endpoint=False)
-    dx = L / nx
-    k = 2.0 * np.pi * np.fft.fftfreq(nx, dx)
-    k_max = np.abs(k).max()
-    dealias = (np.abs(k) <= (2.0 / 3.0) * k_max).astype(np.float64)
-
-    u = (-np.sin(np.pi * x)).astype(np.float64)
-
-    def rhs(u_):
-        u_hat = np.fft.fft(u_)
-        u_x = np.fft.ifft(1j * k * u_hat).real
-        u_xx = np.fft.ifft(-(k ** 2) * u_hat).real
-        nonlin_hat = np.fft.fft(u_ * u_x) * dealias
-        nonlin = np.fft.ifft(nonlin_hat).real
-        return -nonlin + nu * u_xx
-
-    # Spectral RK4 stability: dt < 2 / (ν · k_max²) ~ 2·dx²/(ν·π²). The substep
-    # count therefore needs to grow ∝ nx² so larger references don't NaN through
-    # the shock. The (nx/256)² scaling makes substeps=50 at the original nx=256
-    # reference and bumps to 800 at nx=1024 (well inside the safe envelope).
-    substeps_per_snap = max(50, int(50 * (nx / 256) ** 2))
-    dt_sub = (T_MAX - T_MIN) / ((nt - 1) * substeps_per_snap)
-    snapshots = [u.copy()]
-    for _ in range(nt - 1):
-        for _ in range(substeps_per_snap):
-            k1 = rhs(u)
-            k2 = rhs(u + 0.5 * dt_sub * k1)
-            k3 = rhs(u + 0.5 * dt_sub * k2)
-            k4 = rhs(u + dt_sub * k3)
-            u = u + (dt_sub / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-        snapshots.append(u.copy())
-
-    t_grid = np.linspace(T_MIN, T_MAX, nt).astype(np.float32)
-    x_grid = x.astype(np.float32)
-    u_grid = np.stack(snapshots).astype(np.float32)
-
-    t = torch.from_numpy(t_grid)
-    xt = torch.from_numpy(x_grid)
-    ug = torch.from_numpy(u_grid)
+    np_dtype = np.float64 if dtype == torch.float64 else np.float32
+    # Evaluate at the coordinates actually returned, even for explicit float32.
+    t_grid = np.linspace(T_MIN, T_MAX, nt).astype(np_dtype)
+    x_grid = np.linspace(X_MIN, X_MAX, nx, endpoint=False).astype(np_dtype)
+    u_grid = burgers_cole_hopf(t_grid, x_grid, nu, quadrature_order).astype(np_dtype)
+    t, x, u = map(torch.from_numpy, (t_grid, x_grid, u_grid))
     if cache_path:
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        torch.save({"t": t, "x": xt, "u": ug}, cache_path)
-    return t, xt, ug
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        torch.save({"metadata": metadata, "t": t, "x": x, "u": u}, cache_path)
+    return t, x, u
 
 
 def burgers_reference_jaxpi(
     cache_path: str = JAXPI_REFERENCE_CACHE,
+    dtype: torch.dtype = torch.float64,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """jaxpi's Burgers reference (``burgers.mat``) for a head-to-head rel_L2.
 
@@ -258,7 +268,7 @@ def burgers_reference_jaxpi(
     score against in their pirate-branch benchmark, so a rel_L2 measured here is
     directly comparable to their reported SOAP number — same reference field,
     same grid. Deliberately separate from ``burgers_reference`` (our own
-    Fourier-spectral solve): at their 4e-5 accuracy level the reference dataset
+    Cole–Hopf reference): at their 4e-5 accuracy level the reference dataset
     and eval grid are first-order terms, so the comparison is only valid on
     their own file. Verified contents: ``nu = 0.01/π`` and
     ``usol[0] == -sin(π x)`` to machine precision.
@@ -268,7 +278,7 @@ def burgers_reference_jaxpi(
     and cached under ``experiments/reference_solutions``.
 
     Returns ``(t_grid, x_grid, u_grid)`` with shapes ``(201,)``, ``(512,)``,
-    ``(201, 512)`` — CPU float32, matching ``burgers_reference`` so the same
+    ``(201, 512)`` — CPU tensors in ``dtype``, matching ``burgers_reference`` so the same
     ``eval_rel_l2`` consumes either.
     """
     try:
@@ -298,9 +308,9 @@ def burgers_reference_jaxpi(
             ) from e
 
     blob = scipy.io.loadmat(cache_path)
-    t = torch.from_numpy(blob["t"].astype("float32").ravel())
-    x = torch.from_numpy(blob["x"].astype("float32").ravel())
-    u = torch.from_numpy(blob["usol"].astype("float32"))
+    t = torch.from_numpy(blob["t"].ravel()).to(dtype=dtype)
+    x = torch.from_numpy(blob["x"].ravel()).to(dtype=dtype)
+    u = torch.from_numpy(blob["usol"]).to(dtype=dtype)
     return t, x, u
 
 
@@ -314,23 +324,26 @@ def eval_rel_l2(
     Returns ``||u_pred - u_ref||_2 / ||u_ref||_2`` evaluated over every
     ``(t_i, x_j)`` on the reference grid. The model is queried in batches
     under ``torch.no_grad`` so the reference grid can be much larger than
-    a training batch without OOM.
+    a training batch without OOM. Error arithmetic uses CPU float64; model
+    inference retains its training dtype (use --float64 for double precision).
     """
     nt, nx = u_ref.shape
+    dtype = next(model.parameters()).dtype
     tt, xx = torch.meshgrid(t_ref, x_ref, indexing="ij")
-    t_flat = tt.reshape(-1, 1).to(device)
-    x_flat = xx.reshape(-1, 1).to(device)
+    t_flat = tt.reshape(-1, 1).to(device=device, dtype=dtype)
+    x_flat = xx.reshape(-1, 1).to(device=device, dtype=dtype)
     was_training = model.training
     model.eval()
     preds = []
     with torch.no_grad():
         for i in range(0, t_flat.shape[0], batch_size):
             preds.append(
-                model(t_flat[i:i + batch_size], x_flat[i:i + batch_size]).cpu()
+                model(t_flat[i:i + batch_size], x_flat[i:i + batch_size]).detach().cpu()
             )
     if was_training:
         model.train()
-    u_pred = torch.cat(preds).reshape(nt, nx)
+    u_pred = torch.cat(preds).reshape(nt, nx).to(torch.float64)
+    u_ref = u_ref.to(device="cpu", dtype=torch.float64)
     num = (u_pred - u_ref).pow(2).sum().sqrt()
     den = u_ref.pow(2).sum().sqrt()
     return float(num / den)
@@ -390,6 +403,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--optimizer", required=True,
                    choices=["gnome", "soap", "adamw"])
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--float64", action="store_true",
+                   help="Use double precision for training and evaluation; "
+                        "falls back to CPU on MPS, which has no float64 support.")
     p.add_argument("--steps", type=int, default=5000)
     p.add_argument("--n-pde", type=int, default=2000)
     p.add_argument("--n-ic", type=int, default=100)
@@ -444,7 +460,7 @@ def parse_args() -> argparse.Namespace:
                         "burgers.mat (Wang et al. 2025). On by default so a "
                         "head-to-head number against their reported SOAP "
                         "result is logged as `rel_l2_jaxpi` alongside our "
-                        "spectral-reference `rel_l2`.")
+                        "Cole–Hopf-reference `rel_l2`.")
     p.add_argument("--quiet", action="store_true")
     return p.parse_args()
 
@@ -452,7 +468,12 @@ def parse_args() -> argparse.Namespace:
 def train(args: argparse.Namespace) -> str:
     torch.manual_seed(args.seed)
     device = pick_device()
-    model = PINN(hidden=args.hidden, depth=args.depth).to(device)
+    dtype = torch.float64 if args.float64 else torch.float32
+    if dtype == torch.float64 and device.type == "mps":
+        device = torch.device("cpu")
+        if not args.quiet:
+            print(f"[{EXPERIMENT}] float64: MPS has no double support; using CPU.")
+    model = PINN(hidden=args.hidden, depth=args.depth).to(device=device, dtype=dtype)
     opt, opt_cfg, scheduler = build_optimizer(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
         warmup=args.warmup_steps, total_steps=args.steps,
@@ -481,7 +502,13 @@ def train(args: argparse.Namespace) -> str:
         "n_bc_aux": n_bc_aux,
         "n_params": n_params,
         "nu": NU,
+        "reference_method": BURGERS_REFERENCE_METHOD,
+        "reference_dtype": "torch.float64",
+        "reference_quadrature_order": BURGERS_QUADRATURE_ORDER,
+        "reference_nx": 1024,
+        "reference_nt": 101,
         "device": str(device),
+        "dtype": str(dtype),
         **{f"opt.{k}": v for k, v in opt_cfg.items()},
     }
     run = RunLogger(
@@ -519,7 +546,7 @@ def train(args: argparse.Namespace) -> str:
     if not args.quiet:
         print(
             f"[{EXPERIMENT}] {args.optimizer} | params={n_params:,} | "
-            f"device={device}\n"
+            f"device={device} | dtype={dtype}\n"
             f"  N_pde={args.n_pde} N_ic={args.n_ic} N_bc={args.n_bc} | "
             f"aux={n_pde_aux}/{n_ic_aux}/{n_bc_aux} | steps={args.steps}",
             flush=True,
@@ -536,7 +563,7 @@ def train(args: argparse.Namespace) -> str:
         except Exception as e:
             print(
                 f"  WARNING: jaxpi reference unavailable ({e}); "
-                f"logging only our spectral rel_l2.",
+                f"logging only our Cole–Hopf rel_l2.",
                 flush=True,
             )
 
@@ -550,9 +577,9 @@ def train(args: argparse.Namespace) -> str:
     best_avg = best_rel_l2 = best_rel_l2_j = float("inf")
 
     for step in range(args.steps):
-        main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
+        main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device, dtype)
         if args.optimizer == "gnome":
-            aux_batch = sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device)
+            aux_batch = sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device, dtype)
 
             def main_closure():
                 r = stacked_residuals(model, main_batch)
@@ -586,7 +613,7 @@ def train(args: argparse.Namespace) -> str:
 
         if args.log_every and (step + 1) % args.log_every == 0:
             tl = term_losses(
-                model, sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
+                model, sample_batch(args.n_pde, args.n_ic, args.n_bc, device, dtype)
             )
             rl2 = eval_rel_l2(model, t_ref, x_ref, u_ref, device)
             last_avg = sum(window) / len(window)

@@ -29,6 +29,7 @@ installed as optional-dependency groups:
 | *(base)* | `uv sync` | the `gnome` optimizer package |
 | `experiments` | `uv sync --extra experiments` | the regression + PINN benchmarks (scipy, matplotlib) |
 | `llm` | `uv sync --extra llm` | the WikiText GPT benchmark (datasets, transformers) |
+| `vision` | `uv sync --extra vision` | image classification, including CUB-200-2011 (torchvision, Pillow) |
 | `dev` | `uv sync --extra dev` | tests + notebooks (pytest, jupyter) |
 
 Requires Python ≥ 3.10. The code auto-selects a device: CUDA if available, else Apple MPS,
@@ -45,7 +46,7 @@ batch, and an `aux_closure` over a small disjoint slice used to estimate curvatu
 import torch
 from gnome import Gnome
 
-model = ...  # any nn.Module. Under loss="cce", use LayerNorm/GroupNorm, not BatchNorm.
+model = ...  # any nn.Module
 opt = Gnome(model.parameters(), lr=1e-2, loss="mse")
 
 for x, y in loader:
@@ -90,6 +91,18 @@ Key arguments:
   `aux_closure` (10 in the example above). Controls the curvature estimate's variance, not
   bias. It is *not* a constructor argument — Gnome reads K from the aux batch you provide.
 - `eps` — curvature damping (larger → closer to gradient descent).
+- `trust_radius` — relative L2 update budget:
+  `trust_radius * sqrt(p.square().sum() + initial_sq_norm)`, before multiplying
+  by the learning rate. The squared initialization norm is captured when the
+  parameter first participates in an optimizer step and stored in its checkpoint.
+  Entirely zero tensors use `initial_sq_norm = 1.0`. Pass `None` to disable
+  the trust constraint.
+
+The reference norm is calculated once per parameter and reused. Older optimizer
+checkpoints without it acquire the reference on the next step. For zero-initialized
+tensors, the fallback is the expected squared norm of a length-N vector with
+Xavier variance `1/N`, assuming a hypothetical square layer. It adds no
+hyperparameter or layer lookup and does not change the initial parameter values.
 
 For multi-block losses (e.g. PINNs — a PDE residual plus boundary/initial terms),
 `gnome.stack_residuals([r1, r2, ...])` folds the blocks into a single flat residual vector
@@ -112,8 +125,8 @@ uv run python -m experiments.ols_regression --optimizer gnome --lr 0.1
 the closed-form least-squares solution at a fixed LR, while the baselines stall unless given
 a decay schedule.
 
-**PINNs** (need the `experiments` extra; the Burgers and Navier-Stokes references are
-downloaded automatically on first run):
+**PINNs** (need the `experiments` extra; references are generated or downloaded
+automatically on first run):
 
 ```bash
 uv run python -m experiments.pinns.poisson_pinn                --optimizer gnome --steps 50000
@@ -121,6 +134,12 @@ uv run python -m experiments.pinns.burgers_pinn                --optimizer gnome
 uv run python -m experiments.pinns.kuramoto_sivashinsky_pinn   --optimizer gnome --steps 100000
 uv run python -m experiments.pinns.navier_stokes_pinn          --optimizer gnome --steps 200000
 ```
+
+Burgers uses a float64 Cole–Hopf reference for `rel_l2`. Pass `--float64` for
+double-precision training and inference as well. The additional `rel_l2_jaxpi`
+metric uses the original JAXPI dataset. See the
+[reference documentation](experiments/reference_solutions/README.md) for
+accuracy checks and differences from historical spectral-reference results.
 
 Each takes `--optimizer gnome|soap|adamw`. **Schedule protocol:** every optimizer, Gnome
 included, gets the same linear-warmup + cosine-decay schedule, so the comparison is over the
@@ -136,6 +155,41 @@ uv run python -m experiments.pinns.poisson_pinn --optimizer soap --steps 50000
 Set `--cosine-decay 1` to disable decay entirely (raw SOAP/AdamW), or e.g. `0.1` to decay to
 10% of the peak LR.
 
+**Reaction with ENGD-W:** `experiments.pinns.reaction_pinn` also accepts
+`--optimizer engdw`, using an exact damped Gauss–Newton solve in sample space:
+
+```bash
+uv run -m experiments.pinns.reaction_pinn --optimizer engdw --rho 5 \
+    --engdw-line-search --engdw-damping 1e-6 --engdw-chunk 128 --steps 1000
+```
+
+This baseline uses float64 and fixed damping, with either a fixed learning rate
+or a same-batch grid line search. See [the comparison protocol](docs/reaction_engdw.md)
+for residual normalization, settings matching the Gnome run, and validation.
+
+**Convection across a parameter range, then fine-tuning:**
+
+```bash
+uv run -m experiments.pinns.convection_family_pinn --optimizer gnome \
+    --beta-range 1 200 --beta 200 \
+    --stage1-steps 30000 --stage2-steps 20000 --cosine-decay 1
+```
+
+Both stage arguments enable a model with inputs `(t, x, beta)`, with beta
+normalized to `[-1, 1]` using the fixed range bounds. Stage 1 samples beta uniformly
+across the range for every PDE, initial-condition, and boundary-condition point.
+Stage 2 fixes beta at the target. Optimizer state carries across the transition;
+one LR schedule spans the sum of the stage budgets, which replace `--steps`.
+The example uses warmup then constant LR; omit `--cosine-decay 1` for cosine decay
+over the full run. Either stage budget can be zero for a control run.
+
+In staged mode, the default range is `[1, 200]` and default target is `200`.
+The original `(t, x)` benchmark remains in `experiments.pinns.convection_pinn`,
+with its beta default of `40`. Family runs write to `runs/convection_family_pinn/`. Logs identify each stage; `rel_l2` and PDE/IC/BC validation losses always
+refer to the target. Additional `rel_l2_beta_*` metrics score the endpoints and
+midpoint, including at the stage transition and final step. Training loss in stage 1
+averages over the family, while stage 2 training loss covers only the target.
+
 **WikiText-103 GPT** (needs the `llm` extra + a GPU; downloads the dataset on first run):
 
 ```bash
@@ -145,6 +199,65 @@ uv run python -m experiments.transformers.wikitext_gpt --optimizer gnome_hutchin
 `--optimizer` is `gnome_hutchinson`, `gnome_fisher`, `soap`, or `adamw`. Cross-entropy
 gradients don't vanish at the optimum, so here *every* optimizer (Gnome included) uses a
 cosine schedule.
+
+**CUB-200-2011 bird classification** (needs the `vision` extra):
+
+```bash
+uv run --extra vision -m experiments.resnets.cub200 \
+    --optimizer gnome_hutchinson --download --save-checkpoint
+```
+
+The [official dataset](https://www.vision.caltech.edu/datasets/cub_200_2011/)
+contains 200 bird species. `--download` retrieves the approximately 1.2 GB archive
+from [CaltechDATA](https://data.caltech.edu/records/65de6-vp158), verifies its MD5,
+and extracts it under `experiments/data`. For existing data, `--data-dir` accepts
+the `CUB_200_2011` directory or its parent; subsequent runs need no download flag.
+
+The experiment uses the official train/test split and only species labels.
+It trains from scratch with the shared GELU ResNet trunk, a 7×7 stride-2 stem
+and max-pool for larger images, and GroupNorm by default. Defaults are ResNet-18,
+224×224 crops, batch size 32, and 100 epochs. CUB owns its augmentation policy:
+random resized crops (area fraction 0.2–1.0, aspect ratio 3/4–4/3), horizontal
+flips (p=0.5), and color jitter (brightness/contrast 0.2, saturation 0.1, no hue
+shift). Crops resize to `--image-size` (224 by default). Evaluation uses
+resize/center-crop. `--no-augment` disables all three random transformations.
+The full policy is recorded in run metadata.
+All images use fixed ImageNet channel normalization.
+
+To fine-tune an ImageNet-pretrained ResNet-18:
+
+```bash
+uv run --extra vision -m experiments.resnets.cub200 \
+    --optimizer gnome_hutchinson --arch resnet18_pretrained --save-checkpoint
+```
+
+`--arch` is an alias for `--model`. This option uses torchvision's standard
+ReLU ResNet-18 with `IMAGENET1K_V1` weights, retains BatchNorm by default, and
+replaces the classifier with a fresh 200-class head. All layers are fine-tuned.
+Weights download automatically once into the PyTorch cache, independently of
+the dataset's `--download` flag. Explicit `--norm gn` converts BatchNorm to
+GroupNorm, copying affine parameters and discarding running statistics.
+Run metadata records the weight source and normalization. Existing model
+choices continue to train from scratch with GroupNorm by default.
+
+Choose `gnome_hutchinson`, `gnome_fisher`, `soap`, or `adamw`; all receive the
+same warmup/cosine schedule. All support GroupNorm or BatchNorm. Gnome draws its auxiliary
+samples from the intact main batch. Its auxiliary forward uses batch statistics
+without updating BatchNorm's running mean, variance, or batch counter; only the
+main forward updates those buffers. CUB owns its optimizer factory and
+convolution-factor partition settings, with no dependency on the CIFAR-100 module.
+`--merge-dims` selects `none`, `greedy`, `spatial`, or `patch` partitions.
+`--model resnet12` selects a smaller model; `--workers 4` enables parallel image
+loading. `--max-steps 10 --warmup-steps 0` is useful for a short diagnostic run.
+
+Runs write to `runs/cub200/`. Each epoch reports test cross-entropy, top-1 and
+top-5 as `val` metrics; metadata explicitly identifies the official test split.
+`train_eval_loss`, `train_eval_top1`, and `train_eval_top5` score the training
+set with the same deterministic evaluation transform, exposing the generalization
+gap. Accuracy values are fractions. `training_seconds` excludes evaluation time;
+the final record also includes total wall time. `--save-checkpoint` saves the
+final model, optimizer state, and configuration alongside the JSONL. The test
+set does not select the saved checkpoint or control early stopping.
 
 Pass `--help` to any experiment for the full argument list.
 

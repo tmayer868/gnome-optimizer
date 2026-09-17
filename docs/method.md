@@ -48,10 +48,10 @@ with the un-square-rooted denominator. This is the diagonal Gauss-Newton update 
 A pure Newton step has no built-in step-size control. Gnome imposes an **l2 trust region** on the update in the rotated basis:
 
 $$
-\| \Delta\tilde\theta \|_2 \;\le\; T \;=\; c \cdot \sqrt{P},
+\| \Delta\tilde\theta \|_2 \;\le\; T \;=\; c \sqrt{\|p_t\|_2^2 + S_0},
 $$
 
-where $P$ is the number of elements in the parameter tensor and $c$ is the `trust_radius` hyperparameter (typically $0.1$ to $1.0$). The smallest $\lambda \ge \varepsilon$ that satisfies this constraint is found by solving the secular equation
+where $c$ is `trust_radius` and $S_0 = \|p_0\|_2^2$ is captured when that parameter first participates in an optimizer step. The smallest $\lambda \ge \varepsilon$ that satisfies this constraint is found by solving the secular equation
 
 $$
 \phi(\lambda) \;=\; \left\| \frac{\hat m}{\hat v + \lambda} \right\|_2 \;=\; T,
@@ -64,7 +64,11 @@ via Hebden's reciprocal Newton method. Convergence takes 2 to 3 iterations, warm
 1. **It preserves the update direction.** Uniform damping shrinks the step along the Newton-to-gradient-descent continuum without distorting which coordinates move relative to each other. Per-coordinate clipping projects onto an l-infinity ball, which can scramble the relative ordering of updates.
 2. **No single coordinate dominates.** The l2 norm aggregates all $P$ coordinates, so an outlier with spuriously small $\hat v_i$ cannot single-handedly set the damping for the entire tensor.
 
-**Why $\sqrt{P}$ scaling.** The L2 norm of the Newton step naturally scales as $\sqrt{P}$ (sum of $P$ squared terms). Without the $\sqrt{P}$ factor, a single $c$ could not work across layers of different widths. The scaling makes $c$ a dimensionless "RMS per-coordinate" bound, roughly the allowed typical per-element update magnitude. This is directly analogous to the old per-coordinate `clip=1.0`, but enforced through the L2 budget rather than by projection.
+**Initialization-based scale.** The budget grows with the current parameter norm and retains the initialization norm as a floor. Equivalently, its RMS form is $T/\sqrt{P} = c\sqrt{\operatorname{mean}(p_t^2) + S_0/P}$. This replaces an absolute per-coordinate floor with a model-supplied scale and adds no hyperparameter.
+
+Each parameter stores `initial_sq_norm = p.detach().square().sum()` only if that state entry is absent. If that squared norm is zero, store `1.0` instead. This is the expected squared norm of a length-$N$ vector with Xavier variance $1/N$, assuming a hypothetical square layer: $N(1/N)=1$. It is a scale proxy, not a claim about the tensor's actual layer dimensions. The initial parameters remain zero. Ordinary optimizer checkpointing saves and restores the scalar; older checkpoints acquire it on the next step.
+
+The existing coordinate clamp to `[-1, 1]` after projection remains in place; it can only reduce the update norm. The trust budget applies before learning-rate scaling and excludes decoupled weight decay.
 
 **Behavior at the extremes.** When curvature is well-estimated and the unconstrained Newton step already satisfies $\|\hat m / \hat v\|_2 \le T$, the constraint is slack: $\lambda = \varepsilon$ and the update is a pure diagonally-preconditioned Newton step. When curvature is unreliable (small $\hat v_i$, e.g. early in training while the eigenbasis is still warming up), $\lambda$ grows and the update degrades smoothly toward $\hat m / \lambda$, which is bounded gradient descent in the rotated basis. The trust region is a safeguard, not the primary step-size control; at sensible learning rates and $c \sim 1$ it rarely binds on well-conditioned steps.
 
@@ -310,7 +314,7 @@ For each minibatch, with `main_closure` returning $(\hat y, y)$ on the $B-K$ mai
    - Project $g_{\text{main}}$ and $g_s$ into the rotated basis: $\tilde g = Q_L^\top g\, Q_R$.
    - Update the first-moment EMA from $\tilde g_{\text{main}}$ (`beta1`) and the second-moment EMA from $\tilde g_s^{\,2}$ (`beta2`).
    - Apply bias correction to obtain $\hat m$ and $\hat v$.
-   - Solve for the trust-region damping $\lambda$: the smallest value $\ge \varepsilon$ such that $\|\hat m / (\hat v + \lambda)\|_2 \le c \cdot \sqrt{P}$, where $c$ is `trust_radius` and $P$ is the number of elements in the parameter tensor. Solved via Hebden's reciprocal Newton method (2 to 3 iterations), warm-started from the previous step's $\lambda$, with an analytic bracket from $\min(\hat v)$ and $\max(\hat v)$.
+   - Solve for the trust-region damping $\lambda$: the smallest value $\ge \varepsilon$ such that $\|\hat m / (\hat v + \lambda)\|_2 \le c\sqrt{\|p_t\|_2^2 + S_0}$, where $c$ is `trust_radius` and $S_0$ is the fixed initialization reference from §2. Solved via Hebden's reciprocal Newton method (2 to 3 iterations), warm-started from the previous step's $\lambda$, with an analytic bracket from $\min(\hat v)$ and $\max(\hat v)$.
    - Compute the damped Newton step: $\Delta \tilde\theta = \hat m / (\hat v + \lambda)$.
    - Project back to the parameter basis: $\Delta\theta = Q_L \, \Delta\tilde\theta \, Q_R^\top$. Because the $Q$ matrices are orthonormal, $\|\Delta\theta\|_2 = \|\Delta\tilde\theta\|_2$. The trust region bound is preserved exactly.
    - Apply with $-\text{lr}$, then decoupled weight decay. Gnome owns no learning-rate schedule: `lr` is read from the parameter group on every step and multiplies the update *after* the trust-region solve, so it scales step length linearly and any `torch.optim.lr_scheduler` drives Gnome exactly as it drives AdamW.

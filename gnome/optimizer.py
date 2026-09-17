@@ -17,8 +17,9 @@ into a second-order method:
    diagonal Gauss-Newton update inside the eigenbasis. A pure Newton step
    has no built-in step-size control, so Gnome damps it with a
    Levenberg-Marquardt ``lambda`` chosen as the smallest value satisfying
-   ``||m / (v + lambda)||_2 <= trust_radius * sqrt(P)``, with ``P`` the
-   element count of the parameter tensor. Because ``Q_L`` and ``Q_R`` are
+   ``||m / (v + lambda)||_2 <= trust_radius * sqrt(||p||² + S0)``, where
+   ``S0`` is the tensor's squared norm on its first optimizer step.
+   Because ``Q_L`` and ``Q_R`` are
    orthonormal the l2 norm survives the rotation back, so the bound holds
    in parameter space too. It is a trust region, not a band-aid: when
    curvature is well-conditioned it never binds, but it prevents blow-ups
@@ -108,6 +109,7 @@ import torch
 import torch.nn.functional as F
 from torch.optim.optimizer import Optimizer
 import math
+import random
 
 ClosureReturn = Tuple[torch.Tensor, torch.Tensor]
 MergeDims = Union[bool, str, Sequence[Sequence[int]]]
@@ -252,15 +254,13 @@ class Gnome(Optimizer):
             factor maintained along that dimension).
         trust_radius: l2 trust region on the update in the rotated basis.
             ``lambda`` is set to the smallest value (floored at ``eps``) for
-            which ``||m / (v + lambda)||_2 <= trust_radius * sqrt(P)``, with
-            ``P = p.numel()``. The ``sqrt(P)`` scaling is what makes a single
-            value work across layers of different width: the l2 norm of the
-            step grows as ``sqrt(P)``, so dividing it out leaves
-            ``trust_radius`` as a dimensionless RMS-per-coordinate bound —
-            roughly the typical per-element update magnitude, in units of
-            ``lr``. Typical values are 0.1 to 1.0. Larger = weaker bound =
-            longer steps; ``None`` disables the solve and falls back to plain
-            ``m / (v + eps)`` damping.
+            which ``||m / (v + lambda)||_2 <= trust_radius * sqrt(||p||² + S0)``.
+            ``S0`` is the squared parameter norm captured on its first step
+            and saved in ordinary optimizer state. An entirely zero tensor
+            uses ``S0 = 1``, the expected squared norm of a length-N vector
+            with Xavier variance ``1/N`` under a hypothetical square layer.
+            Larger = weaker bound = longer steps; ``None`` disables the solve
+            and falls back to plain ``m / (v + eps)`` damping.
 
             Because the bound is on the l2 norm and the ``Q`` matrices are
             orthonormal, it transfers exactly to the parameter basis. A
@@ -500,6 +500,10 @@ class Gnome(Optimizer):
             "eps": eps,
             "lr": lr,
             "trust_radius": trust_radius,
+            "trust_budget": (
+                trust_radius * (p.square().sum() + self.state[p]["initial_sq_norm"]).sqrt()
+                if trust_radius is not None else None
+            ),
             # Optimizer-level, so not reachable via group — but metrics that
             # compare v against raw (un-normalized) quantities need it.
             "norm_free": self._norm_free,
@@ -526,6 +530,9 @@ class Gnome(Optimizer):
                 )
             names.append(name)
             reductions.append(val.reshape(()).to(gnd_hat.dtype))
+        if ctx["trust_budget"] is not None:
+            names.append("trust_budget")
+            reductions.append(ctx["trust_budget"].reshape(()))
         if lam_is_tensor:
             reductions.append(lam.reshape(()).to(gnd_hat.dtype))
 
@@ -553,7 +560,11 @@ class Gnome(Optimizer):
         # trust_ratio needs update_rms, which is a metric rather than a
         # built-in — so it is only derivable when that metric is in use.
         if trust_radius is not None and "update_rms" in record:
-            record["trust_ratio"] = record["update_rms"] / trust_radius
+            budget = record["trust_budget"]
+            record["trust_ratio"] = (
+                record["update_rms"] * math.sqrt(p.numel()) / budget
+                if budget > 0 else 0.0
+            )
         elif trust_radius is None:
             record["trust_ratio"] = None
 
@@ -1020,8 +1031,8 @@ class Gnome(Optimizer):
     def _lm_lambda(m, v, T, eps, lam_prev=None, iters=3):
         """Smallest lambda >= eps with ``|| m / (v + lambda) ||_2 <= T``.
 
-        The l2 trust-region solve. ``T`` is ``trust_radius * sqrt(P)`` (see
-        the ``trust_radius`` docstring for why ``sqrt(P)``); the caller is
+        The l2 trust-region solve. ``T`` is ``trust_radius * sqrt(||p||² + S0)``
+        (see ``trust_radius`` for the initialization reference); the caller is
         ``_param_step``, which runs this once per parameter tensor in the
         rotated basis.
 
@@ -1255,6 +1266,12 @@ class Gnome(Optimizer):
     ) -> None:
         state = self.state[p]
 
+        if "initial_sq_norm" not in state:
+            norm_sq = p.detach().square().sum()
+            if norm_sq == 0:
+                norm_sq = norm_sq.new_tensor(1.0)
+            state["initial_sq_norm"] = norm_sq
+
         if "step" not in state:
             state["step"] = 0
         if "grad_m" not in state:
@@ -1339,19 +1356,20 @@ class Gnome(Optimizer):
         #
         #   trust_radius is None -> lam = eps, the plain fixed-damping step
         #   otherwise            -> smallest lam >= eps with
-        #                           ||update||_2 <= trust_radius * sqrt(P)
+        #                           ||update||_2 <= trust_radius * sqrt(||p||² + S0)
         #
         # Larger trust_radius = weaker bound = longer steps. The bound is on
         # the update itself, so ||delta_theta||_2 <= lr * trust_radius *
-        # sqrt(P), and since the Q matrices are orthonormal that survives the
-        # projection back: the knob is an RMS-per-coordinate budget, in units
-        # of lr.
+        # sqrt(||p||² + S0). Orthogonal projection and coordinate clipping
+        # preserve this upper bound; decoupled weight decay is separate.
         eps = group["eps"]
         trust_radius = group["trust_radius"]
         if trust_radius is None:
             lam = eps
         else:
-            T = trust_radius * math.sqrt(p.numel())
+            T = trust_radius * (
+                p.square().sum() + 1.0
+            ).sqrt()
             lam = self._lm_lambda(grad_hat, gnd_hat, T, eps,
                                   lam_prev=state.get("lm_lambda"))
             state["lm_lambda"] = lam
@@ -1365,12 +1383,13 @@ class Gnome(Optimizer):
 
         # Rotate back into the parameter basis. Orthonormal Q means the l2
         # norm — and hence the trust-region bound — carries over exactly, so
-        # no further per-coordinate safeguard is applied here.
+        # subsequent coordinate clipping can only reduce that norm.
         update = self._project_back(
             update_rot, state,
             merge_dims=group["merge_dims"],
             max_precond_dim=group["max_precond_dim"],
         )
+        update = update.clamp(min=-1.0, max=1.0)
 
         p.add_(update, alpha=-lr)
         if group["weight_decay"] > 0.0:

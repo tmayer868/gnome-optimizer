@@ -35,6 +35,24 @@ class ConcatEmbedding(nn.Module):
             )
 
 
+class PolynomialEmbedding(nn.Module):
+    """Map ``(t, x)`` to ``[t, 1 - x², x(1 - x²)]``.
+
+    The endpoints ``x = -1`` and ``x = 1`` have identical features, so a
+    downstream network has matching endpoint values. Its spatial derivatives
+    need not match; this embedding does not enforce full periodicity.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.n_inputs = 2
+        self.out_dim = 3
+
+    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        envelope = 1 - x.square()
+        return torch.cat([t, envelope, x * envelope], dim=1)
+
+
 class PeriodicEmbedding(nn.Module):
     """Replace selected coordinates with fixed periodic harmonics.
 
@@ -171,6 +189,7 @@ ConcatEmbed = ConcatEmbedding
 __all__ = [
     "ConcatEmbed",
     "ConcatEmbedding",
+    "PolynomialEmbedding",
     "PeriodicEmbedding",
     "TrainableFourierEmbedding",
 ]

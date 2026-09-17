@@ -474,7 +474,7 @@ def parse_args() -> argparse.Namespace:
                         "a step. Larger -> weaker bound -> longer steps. "
                         "0 disables it, falling back to plain m̂/(v̂+eps) "
                         "damping.")
-    p.add_argument("--eps", type=float, default=1e-6,
+    p.add_argument("--eps", type=float, default=1e-12,
                    help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
                         "-> more gradient-descent-like, smaller -> fuller Newton "
                         "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")

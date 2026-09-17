@@ -5,6 +5,7 @@ from experiments.common.divergence import DIVERGED_EXIT, diverged
 from experiments.common.embedding_layers import (
     ConcatEmbed,
     ConcatEmbedding,
+    PolynomialEmbedding,
     PeriodicEmbedding,
     TrainableFourierEmbedding,
 )
@@ -33,6 +34,7 @@ __all__ = [
     "diverged",
     "ConcatEmbed",
     "ConcatEmbedding",
+    "PolynomialEmbedding",
     "PeriodicEmbedding",
     "TrainableFourierEmbedding",
     "FusedMLP",

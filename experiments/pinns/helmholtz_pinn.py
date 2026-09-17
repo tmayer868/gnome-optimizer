@@ -287,7 +287,12 @@ def make_eval_set(
     y = torch.linspace(Y_MIN, Y_MAX, ns, **kw)
     xx, yy = torch.meshgrid(x, y, indexing="ij")
     coords = (xx.reshape(-1, 1), yy.reshape(-1, 1))
-    return coords, exact_solution(*coords, a1, a2)
+    # Evaluate the reference at the same coordinates seen by the model, but
+    # compute the analytic solution in float64. MPS requires CPU for float64.
+    metric_device = torch.device("cpu") if device.type == "mps" else device
+    # Transfer first: a combined MPS-to-CPU/double conversion is unreliable.
+    ref_coords = tuple(c.to(device=metric_device).double() for c in coords)
+    return coords, exact_solution(*ref_coords, a1, a2)
 
 
 def eval_errors(
@@ -298,6 +303,9 @@ def eval_errors(
     Both are reported because Table 3 reports both, and they separate cleanly
     here: rel_L2 is an average over a domain that is mostly easy, rel_Linf
     catches the antinodes where the oscillation is hardest to fit.
+
+    Model inference retains the training dtype; predictions are promoted to
+    float64 before subtraction and reduction against the float64 reference.
     """
     x, y = coords
     was_training = model.training
@@ -307,7 +315,8 @@ def eval_errors(
     with torch.no_grad():
         for i in range(0, x.shape[0], batch_size):
             sl = slice(i, i + batch_size)
-            err = (model(x[sl], y[sl]) - u_ref[sl]).abs()
+            prediction = model(x[sl], y[sl]).to(device=u_ref.device).double()
+            err = (prediction - u_ref[sl]).abs()
             sq += err.pow(2).sum()
             mx = torch.maximum(mx, err.max())
     if was_training:

@@ -1,4 +1,4 @@
-"""1D reaction PINN: AdamW vs SOAP vs Gnome.
+"""1D reaction PINN: AdamW vs SOAP vs Gnome vs ENGD-W.
 
 PDE:  u_t - rho*u*(1-u) = 0,    x in [0, 2*pi],  t in [0, 1]
 IC:   u(0, x) = exp(-(x-pi)^2 / (2*(pi/4)^2))
@@ -22,9 +22,12 @@ PDE and IC blocks.
 
 The default model matches the paper's function class: raw (t, x), four hidden
 layers of width 50 with tanh activations, a soft IC, and a soft C0 periodic BC.
-This repo resamples collocation points every optimizer step, whereas the
+By default this repo resamples collocation points every optimizer step, whereas the
 paper's released implementation samples a fixed set, so the numbers are an
 order-of-magnitude anchor rather than a bit-for-bit reproduction.
+
+``--engdw-fixed`` samples ENGD-W's training points once and reuses them for
+all steps; validation remains independent.
 
 ``--embed periodic`` is an ablation that feeds [t, cos(x), sin(x)]. It makes
 the BC exact and drops that residual block. It is not the published setup and
@@ -37,6 +40,8 @@ Usage:
     uv run -m experiments.pinns.reaction_pinn --optimizer gnome --rho 5
     uv run -m experiments.pinns.reaction_pinn --optimizer adamw --rho 5
     uv run -m experiments.pinns.reaction_pinn --optimizer soap --rho 10
+    uv run -m experiments.pinns.reaction_pinn --optimizer engdw --rho 5 \
+        --engdw-line-search --engdw-damping 1e-6 --engdw-chunk 128 --steps 1000
     uv run -m experiments.pinns.reaction_pinn --optimizer gnome --rho 5 \
         --arch fused-modified --fuse-every 2 --depth 6
 """
@@ -51,8 +56,9 @@ import time
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
+from torch.func import functional_call, jacrev, vmap
 
-from experiments.baselines import SOAP
+from experiments.baselines import ENGDW, SOAP
 from experiments.common import (
     DIVERGED_EXIT,
     FusedMLP,
@@ -248,6 +254,72 @@ def eval_rel_l2(
 
 # ========================= Optimizer factory =========================
 
+def make_engdw_functions(
+    model: nn.Module, rho: float, use_bc: bool = True, chunk_size: int | None = 32,
+):
+    """Return the normalized ENGD-W residual and its per-sample Jacobian.
+
+    Its squared norm equals ``stacked_residuals(...).square().mean()``.
+    ENGD-W uses half this value as its energy; damping therefore belongs to
+    J.T @ J for this normalization, independently of total batch size.
+
+    torch.func input differentiation allows jacrev to differentiate through
+    u_t as well as the nonlinear reaction term. The PDE Jacobian is
+    d_theta(u_t) - rho * (1 - 2*u) * d_theta(u).
+    """
+    def u_single(params, tx):
+        return functional_call(
+            model, params, (tx[0:1].reshape(1, 1), tx[1:2].reshape(1, 1))
+        ).squeeze()
+
+    du = jacrev(u_single, argnums=1)
+
+    def pde_single(params, tx):
+        u = u_single(params, tx)
+        return du(params, tx)[0] - rho * u * (1.0 - u)
+
+    def ic_single(params, x):
+        tx = torch.cat((torch.zeros_like(x), x))
+        return u_single(params, tx) - initial_condition(x).squeeze()
+
+    def bc_single(params, t):
+        left = torch.cat((t, torch.full_like(t, X_MIN)))
+        right = torch.cat((t, torch.full_like(t, X_MAX)))
+        return u_single(params, left) - u_single(params, right)
+
+    def residual(params, batch):
+        t_pde, x_pde, x_ic, t_bc = batch
+        r_pde = vmap(pde_single, in_dims=(None, 0))(
+            params, torch.cat((t_pde, x_pde), dim=1)
+        )
+        u_ic = functional_call(model, params, (torch.zeros_like(x_ic), x_ic))
+        blocks = [r_pde, (u_ic - initial_condition(x_ic)).reshape(-1)]
+        if use_bc:
+            u_l = functional_call(model, params, (t_bc, torch.full_like(t_bc, X_MIN)))
+            u_r = functional_call(model, params, (t_bc, torch.full_like(t_bc, X_MAX)))
+            blocks.append((u_l - u_r).reshape(-1))
+        return torch.cat([r / math.sqrt(r.numel()) for r in blocks]).unsqueeze(1)
+
+    def jacobian(params, batch):
+        t_pde, x_pde, x_ic, t_bc = batch
+        blocks = [(pde_single, torch.cat((t_pde, x_pde), dim=1)),
+                  (ic_single, x_ic)]
+        if use_bc:
+            blocks.append((bc_single, t_bc))
+        # Samples are independent. vmap(jacrev(one residual)) computes only
+        # the necessary N parameter gradients, rather than differentiating
+        # a batched forward N times with mostly-zero cotangents.
+        jacobians = []
+        for fn, points in blocks:
+            block = vmap(jacrev(fn), in_dims=(None, 0), chunk_size=chunk_size)(
+                params, points
+            )
+            jacobians.append({k: v / math.sqrt(len(points)) for k, v in block.items()})
+        return {k: torch.cat([block[k] for block in jacobians]) for k in params}
+
+    return residual, jacobian
+
+
 def build_optimizer(
     name: str,
     params,
@@ -305,10 +377,10 @@ def build_optimizer(
 
 # ========================= CLI and training =========================
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument(
-        "--optimizer", required=True, choices=["gnome", "soap", "adamw"]
+        "--optimizer", required=True, choices=["gnome", "soap", "adamw", "engdw"]
     )
     p.add_argument(
         "--rho", type=float, default=5.0,
@@ -356,6 +428,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--beta2", type=float, default=0.99)
     p.add_argument("--weight-decay", type=float, default=1e-8)
     p.add_argument(
+        "--engdw-damping", type=float, default=1e-6,
+        help="ENGD-W fixed damping in JJ^T + lambda I; reaction starting "
+             "value, not a tuned result. No weight decay or LR schedule is used.",
+    )
+    p.add_argument(
+        "--engdw-line-search", action="store_true",
+        help="Choose the lowest same-batch loss on 13 log-spaced step sizes "
+             "from 1e-3 to 1, overriding --lr (same grid as Poisson-5D).",
+    )
+    p.add_argument(
+        "--engdw-fixed", action="store_true",
+        help="ENGD-W only: sample PDE/IC/BC training points once and reuse "
+             "them every step. Validation points remain independently sampled.",
+    )
+    p.add_argument(
+        "--engdw-chunk", type=int, default=32,
+        help="Samples per vectorized Jacobian chunk for ENGD-W; limits differentiation "
+             "workspace, while the full Jacobian and sample Gram remain dense.",
+    )
+    p.add_argument(
         "--hidden", type=int, default=50,
         help="Network width; 50 matches the published model.",
     )
@@ -371,8 +463,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--float64", action="store_true",
-        help="Use float64, falling back to CPU when the selected device is "
-             "MPS.",
+        help="Use float64 (always enabled for ENGD-W), falling back to CPU "
+             "when the selected device is MPS.",
     )
     p.add_argument(
         "--diagnostics-every", type=int, default=0,
@@ -385,22 +477,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def train(args: argparse.Namespace) -> str:
+    if args.engdw_fixed and args.optimizer != "engdw":
+        raise SystemExit("--engdw-fixed requires --optimizer engdw")
     if args.rho < 0.0:
         raise SystemExit("--rho must be non-negative")
     if args.aux_frac <= 0.0:
         raise SystemExit("--aux-frac must be positive")
+    if min(args.n_pde, args.n_ic, args.n_bc, args.steps) < 1:
+        raise SystemExit("sample counts and --steps must be positive")
+    if args.diagnostics_every > 0 and args.optimizer != "gnome":
+        raise SystemExit("--diagnostics-every is Gnome-only")
+    if args.optimizer == "engdw":
+        if not math.isfinite(args.engdw_damping) or args.engdw_damping <= 0:
+            raise SystemExit("--engdw-damping must be finite and positive")
+        if args.engdw_chunk < 1:
+            raise SystemExit("--engdw-chunk must be positive")
+        if not math.isfinite(args.lr) or args.lr < 0:
+            raise SystemExit("--lr must be finite and non-negative")
 
     device = pick_device()
-    if args.float64:
+    if args.float64 or args.optimizer == "engdw":
         torch.set_default_dtype(torch.float64)
         if device.type == "mps":
             if not args.quiet:
                 print(
-                    f"[{EXPERIMENT}] --float64: MPS has no double support; "
+                    f"[{EXPERIMENT}] float64: MPS has no double support; "
                     "using CPU.", flush=True,
                 )
             device = torch.device("cpu")
@@ -414,23 +519,42 @@ def train(args: argparse.Namespace) -> str:
         args.depth,
         args.fuse_every,
     ).to(device)
-    opt, opt_cfg, scheduler = build_optimizer(
-        args.optimizer,
-        model.parameters(),
-        args.lr,
-        args.weight_decay,
-        warmup=args.warmup_steps,
-        total_steps=args.steps,
-        cosine_decay=args.cosine_decay,
-        eps=args.eps,
-        beta1=args.beta1,
-        beta2=args.beta2,
-        trust_region=args.trust_region,
-    )
+    if args.optimizer == "engdw":
+        residual_fn, jacobian_fn = make_engdw_functions(
+            model, args.rho, use_bc, chunk_size=args.engdw_chunk,
+        )
+        opt = ENGDW(
+            model, residual_fn, jacobian_fn=jacobian_fn,
+            lr=args.lr, damping=args.engdw_damping,
+            line_search=args.engdw_line_search, chunk_size=args.engdw_chunk,
+        )
+        opt_cfg = dict(
+            lr=args.lr, damping=args.engdw_damping,
+            line_search=args.engdw_line_search,
+            ls_grid=opt.ls_grid if args.engdw_line_search else None,
+            chunk_size=args.engdw_chunk, weight_decay=0.0, schedule="none",
+            jacobian="vmap(jacrev(single_residual))",
+            energy="0.5 * sum(block MSEs)", residual_scaling="1/sqrt(N_block)",
+        )
+        scheduler = None
+    else:
+        opt, opt_cfg, scheduler = build_optimizer(
+            args.optimizer,
+            model.parameters(),
+            args.lr,
+            args.weight_decay,
+            warmup=args.warmup_steps,
+            total_steps=args.steps,
+            cosine_decay=args.cosine_decay,
+            eps=args.eps,
+            beta1=args.beta1,
+            beta2=args.beta2,
+            trust_region=args.trust_region,
+        )
 
-    n_pde_aux = max(1, int(args.n_pde * args.aux_frac))
-    n_ic_aux = max(1, int(args.n_ic * args.aux_frac))
-    n_bc_aux = max(1, int(args.n_bc * args.aux_frac))
+    n_pde_aux = max(1, int(args.n_pde * args.aux_frac)) if args.optimizer == "gnome" else 0
+    n_ic_aux = max(1, int(args.n_ic * args.aux_frac)) if args.optimizer == "gnome" else 0
+    n_bc_aux = max(1, int(args.n_bc * args.aux_frac)) if args.optimizer == "gnome" else 0
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
@@ -451,6 +575,7 @@ def train(args: argparse.Namespace) -> str:
         "n_pde_aux": n_pde_aux,
         "n_ic_aux": n_ic_aux,
         "n_bc_aux": n_bc_aux,
+        "sampling": "fixed" if args.engdw_fixed else "resample_each_step",
         "diagnostics_every": args.diagnostics_every,
         "x_domain": (X_MIN, X_MAX),
         "t_domain": (T_MIN, T_MAX),
@@ -468,11 +593,6 @@ def train(args: argparse.Namespace) -> str:
 
     diag = None
     if args.diagnostics_every > 0:
-        if args.optimizer != "gnome":
-            raise SystemExit(
-                f"--diagnostics-every is Gnome-only; --optimizer "
-                f"{args.optimizer} exposes no diagnostics hook."
-            )
         diag_params = (
             None if not args.diagnostics_params
             else [int(s) for s in args.diagnostics_params.split(",")]
@@ -501,11 +621,17 @@ def train(args: argparse.Namespace) -> str:
     last_avg = last_rel_l2 = float("nan")
     last_terms: dict[str, float] = {}
     best_avg = best_rel_l2 = float("inf")
+    training_seconds = 0.0
+    fixed_batch = None
 
     for step in range(args.steps):
-        main_batch = sample_batch(
-            args.n_pde, args.n_ic, args.n_bc, device
-        )
+        step_start = time.perf_counter()
+        if fixed_batch is None:
+            main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
+            if args.engdw_fixed:
+                fixed_batch = main_batch
+        else:
+            main_batch = fixed_batch
         if args.optimizer == "gnome":
             aux_batch = sample_batch(
                 n_pde_aux, n_ic_aux, n_bc_aux, device
@@ -520,6 +646,8 @@ def train(args: argparse.Namespace) -> str:
                 return r, torch.zeros_like(r)
 
             loss = opt.step(main_closure, aux_closure)
+        elif args.optimizer == "engdw":
+            loss = opt.step(main_batch)
         else:
             opt.zero_grad()
             r = stacked_residuals(model, main_batch, args.rho, use_bc)
@@ -527,10 +655,12 @@ def train(args: argparse.Namespace) -> str:
             loss.backward()
             opt.step()
 
+        applied_lr = current_lr(opt)
         if scheduler is not None:
             scheduler.step()
 
-        loss_val = float(loss.detach().item())
+        loss_val = float(loss.detach().item()) if torch.is_tensor(loss) else float(loss)
+        training_seconds += time.perf_counter() - step_start
         if diverged(loss_val):
             run.finish(completed=False, diverged=True, diverged_step=step)
             if diag is not None:
@@ -540,7 +670,8 @@ def train(args: argparse.Namespace) -> str:
                 flush=True,
             )
             raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=loss_val)
+        run.log_train(step, loss=loss_val, lr=applied_lr,
+                      training_seconds=training_seconds)
         window.append(loss_val)
 
         should_log = args.log_every and (step + 1) % args.log_every == 0
@@ -561,6 +692,7 @@ def train(args: argparse.Namespace) -> str:
                 loss=last_avg,
                 lr=current_lr(opt),
                 rel_l2=rl2,
+                training_seconds=training_seconds,
                 **tl,
             )
             if not args.quiet:
@@ -580,6 +712,7 @@ def train(args: argparse.Namespace) -> str:
         best_avg_train=best_avg,
         final_rel_l2=last_rel_l2,
         best_rel_l2=best_rel_l2,
+        training_seconds=training_seconds,
     )
     if diag is not None:
         diag.close()

@@ -194,6 +194,7 @@ EXPERIMENT_PACKAGES = {
         "burgers2d_pinn",
         "burgers_pinn",
         "convection_pinn",
+        "convection_family_pinn",
         "generate_allen_cahn_reference",
         "helmholtz_pinn",
         "inviscid_burgers_pinn",
@@ -206,7 +207,7 @@ EXPERIMENT_PACKAGES = {
         "reaction_pinn",
         "wave_pinn",
     },
-    "resnets": {"cifar100", "cifar_rotation", "grating_freq", "utkface"},
+    "resnets": {"cifar100", "cifar_rotation", "cub200", "grating_freq", "utkface"},
     "transformers": {"wikitext_gpt"},
 }
 

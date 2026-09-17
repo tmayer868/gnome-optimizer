@@ -69,8 +69,8 @@ class _BasicBlock(nn.Module):
 _SPECS = {
     #            channels             blocks       strides       gn_groups
     "resnet8":  ((16, 32, 64),        (1, 1, 1),    (1, 2, 2),    8),
-    "resnet12": ((48, 96, 192),       (2, 2, 1),    (1, 2, 2),    8),
-    "resnet18": ((64, 128, 256, 512), (2, 2, 2, 2), (1, 2, 2, 2), 32),
+    "resnet12": ((48, 96, 192),       (2, 2, 4),    (1, 2, 2),    8),
+    "resnet18": ((64, 128, 256),      (2, 4, 2),    (1, 2, 2),    16),
 }
 
 MODEL_NAMES = tuple(_SPECS)  # ("resnet8", "resnet12", "resnet18")

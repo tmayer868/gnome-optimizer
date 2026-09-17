@@ -45,6 +45,8 @@ Each metric receives this dict and must return a **0-dim tensor** (see
 ``eps``         curvature floor (Python float)
 ``lr``          learning rate applied this step
 ``trust_radius`` the group's trust radius, or ``None``
+``trust_budget`` actual L2 budget ``trust_radius * sqrt(||p||² + S0)``,
+                before learning-rate scaling, or ``None``
 ``p``           the parameter tensor itself
 ``state``       Gnome's per-parameter state — the escape hatch. Holds the raw
                 pre-bias-correction EMAs ``gnd_m`` / ``grad_m``, the Kronecker
@@ -94,9 +96,11 @@ From :data:`DEFAULT_METRICS` — present only while those metrics are in use:
                       region binds and pushes ``lam`` past ``eps``
 ``grad_rms``          RMS of the bias-corrected gradient EMA
 ``update_rms``        RMS of the update, in units of ``lr``. Basis-independent
-                      (the Q matrices are orthonormal), so it is also the RMS
-                      of the final parameter update
-``trust_ratio``       ``update_rms / trust_radius`` — the fraction of the
+                      (the Q matrices are orthonormal), measured before
+                      coordinate clipping and decoupled weight decay
+``trust_budget``      Actual L2 budget, before learning-rate scaling. Included
+                      whenever the trust region is enabled
+``trust_ratio``       ``update_rms * sqrt(numel) / trust_budget`` — the fraction of the
                       trust-region budget spent; ~1.0 means the constraint is
                       active. ``None`` when ``trust_radius=None``. Derived
                       from ``update_rms``, so it disappears if you drop that
