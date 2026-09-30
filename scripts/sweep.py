@@ -196,6 +196,7 @@ EXPERIMENT_PACKAGES = {
         "convection_pinn",
         "convection_family_pinn",
         "generate_allen_cahn_reference",
+        "ginzburg_landau",
         "helmholtz_pinn",
         "inviscid_burgers_pinn",
         "kdv_pinn",

@@ -7,10 +7,13 @@ Extracted from the Poisson-5D benchmark so PDEs share the same solver.
 Residual blocks must be divided by sqrt(their sample count), giving
 energy 0.5 * sum(block MSEs). step() reports twice this energy to match
 experiment training losses. Damping is fixed; there is no weight decay,
-momentum, sketching, or learning-rate schedule inside this baseline.
+sketching, or learning-rate schedule inside this baseline. Optional SPRING-style
+momentum centers the regularization at the previous direction.
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 from torch.func import jacrev
@@ -27,14 +30,23 @@ class ENGDW:
     CPU or CUDA for small damping values and ill-conditioned PINN Jacobians.
 
     ``residual_fn(params, *args) → (N, 1)`` with energy ``L = 0.5‖r‖²``.
+
+    With momentum μ, minimize ``‖Jδ-r‖² + λ‖δ-μδ_prev‖²`` via
+    ``δ = base + Jᵀ(JJᵀ+λI)⁻¹(r-J base)``, ``base = μδ_prev``.
+    History stores the unscaled direction, before the step size / line search.
+    ``reset_state()`` clears that history without changing model parameters.
     """
 
     def __init__(self, model, residual_fn, lr=5.2289e-2, damping=6.804474e-8,
-                 line_search=False, ls_grid=None, chunk_size=None, jacobian_fn=None):
+                 line_search=False, ls_grid=None, chunk_size=None, jacobian_fn=None,
+                 momentum=0.0):
+        if not math.isfinite(momentum) or not 0.0 <= momentum < 1.0:
+            raise ValueError("momentum must be finite and in [0, 1)")
         self.model = model
         self.residual_fn = residual_fn
         self.lr = lr
         self.lam = damping
+        self.momentum = momentum
         self.line_search = line_search
         self.ls_grid = ls_grid or torch.logspace(-3, 0, 13).tolist()
         self.chunk_size = chunk_size
@@ -46,6 +58,12 @@ class ENGDW:
         # Duck-type shim so common.current_lr(opt) works; updated per step to the
         # actual η applied (meaningful when line search is on).
         self.param_groups = [{"lr": lr}]
+        self.reset_state()
+
+    def reset_state(self):
+        """Clear direction history, including after an external model reset."""
+        parameter = next(iter(self.params.values()))
+        self.d_prev = parameter.new_zeros(sum(n for _, _, n in self.shapes))
 
     def _unflat(self, flat):
         out, i = {}, 0
@@ -79,13 +97,21 @@ class ENGDW:
         G = 0.5 * (G + G.T)                    # symmetrize before factoring
         G.diagonal().add_(self.lam)
 
+        # Keep the zero-momentum arithmetic identical to the original solver.
+        rhs = r
+        if self.momentum != 0.0:
+            base = self.momentum * self.d_prev
+            rhs = r - J @ base
+
         try:                                    # G is SPD; Cholesky is the right call
             L = torch.linalg.cholesky(G)
-            z = torch.cholesky_solve(r.unsqueeze(1), L).squeeze(1)
+            z = torch.cholesky_solve(rhs.unsqueeze(1), L).squeeze(1)
         except torch.linalg.LinAlgError:        # damping too small for this dtype
-            z = torch.linalg.lstsq(G, r.unsqueeze(1)).solution.squeeze(1)
+            z = torch.linalg.lstsq(G, rhs.unsqueeze(1)).solution.squeeze(1)
 
         delta = J.T @ z                                              # (D,)
+        if self.momentum != 0.0:
+            delta = base + delta
 
         if self.line_search:
             eta = min((self._loss_at(e, delta, args), e) for e in self.ls_grid)[1]
@@ -97,5 +123,6 @@ class ENGDW:
         with torch.no_grad():
             for k, v in self.params.items():
                 v -= upd[k]
+        self.d_prev = delta.detach().clone()
 
         return float((r ** 2).sum())          # PINN loss = sum of block MSEs

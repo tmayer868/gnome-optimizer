@@ -53,6 +53,11 @@ optimizer. Every optimizer gets the same linear-warmup + cosine-decay schedule
 constant, which suits Gnome on MSE since its step self-anneals as the
 residual shrinks).
 
+Use ``--float64-after N`` to run N steps in float32, then continue in
+float64 with the same optimizer state and LR schedule. On MPS the switch
+also moves training to CPU. ``--float64`` (or ``--float64-after 0``) starts
+in double precision immediately.
+
 Reference: jaxpi's ``allen_cahn.mat`` (auto-downloaded to
 ``experiments/reference_solutions/``), the Chebfun solution for this benchmark. A finer,
 independently generated spectral reference can be selected with
@@ -69,6 +74,7 @@ Usage:
     uv run -m experiments.pinns.allen_cahn_pinn --optimizer adamw --arch modified
     uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --embed periodic
     uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --embed polynomial
+    uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --float64-after 30000
 """
 
 from __future__ import annotations
@@ -399,7 +405,7 @@ def build_optimizer(
 
 # ========================= CLI / training =========================
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--optimizer", required=True,
                    choices=["gnome", "soap", "adamw"])
@@ -481,13 +487,19 @@ def parse_args() -> argparse.Namespace:
                    help="Final-LR fraction for the baseline cosine decay: 0.0 "
                         "decays to zero (standard treatment), 1.0 disables "
                         "decay. Gnome (MSE) never decays regardless.")
-    p.add_argument("--float64", action="store_true",
+    precision = p.add_mutually_exclusive_group()
+    precision.add_argument("--float64", action="store_true",
                    help="Run in double precision. Allen-Cahn's stiff canyon "
                         "geometry can push the residual below the float32 "
                         "floor (~1e-6 relative), where the Gauss-Newton "
                         "curvature estimate is reading round-off; float64 "
                         "moves that floor out of the way. MPS has no double "
                         "support, so this falls back to CPU there.")
+    precision.add_argument("--float64-after", type=int, metavar="N",
+                           help="Switch to float64 after N float32 steps, "
+                                "preserving optimizer state and LR schedule. "
+                                "Requires 0 <= N < --steps; 0 starts in "
+                                "float64. MPS moves to CPU at the switch.")
     p.add_argument(
         "--reference",
         choices=["jaxpi", "highres"],
@@ -512,15 +524,67 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+    args = p.parse_args(argv)
+    if args.float64_after is not None and not 0 <= args.float64_after < args.steps:
+        p.error("--float64-after must satisfy 0 <= N < --steps")
+    return args
+
+
+def switch_to_float64(model: nn.Module, opt: torch.optim.Optimizer) -> torch.device:
+    """Promote a model and its accumulated optimizer state between steps."""
+    old_params = list(model.parameters())
+    device = old_params[0].device
+    opt.zero_grad(set_to_none=True)
+    if device.type == "mps":
+        device = torch.device("cpu")
+        # Transfer first: MPS cannot hold even a temporary float64 tensor.
+        model.to(device)
+    model.double()
+
+    def convert(value):
+        if isinstance(value, torch.Tensor):
+            return value.to(device=device).to(
+                dtype=torch.float64 if value.is_floating_point() else value.dtype
+            )
+        if isinstance(value, dict):
+            return {key: convert(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(convert(item) for item in value)
+        return value
+
+    # Module conversion can replace Parameters on a device change. Rebind
+    # optimizer references as well as state keys, retaining the same optimizer.
+    replacements = dict(zip(old_params, model.parameters()))
+    for group in opt.param_groups:
+        group["params"] = [replacements[p] for p in group["params"]]
+    old_state = list(opt.state.items())
+    opt.state.clear()
+    for parameter, state in old_state:
+        opt.state[replacements[parameter]] = {
+            # AdamW's scalar step counter keeps its original dtype/device.
+            key: value if key == "step" else convert(value)
+            for key, value in state.items()
+        }
+    torch.set_default_dtype(torch.float64)
+    return device
 
 
 def train(args: argparse.Namespace) -> str:
-    # float64 must be set before the model is built. CUDA does doubles fine
-    # (just slowly); MPS has no double support at all, so it forces CPU.
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(
+        torch.float64 if args.float64 or args.float64_after == 0 else torch.float32
+    )
+    try:
+        return _train(args)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+
+def _train(args: argparse.Namespace) -> str:
     device = pick_device()
-    if args.float64:
-        torch.set_default_dtype(torch.float64)
+    if torch.get_default_dtype() == torch.float64:
         if device.type == "mps":
             if not args.quiet:
                 print(f"[{EXPERIMENT}] --float64: MPS has no double support "
@@ -577,6 +641,7 @@ def train(args: argparse.Namespace) -> str:
         "t_domain": (T_MIN, T_MAX),
         "device": str(device),
         "dtype": str(torch.get_default_dtype()),
+        "float64_after": args.float64_after,
         "reference": args.reference,
         **{f"opt.{k}": v for k, v in opt_cfg.items()},
     }
@@ -629,10 +694,8 @@ def train(args: argparse.Namespace) -> str:
                   f"→ {diag.path}", flush=True)
         print(f"  loading reference solution ({args.reference})...", flush=True)
     t_ref, x_ref, u_ref = allen_cahn_reference(reference=args.reference)
-    # Coordinates must match the model for inference. Keep the target in
-    # float64: eval_rel_l2 explicitly promotes predictions before error math.
-    dt = torch.get_default_dtype()
-    t_ref, x_ref = t_ref.to(dt), x_ref.to(dt)
+    # Retain the original float64 coordinates for the later precision switch;
+    # eval_rel_l2 casts inference inputs to the model's current dtype/device.
     u_ref = u_ref.to(torch.float64)
     if not args.quiet:
         print(f"  reference grid={u_ref.shape[0]}x{u_ref.shape[1]}", flush=True)
@@ -644,6 +707,15 @@ def train(args: argparse.Namespace) -> str:
     best_avg = best_rel_l2 = float("inf")
 
     for step in range(args.steps):
+        if step == args.float64_after and step > 0:
+            previous_device = device
+            device = switch_to_float64(model, opt)
+            run.log("precision", step=step, from_dtype="torch.float32",
+                    dtype="torch.float64", from_device=str(previous_device),
+                    device=str(device), lr=current_lr(opt))
+            if not args.quiet:
+                print(f"[{EXPERIMENT}] after {step} steps: float32 → float64 "
+                      f"| device={previous_device} → {device}", flush=True)
         main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
         if args.optimizer == "gnome":
             aux_batch = sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device)
@@ -702,6 +774,7 @@ def train(args: argparse.Namespace) -> str:
 
     path = run.finish(
         completed=True,
+        final_dtype=str(torch.get_default_dtype()), final_device=str(device),
         final_avg_train=last_avg, best_avg_train=best_avg,
         final_rel_l2=last_rel_l2, best_rel_l2=best_rel_l2,
     )

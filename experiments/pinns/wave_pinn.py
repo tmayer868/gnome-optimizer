@@ -422,7 +422,7 @@ def parse_args() -> argparse.Namespace:
                         "the smallest value with max|m̂/(v̂+lambda)| <= this, "
                         "so no coordinate moves more than lr*trust_region in "
                         "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
+                        "0 disables it, falling back to plain m̂/(v̂+eps) "     
                         "damping.")
     p.add_argument("--eps", type=float, default=1e-6,
                    help="Gnome curvature-damping epsilon in m̂/(v̂+eps). Gnome "

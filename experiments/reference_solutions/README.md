@@ -8,6 +8,24 @@ first use, and subsequent runs reuse the matching local cache.
 Closed-form analytic references remain defined in their experiment source, and
 training datasets remain under `experiments/data/`.
 
+## Ginzburg–Landau
+
+`experiments.pinns.generate_ginzburg_landau_reference` generates a complex128
+Fourier/ETDRK4 solution on 256² points over `[0,1]`, with maximum step 0.001
+and 201 stored frames. Versioned `ginzburg_landau_v1_*.npz` caches contain
+`t,x,y,u,v`, actual time step, and checked solver metadata. The cache is shared
+across all PINN time horizons. Evaluation uses the full Fourier interpolant in
+space and cubic interpolation in time, without extrapolation.
+
+```bash
+uv run --extra experiments -m experiments.pinns.generate_ginzburg_landau_reference --validate
+```
+
+Default temporal/spatial refinement deltas are below `1.2e-8`; the time
+interpolation delta is `7.5e-8` or less. See the
+[benchmark documentation](../../docs/ginzburg_landau.md) for the validation
+protocol and numerical limitations. No generated arrays are tracked in git.
+
 ## Burgers
 
 `experiments.pinns.burgers_pinn.burgers_reference()` generates the solution via

@@ -22,7 +22,7 @@ PDE and IC blocks.
 
 The default model matches the paper's function class: raw (t, x), four hidden
 layers of width 50 with tanh activations, a soft IC, and a soft C0 periodic BC.
-By default this repo resamples collocation points every optimizer step, whereas the
+By default this repo resamples collocation points everyƒ optimizer step, whereas the
 paper's released implementation samples a fixed set, so the numbers are an
 order-of-magnitude anchor rather than a bit-for-bit reproduction.
 
@@ -433,6 +433,11 @@ def parse_args(argv=None) -> argparse.Namespace:
              "value, not a tuned result. No weight decay or LR schedule is used.",
     )
     p.add_argument(
+        "--engdw-momentum", type=float, default=0.0,
+        help="ENGD-W SPRING-style regularization-center momentum in [0, 1). "
+             "Zero preserves the original solver; try 0.9, 0.95, or 0.99.",
+    )
+    p.add_argument(
         "--engdw-line-search", action="store_true",
         help="Choose the lowest same-batch loss on 13 log-spaced step sizes "
              "from 1e-3 to 1, overriding --lr (same grid as Poisson-5D).",
@@ -492,6 +497,8 @@ def train(args: argparse.Namespace) -> str:
     if args.diagnostics_every > 0 and args.optimizer != "gnome":
         raise SystemExit("--diagnostics-every is Gnome-only")
     if args.optimizer == "engdw":
+        if not math.isfinite(args.engdw_momentum) or not 0 <= args.engdw_momentum < 1:
+            raise SystemExit("--engdw-momentum must be finite and in [0, 1)")
         if not math.isfinite(args.engdw_damping) or args.engdw_damping <= 0:
             raise SystemExit("--engdw-damping must be finite and positive")
         if args.engdw_chunk < 1:
@@ -526,10 +533,12 @@ def train(args: argparse.Namespace) -> str:
         opt = ENGDW(
             model, residual_fn, jacobian_fn=jacobian_fn,
             lr=args.lr, damping=args.engdw_damping,
+            momentum=args.engdw_momentum,
             line_search=args.engdw_line_search, chunk_size=args.engdw_chunk,
         )
         opt_cfg = dict(
             lr=args.lr, damping=args.engdw_damping,
+            momentum=args.engdw_momentum,
             line_search=args.engdw_line_search,
             ls_grid=opt.ls_grid if args.engdw_line_search else None,
             chunk_size=args.engdw_chunk, weight_decay=0.0, schedule="none",

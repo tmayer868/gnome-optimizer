@@ -1,4 +1,4 @@
-"""2D Poisson PINN: AdamW vs SOAP vs Gnome.
+"""2D Poisson PINN: AdamW vs SOAP vs Gnome vs ENGD-W.
 
 PDE:  -Δu = f(x, y),    (x, y) ∈ (0, 1)²
 BC:   u = 0  on  ∂Ω    (Dirichlet)
@@ -26,16 +26,24 @@ Two-block residual: PDE (interior), BC (boundary). Stacked through
 ``gnome.stack_residuals`` so the multi-block MSE rides Gnome's single-MSE
 surrogate as the per-block independent Rademacher GGN estimator.
 
-All three optimizers share one plain tanh MLP so the only variable is the
-optimizer. Every optimizer gets the same linear-warmup + cosine-decay schedule
+Gnome, SOAP, and AdamW get the same linear-warmup + cosine-decay schedule
 (``--cosine-decay`` sets the final-lr fraction; 1.0 gives warmup then constant,
 which suits Gnome on MSE since its step self-anneals as the residual shrinks).
+
+ENGD-W uses the shared exact damped sample-space solve in float64, with a
+fixed learning rate or same-batch grid line search and no schedule/weight decay.
+Points are resampled each step unless ``--fixed-dataset`` is supplied.
+This flag works for every optimizer. Gnome draws fresh auxiliary subsets from
+the fixed main points each step. ``--engdw-fixed`` remains an ENGD-W-only
+compatibility flag.
 
 Usage:
 
     uv run -m experiments.pinns.poisson_pinn --optimizer gnome --seed 0
     uv run -m experiments.pinns.poisson_pinn --optimizer soap  --seed 0
     uv run -m experiments.pinns.poisson_pinn --optimizer adamw --seed 0
+    uv run -m experiments.pinns.poisson_pinn --optimizer engdw --n-pde 128 \
+        --n-bc-per-edge 16 --engdw-line-search --steps 1000
 """
 
 from __future__ import annotations
@@ -49,6 +57,7 @@ import time
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
+from torch.func import functional_call, jacrev, vmap
 
 from gnome import (
     Gnome,
@@ -57,7 +66,7 @@ from gnome import (
     measure_rho,
     stack_residuals,
 )
-from experiments.baselines import SOAP
+from experiments.baselines import ENGDW, SOAP
 from experiments.common import (
     DIVERGED_EXIT,
     ConcatEmbedding,
@@ -171,6 +180,24 @@ def sample_batch(
     return x_pde, y_pde, x_bc, y_bc
 
 
+def sample_aux_from_batch(batch, n_pde: int, n_bc_per_edge: int):
+    """Uniform subsets without replacement from PDE points and each BC edge.
+
+    Each edge has the same main/aux sample count, preserving the original
+    equal-weight PDE/BC objective in expectation. Coordinate pairs stay intact.
+    """
+    x, y, xb, yb = batch
+    edge_size = len(xb) // 4
+    if len(xb) % 4 or not 1 <= n_pde <= len(x) or not 1 <= n_bc_per_edge <= edge_size:
+        raise ValueError("auxiliary sample counts must fit the main PDE batch and each of its four edges")
+    interior = torch.randperm(len(x), device=x.device)[:n_pde]
+    boundary = torch.cat([
+        edge*edge_size + torch.randperm(edge_size, device=xb.device)[:n_bc_per_edge]
+        for edge in range(4)
+    ])
+    return x[interior], y[interior], xb[boundary], yb[boundary]
+
+
 def stacked_residuals(model: nn.Module, batch) -> torch.Tensor:
     """PDE + BC residuals stacked via ``stack_residuals`` (equal weights)."""
     x_pde, y_pde, x_bc, y_bc = batch
@@ -235,6 +262,42 @@ def eval_rel_l2(
 
 # ========================= Optimizer factory =========================
 
+def make_engdw_functions(model: nn.Module, chunk_size: int = 32):
+    """Normalized PDE/BC residuals and their per-point parameter Jacobian.
+
+    Squared norm equals mean(PDE**2) + mean(BC**2), even for unequal block
+    sizes. BC contains all four edges. Functional input Hessians preserve
+    parameter differentiation through the Laplacian.
+    """
+    def u_single(params, xy):
+        return functional_call(model, params, (xy[:1].reshape(1, 1), xy[1:].reshape(1, 1))).squeeze()
+
+    hessian = jacrev(jacrev(u_single, argnums=1), argnums=1)
+
+    def pde_single(params, xy):
+        h = hessian(params, xy)
+        return h[0, 0] + h[1, 1] + _source_term(xy[0], xy[1])
+
+    def points(batch):
+        x, y, xb, yb = batch
+        return torch.cat((x, y), 1), torch.cat((xb, yb), 1)
+
+    def residual(params, batch):
+        blocks = [vmap(fn, in_dims=(None, 0), chunk_size=chunk_size)(params, pts)
+                  / math.sqrt(len(pts))
+                  for fn, pts in zip((pde_single, u_single), points(batch))]
+        return torch.cat(blocks).unsqueeze(1)
+
+    def jacobian(params, batch):
+        blocks = []
+        for fn, pts in zip((pde_single, u_single), points(batch)):
+            j = vmap(jacrev(fn), in_dims=(None, 0), chunk_size=chunk_size)(params, pts)
+            blocks.append({k: v / math.sqrt(len(pts)) for k, v in j.items()})
+        return {k: torch.cat([b[k] for b in blocks]) for k in params}
+
+    return residual, jacobian
+
+
 def build_optimizer(
     name: str, params, lr: float, weight_decay: float,
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
@@ -282,10 +345,10 @@ def build_optimizer(
 
 # ========================= CLI / training =========================
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--optimizer", required=True,
-                   choices=["gnome", "soap", "adamw"])
+                   choices=["gnome", "soap", "adamw", "engdw"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--steps", type=int, default=50000,
                    help="Default 50k — Poisson converges much faster than "
@@ -293,6 +356,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-pde", type=int, default=2000)
     p.add_argument("--n-bc-per-edge", type=int, default=50,
                    help="Boundary points per edge (total BC sample is 4× this).")
+    p.add_argument("--fixed-dataset", action="store_true",
+                   help="Reuse the same PDE/BC training points every step for any optimizer. "
+                        "Gnome draws fresh auxiliary subsets of those points; validation still resamples.")
     p.add_argument("--aux-frac", type=float, default=0.05)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--trust-region", type=float, default=1.0,
@@ -311,6 +377,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--beta2", type=float, default=0.99,
                    help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
     p.add_argument("--weight-decay", type=float, default=1e-8)
+    p.add_argument("--engdw-damping", type=float, default=1e-6,
+                   help="ENGD-W fixed damping in J J^T + lambda I; no weight decay or schedule.")
+    p.add_argument("--engdw-momentum", type=float, default=0.0,
+                   help="ENGD-W regularization-center momentum in [0,1).")
+    p.add_argument("--engdw-line-search", action="store_true",
+                   help="ENGD-W same-batch grid line search over [1e-3,1], overriding --lr.")
+    p.add_argument("--engdw-chunk", type=int, default=32,
+                   help="Points per Jacobian chunk; the full Jacobian and sample Gram remain dense.")
+    p.add_argument("--engdw-fixed", action="store_true",
+                   help="ENGD-W-only compatibility flag for --fixed-dataset.")
     p.add_argument("--hidden", type=int, default=64, help="MLP width.")
     p.add_argument("--depth", type=int, default=5, help="MLP depth.")
     p.add_argument("--arch", type=str, default="mlp",
@@ -334,11 +410,11 @@ def parse_args() -> argparse.Namespace:
                         "the eigenbasis refresh dominates, well above "
                         "hidden=64.")
     p.add_argument("--warmup-steps", type=int, default=200,
-                   help="Linear LR warmup steps, applied to every optimizer.")
+                   help="Linear LR warmup for Gnome, SOAP, and AdamW; ENGD-W has no schedule.")
     p.add_argument("--cosine-decay", type=float, default=0.0,
                    help="Final-LR fraction for the baseline cosine decay: 0.0 "
                         "decays to zero (standard treatment), 1.0 disables "
-                        "decay. Gnome (MSE) never decays regardless.")
+                        "decay. Applies to Gnome, SOAP, and AdamW; ignored by ENGD-W.")
     p.add_argument("--float64", action="store_true",
                    help="Run in double precision on CPU. float32 floors "
                         "rel_L2 around 1e-5..1e-6; the ENGD high-accuracy "
@@ -373,32 +449,69 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+    args = p.parse_args(argv)
+    if min(args.steps, args.n_pde, args.n_bc_per_edge) < 1:
+        p.error("steps and collocation counts must be positive")
+    if args.engdw_fixed and args.optimizer != "engdw":
+        p.error("--engdw-fixed requires --optimizer engdw")
+    if args.optimizer == "gnome" and args.fixed_dataset and not 0 < args.aux_frac <= 1:
+        p.error("--fixed-dataset requires --aux-frac in (0,1] for Gnome")
+    if args.optimizer != "gnome" and (args.diagnostics_every > 0 or args.measure_rho_every > 0):
+        p.error("diagnostics and rho measurements are Gnome-only")
+    if args.optimizer == "engdw":
+        if not math.isfinite(args.engdw_damping) or args.engdw_damping <= 0:
+            p.error("--engdw-damping must be finite and positive")
+        if not 0 <= args.engdw_momentum < 1 or not math.isfinite(args.engdw_momentum):
+            p.error("--engdw-momentum must be finite and in [0,1)")
+        if args.engdw_chunk < 1:
+            p.error("--engdw-chunk must be positive")
+        if not math.isfinite(args.lr) or args.lr < 0:
+            p.error("--lr must be finite and nonnegative")
+    return args
 
 
 def train(args: argparse.Namespace) -> str:
+    fixed_dataset = args.fixed_dataset or args.engdw_fixed
     # float64 must come before any tensor/model construction so params,
     # samples and the reference grid are all double. MPS has no float64
     # support, so double precision forces CPU.
     if args.float64:
         torch.set_default_dtype(torch.float64)
         device = torch.device("cpu")
+    elif args.optimizer == "engdw":
+        torch.set_default_dtype(torch.float64)
+        device = pick_device()
+        if device.type == "mps":
+            device = torch.device("cpu")
     else:
         device = pick_device()
     torch.manual_seed(args.seed)
     model = build_model(
         args.arch, args.hidden, args.depth, args.fuse_every
     ).to(device)
-    opt, opt_cfg, scheduler = build_optimizer(
-        args.optimizer, model.parameters(), args.lr, args.weight_decay,
-        warmup=args.warmup_steps, total_steps=args.steps,
-        cosine_decay=args.cosine_decay, eps=args.eps,
-        beta1=args.beta1, beta2=args.beta2,
-        trust_region=args.trust_region,
-    )
+    if args.optimizer == "engdw":
+        residual, jacobian = make_engdw_functions(model, args.engdw_chunk)
+        opt = ENGDW(model, residual, jacobian_fn=jacobian, lr=args.lr,
+                    damping=args.engdw_damping, momentum=args.engdw_momentum,
+                    line_search=args.engdw_line_search, chunk_size=args.engdw_chunk)
+        opt_cfg = dict(lr=args.lr, damping=args.engdw_damping, momentum=args.engdw_momentum,
+                       line_search=args.engdw_line_search,
+                       ls_grid=opt.ls_grid if args.engdw_line_search else None,
+                       chunk_size=args.engdw_chunk, schedule="none", weight_decay=0.0,
+                       energy="0.5 * sum(block MSEs)", residual_scaling="1/sqrt(N_block)",
+                       jacobian="vmap(jacrev(single_residual))")
+        scheduler = None
+    else:
+        opt, opt_cfg, scheduler = build_optimizer(
+            args.optimizer, model.parameters(), args.lr, args.weight_decay,
+            warmup=args.warmup_steps, total_steps=args.steps,
+            cosine_decay=args.cosine_decay, eps=args.eps,
+            beta1=args.beta1, beta2=args.beta2,
+            trust_region=args.trust_region,
+        )
 
-    n_pde_aux = max(1, int(args.n_pde * args.aux_frac))
-    n_bc_aux_per_edge = max(1, int(args.n_bc_per_edge * args.aux_frac))
+    n_pde_aux = max(1, int(args.n_pde * args.aux_frac)) if args.optimizer == "gnome" else 0
+    n_bc_aux_per_edge = max(1, int(args.n_bc_per_edge * args.aux_frac)) if args.optimizer == "gnome" else 0
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
@@ -422,6 +535,9 @@ def train(args: argparse.Namespace) -> str:
         "n_bc_per_edge": args.n_bc_per_edge,
         "n_pde_aux": n_pde_aux,
         "n_bc_aux_per_edge": n_bc_aux_per_edge,
+        "fixed_dataset": fixed_dataset,
+        "sampling": "fixed" if fixed_dataset else "resample_each_step",
+        "aux_sampling": ("subsample_fixed_main_each_step" if fixed_dataset else "resample_each_step") if args.optimizer == "gnome" else None,
         # Non-zero means a sibling {run_id}.diag.jsonl exists for this run.
         "diagnostics_every": args.diagnostics_every,
         "device": str(device),
@@ -480,7 +596,8 @@ def train(args: argparse.Namespace) -> str:
             f"[{EXPERIMENT}] {args.optimizer} | params={n_params:,} | "
             f"device={device} | dtype={torch.get_default_dtype()}\n"
             f"  N_pde={args.n_pde} N_bc_per_edge={args.n_bc_per_edge} | "
-            f"aux={n_pde_aux}/{n_bc_aux_per_edge} | steps={args.steps}",
+            f"aux={n_pde_aux}/{n_bc_aux_per_edge} | steps={args.steps} | "
+            f"sampling={'fixed' if fixed_dataset else 'resample_each_step'}",
             flush=True,
         )
         if diag is not None:
@@ -492,11 +609,20 @@ def train(args: argparse.Namespace) -> str:
     window: list[float] = []
     last_avg = last_rel_l2 = float("nan")
     best_avg = best_rel_l2 = float("inf")
+    fixed_batch = None
 
     for step in range(args.steps):
-        main_batch = sample_batch(args.n_pde, args.n_bc_per_edge, device)
+        if fixed_batch is None:
+            main_batch = sample_batch(args.n_pde, args.n_bc_per_edge, device)
+            if fixed_dataset:
+                fixed_batch = main_batch
+        else:
+            main_batch = fixed_batch
         if args.optimizer == "gnome":
-            aux_batch = sample_batch(n_pde_aux, n_bc_aux_per_edge, device)
+            if fixed_dataset:
+                aux_batch = sample_aux_from_batch(main_batch, n_pde_aux, n_bc_aux_per_edge)
+            else:
+                aux_batch = sample_batch(n_pde_aux, n_bc_aux_per_edge, device)
 
             def main_closure():
                 r = stacked_residuals(model, main_batch)
@@ -507,6 +633,8 @@ def train(args: argparse.Namespace) -> str:
                 return r, torch.zeros_like(r)
 
             loss = opt.step(main_closure, aux_closure)
+        elif args.optimizer == "engdw":
+            loss = opt.step(main_batch)
         else:
             opt.zero_grad()
             r = stacked_residuals(model, main_batch)
@@ -530,10 +658,11 @@ def train(args: argparse.Namespace) -> str:
                 print(f"  [rho @ step {step + 1}]")
                 print(format_records(records, prefix="    "), flush=True)
 
+        applied_lr = current_lr(opt)
         if scheduler is not None:
             scheduler.step()
 
-        loss_val = float(loss.detach().item())
+        loss_val = float(loss.detach().item()) if torch.is_tensor(loss) else float(loss)
         if diverged(loss_val):
             run.finish(completed=False, diverged=True, diverged_step=step)
             if diag is not None:
@@ -542,10 +671,10 @@ def train(args: argparse.Namespace) -> str:
                 rho_log.close()
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
             raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=loss_val)
+        run.log_train(step, loss=loss_val, lr=applied_lr)
         window.append(loss_val)
 
-        if args.log_every and (step + 1) % args.log_every == 0:
+        if (args.log_every and (step + 1) % args.log_every == 0) or step + 1 == args.steps:
             tl = term_losses(
                 model, sample_batch(args.n_pde, args.n_bc_per_edge, device)
             )

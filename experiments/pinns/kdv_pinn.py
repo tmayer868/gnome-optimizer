@@ -21,10 +21,14 @@ Two architectures, selectable via ``--arch``:
   input encoders ``u, v`` gate every hidden layer via
   ``h = tanh(W h); h = h·u + (1-h)·v``. This is the *architecture only* —
   none of the rest of the jaxpi pipeline (random weight factorization,
-  Fourier features, causal weighting, grad-norm balancing) is ported. Both
-  archs use a period-2 input embedding ``[t, cos(πx), sin(πx)]`` (matching
-  the ``[-1, 1]`` domain), and the multi-block loss is the same plain
-  ``gnome.stack_residuals`` pattern with equal block weights.
+  Fourier features, causal weighting, grad-norm balancing) is ported.
+
+Both architectures accept ``--embed periodic|none``. The default ``periodic``
+uses ``[t, cos(πx), sin(πx)]``, enforcing period-2 spatial periodicity on
+``[-1, 1]``. ``none`` feeds raw ``[t, x]``. Both retain the PDE, IC, and BC
+blocks with equal weights via ``gnome.stack_residuals``; the BC block enforces
+matching ``u``, ``u_x``, and ``u_xx`` for raw inputs and is redundant up to
+roundoff with the periodic embedding.
 
 All optimizers share the chosen network so the only variable is the
 optimizer. Every optimizer gets the same linear-warmup + cosine-decay schedule
@@ -50,6 +54,7 @@ Usage:
 
     uv run -m experiments.pinns.kdv_pinn --optimizer gnome --arch modified
     uv run -m experiments.pinns.kdv_pinn --optimizer soap  --arch mlp
+    uv run -m experiments.pinns.kdv_pinn --optimizer gnome --embed none
     uv run -m experiments.pinns.kdv_pinn --optimizer adamw+lbfgs --arch modified
 """
 
@@ -69,6 +74,7 @@ import torch.nn as nn
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.baselines import SOAP, ENGD
 from experiments.common import (
+    ConcatEmbedding,
     DIVERGED_EXIT,
     ModifiedMLP,
     diverged,
@@ -101,16 +107,25 @@ KDV_URL = (
 
 
 # ========================= Models =========================
+def build_embedding(embed: str) -> nn.Module:
+    if embed == "periodic":
+        return PeriodicEmbedding(2, wavenumber=math.pi)
+    if embed == "none":
+        return ConcatEmbedding(2)
+    raise ValueError(f"unknown embedding: {embed}")
+
+
 class MLP(nn.Module):
     """Plain tanh MLP: ``(t, x) → u``. ``depth`` = number of Linear layers.
 
-    Input is the period-2 embedding ``[t, cos(πx), sin(πx)]`` (matches the
-    ``[-1, 1]`` x-domain)."""
+    Input is the period-2 embedding ``[t, cos(πx), sin(πx)]`` by default,
+    or raw ``[t, x]`` with ``embed="none"``."""
 
-    def __init__(self, hidden: int = 256, depth: int = 4):
+    def __init__(self, hidden: int = 256, depth: int = 4,
+                 embed: str = "periodic"):
         super().__init__()
         assert depth >= 2
-        self.embed = PeriodicEmbedding(2, wavenumber=math.pi)
+        self.embed = build_embedding(embed)
         layers: list[nn.Module] = [nn.Linear(self.embed.out_dim, hidden), nn.Tanh()]
         for i in range(depth - 1):
             layers += [nn.Linear(hidden, hidden), nn.Tanh()]
@@ -121,13 +136,14 @@ class MLP(nn.Module):
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         return self.net(self.embed(t, x))
 
-def build_model(arch: str, hidden: int, depth: int) -> nn.Module:
-    """``(t, x) → u`` with a shared period-2 spatial embedding."""
+def build_model(arch: str, hidden: int, depth: int,
+                embed: str = "periodic") -> nn.Module:
+    """``(t, x) → u`` with periodic features or raw coordinates."""
     if arch == "mlp":
-        return MLP(hidden=hidden, depth=depth)
+        return MLP(hidden=hidden, depth=depth, embed=embed)
     if arch == "modified":
         return ModifiedMLP(
-            PeriodicEmbedding(2, wavenumber=math.pi),
+            build_embedding(embed),
             hidden=hidden,
             depth=depth,
         )
@@ -752,6 +768,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--arch", choices=["mlp", "modified"], default="modified",
                    help="Network: plain tanh MLP or the gated modified MLP "
                         "(Wang et al. 2021). --hidden / --depth control both.")
+    p.add_argument("--embed", choices=["periodic", "none"], default="periodic",
+                   help="Input embedding: 'periodic' (default) feeds "
+                        "[t, cos(pi x), sin(pi x)]; 'none' feeds raw [t, x]. "
+                        "Both retain the periodic BC loss for u, u_x, u_xx.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--steps", type=int, default=100_000,
                    help="KdV is dispersive/stiff; may want more than default.")
@@ -888,7 +908,7 @@ def train(args: argparse.Namespace) -> str:
                   flush=True)
         device = torch.device("cpu")
     torch.manual_seed(args.seed)
-    model = build_model(args.arch, args.hidden, args.depth).to(device)
+    model = build_model(args.arch, args.hidden, args.depth, args.embed).to(device)
     opt, opt_cfg, scheduler = build_optimizer(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
         warmup=args.warmup_steps, total_steps=args.steps,
@@ -922,6 +942,7 @@ def train(args: argparse.Namespace) -> str:
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
         "arch": args.arch,
+        "embed": args.embed,
         "steps": args.steps,
         "hidden": args.hidden,
         "depth": args.depth,
@@ -988,7 +1009,7 @@ def train(args: argparse.Namespace) -> str:
     if not args.quiet:
         print(
             f"[{EXPERIMENT}] {args.optimizer} | arch={args.arch} "
-            f"{args.depth}x{args.hidden} | params={n_params:,} | "
+            f"{args.depth}x{args.hidden} | embed={args.embed} | params={n_params:,} | "
             f"device={device}\n"
             f"  N_pde={args.n_pde} N_ic={args.n_ic} N_bc={args.n_bc} | "
             f"aux={n_pde_aux}/{n_ic_aux}/{n_bc_aux} | steps={args.steps}\n"

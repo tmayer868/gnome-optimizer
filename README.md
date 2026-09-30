@@ -141,6 +141,17 @@ metric uses the original JAXPI dataset. See the
 [reference documentation](experiments/reference_solutions/README.md) for
 accuracy checks and differences from historical spectral-reference results.
 
+Allen–Cahn can switch precision during a run while preserving optimizer state
+and the learning-rate schedule:
+
+```bash
+uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --float64-after 30000
+```
+
+This runs 30,000 steps in FP32 and the remaining steps in FP64. On Apple MPS,
+the switch moves training to CPU. Use `--float64` to start in FP64; the two
+options are mutually exclusive. The switch is recorded in the run log.
+
 Each takes `--optimizer gnome|soap|adamw`. **Schedule protocol:** every optimizer, Gnome
 included, gets the same linear-warmup + cosine-decay schedule, so the comparison is over the
 update rule and not over who was handed a schedule. `--cosine-decay` is the final-LR
@@ -154,6 +165,37 @@ uv run python -m experiments.pinns.poisson_pinn --optimizer soap --steps 50000
 
 Set `--cosine-decay 1` to disable decay entirely (raw SOAP/AdamW), or e.g. `0.1` to decay to
 10% of the peak LR.
+
+**Poisson with fixed training points:** add `--fixed-dataset` to reuse one
+sampled PDE/boundary batch throughout training with any optimizer:
+
+```bash
+uv run -m experiments.pinns.poisson_pinn --optimizer gnome --fixed-dataset
+```
+
+Gnome draws fresh auxiliary subsets from that fixed batch each step, uniformly
+without replacement within the PDE points and each boundary edge. `--aux-frac`
+sets the subset sizes and must be in `(0,1]` for this mode. PDE/BC loss weights
+are preserved, and curvature probes remain random.
+Validation residual points still resample, and relative L2 uses the analytical
+reference grid. Omitting the flag retains per-step training resampling.
+
+**Poisson with ENGD-W:** the 2D Poisson benchmark accepts the shared exact
+sample-space Gauss–Newton baseline:
+
+```bash
+uv run -m experiments.pinns.poisson_pinn --optimizer engdw \
+    --n-pde 128 --n-bc-per-edge 16 --engdw-line-search --steps 1000
+```
+
+ENGD-W automatically uses float64 on CUDA or CPU (MPS falls back to CPU),
+with equal-weight PDE and boundary MSEs. `--engdw-damping` defaults to `1e-6`;
+`--engdw-momentum` defaults to zero. It uses a fixed `--lr` or optional same-batch
+grid line search, without warmup, cosine decay, or weight decay. Points resample
+each step; `--fixed-dataset` (or the existing `--engdw-fixed`) reuses the training set while validation stays
+independent. Both `--arch mlp` and `--arch fused` are supported. Start with small
+collocation batches: the dense sample Gram has `n_pde + 4*n_bc_per_edge` rows.
+`--engdw-chunk` limits differentiation workspace, not that matrix's size.
 
 **Reaction with ENGD-W:** `experiments.pinns.reaction_pinn` also accepts
 `--optimizer engdw`, using an exact damped Gauss–Newton solve in sample space:
@@ -189,6 +231,40 @@ with its beta default of `40`. Family runs write to `runs/convection_family_pinn
 refer to the target. Additional `rel_l2_beta_*` metrics score the endpoints and
 midpoint, including at the stage transition and final step. Training loss in stage 1
 averages over the family, while stage 2 training loss covers only the target.
+
+**2D complex Ginzburg–Landau, trained globally in time:**
+
+```bash
+uv run --extra experiments -m experiments.pinns.ginzburg_landau \
+    --optimizer gnome --time-interval 0.2 --depth 5 --hidden 128 \
+    --n-pde 8192 --n-ic 2048 --steps 100000
+```
+
+One two-output shared MLP solves the entire physical interval `[time_start,T]`
+at once. `--time-interval` sets the upper bound (default `1.0`); `--time-start`
+sets the lower bound (default `0.0`), with `0 <= time_start < T <= 1`.
+For example, `--time-start 0.4 --time-interval 0.8` trains on `[0.4,0.8]`,
+using the cached reference at t=0.4 as its initial condition. Both spatial
+directions use the shared hard periodic embedding. The objective is the sum
+of the four block MSEs `pde_u`, `pde_v`, `ic_u`, `ic_v`. Choose `gnome`, `soap`,
+`adamw`, `adam`, or `engdw`. `--width` aliases `--hidden`; depth counts affine
+layers, so depth 5 means four hidden layers and the output layer.
+
+`--ic-weight` sets a fixed weight on both IC blocks:
+`loss = pde + ic_weight * ic`. It defaults to `1.0`; try `--ic-weight 10` or
+`--ic-weight 100` to emphasize the initial condition. All optimizers use this
+same weighted objective, including Gnome's curvature pass and ENGD-W's solve.
+Logged `ic`, `ic_u`, and `ic_v` remain unweighted; `ic_weighted` and `objective`
+report the weighted IC contribution and total validation objective.
+
+A separately generated complex128 Fourier/ETDRK4 reference is cached over
+`[0,1]` and reused across horizons. Chunked evaluation reports combined-complex
+`rel_l2` plus `rel_l2_u` and `rel_l2_v`. `--log-every` controls residual logging;
+`--eval-every` controls the more expensive relative errors (default 200).
+The final step always reports both. Runs also save field comparisons at five
+times, amplitude and wrapped-phase errors, and training curves. Use `--no-plots`
+for a diagnostic run. See [benchmark details](docs/ginzburg_landau.md) for
+reference validation, precision options, and a horizon sweep.
 
 **WikiText-103 GPT** (needs the `llm` extra + a GPU; downloads the dataset on first run):
 
