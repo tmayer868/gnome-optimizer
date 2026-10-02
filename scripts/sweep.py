@@ -209,7 +209,7 @@ EXPERIMENT_PACKAGES = {
         "wave_pinn",
     },
     "resnets": {"cifar100", "cifar_rotation", "cub200", "grating_freq", "utkface"},
-    "transformers": {"wikitext_gpt"},
+    "transformers": {"wikitext_gpt", "modded_nanogpt"},
 }
 
 

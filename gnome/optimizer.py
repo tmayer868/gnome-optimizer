@@ -1375,6 +1375,7 @@ class Gnome(Optimizer):
             state["lm_lambda"] = lam
         # Newton step in the rotated basis, damped by lam.
         update_rot = grad_hat / gnd_hat.add(lam)
+        update_rot = update_rot.clamp(-1, 1)
 
         if self._diagnostics_due():
             self._emit_diagnostics(

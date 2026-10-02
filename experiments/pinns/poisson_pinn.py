@@ -1,4 +1,4 @@
-"""2D Poisson PINN: AdamW vs SOAP vs Gnome vs ENGD-W.
+"""2D Poisson PINN: AdamW vs SOAP vs Gnome vs ENGD-W vs WoodburyGGN.
 
 PDE:  -Δu = f(x, y),    (x, y) ∈ (0, 1)²
 BC:   u = 0  on  ∂Ω    (Dirichlet)
@@ -26,14 +26,14 @@ Two-block residual: PDE (interior), BC (boundary). Stacked through
 ``gnome.stack_residuals`` so the multi-block MSE rides Gnome's single-MSE
 surrogate as the per-block independent Rademacher GGN estimator.
 
-Gnome, SOAP, and AdamW get the same linear-warmup + cosine-decay schedule
+Gnome, SOAP, AdamW, and WoodburyGGN get the same linear-warmup + cosine-decay schedule
 (``--cosine-decay`` sets the final-lr fraction; 1.0 gives warmup then constant,
 which suits Gnome on MSE since its step self-anneals as the residual shrinks).
 
 ENGD-W uses the shared exact damped sample-space solve in float64, with a
 fixed learning rate or same-batch grid line search and no schedule/weight decay.
 Points are resampled each step unless ``--fixed-dataset`` is supplied.
-This flag works for every optimizer. Gnome draws fresh auxiliary subsets from
+This flag works for every optimizer. Gnome and WoodburyGGN draw fresh auxiliary subsets from
 the fixed main points each step. ``--engdw-fixed`` remains an ENGD-W-only
 compatibility flag.
 
@@ -66,6 +66,7 @@ from gnome import (
     measure_rho,
     stack_residuals,
 )
+from gnome.experimental import WoodburyGGN
 from experiments.baselines import ENGDW, SOAP
 from experiments.common import (
     DIVERGED_EXIT,
@@ -303,6 +304,9 @@ def build_optimizer(
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
     beta1: float = 0.9, beta2: float = 0.99,
     trust_region: float = 1.0,
+    woodbury_damping: float = 1e-3, history_tol: float = 0.01,
+    max_history: int | None = None, gram_float64: bool = False,
+    woodbury_warmup_steps: int = 100,
 ):
     """Construct the optimizer and its LR schedule.
 
@@ -321,6 +325,16 @@ def build_optimizer(
             loss="mse", precondition_1d=True,
         )
         opt = Gnome(params, **cfg)
+    elif name == "woodbury":
+        cfg = dict(lr=lr, beta1=beta1, beta2=beta2, damping=woodbury_damping,
+                   history_tol=history_tol, max_history=max_history,
+                   gram_dtype=torch.float64 if gram_float64 else None, loss="mse",
+                   trust_radius=(trust_region if trust_region > 0 else None),
+                   curvature_warmup_steps=woodbury_warmup_steps)
+        opt = WoodburyGGN(params, **cfg)
+        cfg["gram_dtype"] = "float64" if gram_float64 else "parameter_dtype_at_least_float32"
+        cfg["history_size"] = opt.param_groups[0]["history_size"]
+        cfg["weight_decay"] = 0.0
     elif name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
@@ -348,7 +362,7 @@ def build_optimizer(
 def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--optimizer", required=True,
-                   choices=["gnome", "soap", "adamw", "engdw"])
+                   choices=["gnome", "soap", "adamw", "engdw", "woodbury"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--steps", type=int, default=50000,
                    help="Default 50k — Poisson converges much faster than "
@@ -358,25 +372,33 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Boundary points per edge (total BC sample is 4× this).")
     p.add_argument("--fixed-dataset", action="store_true",
                    help="Reuse the same PDE/BC training points every step for any optimizer. "
-                        "Gnome draws fresh auxiliary subsets of those points; validation still resamples.")
+                        "Gnome/Woodbury draw fresh auxiliary subsets of those points; validation still resamples.")
     p.add_argument("--aux-frac", type=float, default=0.05)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
-                        "damping.")
+                   help="Gnome/Woodbury per-tensor L2 bound: choose damping so "
+                        "||direction|| <= trust_region * sqrt(||W||^2 + 1). "
+                        "LR scales the bounded direction. 0 disables adaptive damping.")
     p.add_argument("--eps", type=float, default=1e-6,
                    help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
                         "-> more gradient-descent-like, smaller -> fuller Newton "
                         "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.9,
-                   help="First-moment (momentum) EMA for Gnome and SOAP.")
+    p.add_argument("--beta1", type=float, default=None,
+                   help="First-moment EMA: default 0 for Woodbury, 0.9 for Gnome/SOAP.")
     p.add_argument("--beta2", type=float, default=0.99,
-                   help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
+                   help="Curvature EMA for Woodbury; second-moment / preconditioner EMA for Gnome/SOAP.")
     p.add_argument("--weight-decay", type=float, default=1e-8)
+    p.add_argument("--woodbury-damping", type=float, default=1e-3,
+                   help="Woodbury damping floor; fixed damping when --trust-region 0.")
+    p.add_argument("--woodbury-warmup-steps", type=int, default=100,
+                   help="Hold parameters fixed while collecting curvature for the first N steps. "
+                        "0 disables. Independent of the concurrent --warmup-steps LR ramp.")
+    p.add_argument("--history-tol", type=float, default=0.01,
+                   help="Woodbury EMA tail tolerance; history=ceil(log(tol)/log(beta2)).")
+    p.add_argument("--max-history", type=int, default=None,
+                   help="Override Woodbury's derived history length (matrix samples per parameter).")
+    p.add_argument("--gram-float64", action="store_true",
+                   help="Woodbury float64 inner products, solve and reconstruction; CPU on MPS.")
     p.add_argument("--engdw-damping", type=float, default=1e-6,
                    help="ENGD-W fixed damping in J J^T + lambda I; no weight decay or schedule.")
     p.add_argument("--engdw-momentum", type=float, default=0.0,
@@ -393,8 +415,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    choices=["mlp", "fused"],
                    help="Weight grouping — same function class either way, "
                         "different parameter tensors for the optimizer to "
-                        "precondition over. 'mlp' (default) is the nn.Linear "
-                        "baseline; 'fused' merges [W|b] per layer and groups "
+                        "precondition over. 'mlp' (default) stores one [W|b] "
+                        "matrix per layer; 'fused' additionally groups "
                         "hidden layers per --fuse-every.")
     p.add_argument("--fuse-every", type=int, default=0,
                    help="--arch fused only: consecutive hidden layers per "
@@ -410,11 +432,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "the eigenbasis refresh dominates, well above "
                         "hidden=64.")
     p.add_argument("--warmup-steps", type=int, default=200,
-                   help="Linear LR warmup for Gnome, SOAP, and AdamW; ENGD-W has no schedule.")
+                   help="Linear LR warmup for Gnome, SOAP, AdamW, Woodbury; ENGD-W has no schedule.")
     p.add_argument("--cosine-decay", type=float, default=0.0,
                    help="Final-LR fraction for the baseline cosine decay: 0.0 "
                         "decays to zero (standard treatment), 1.0 disables "
-                        "decay. Applies to Gnome, SOAP, and AdamW; ignored by ENGD-W.")
+                        "decay. Applies to Gnome, SOAP, AdamW, Woodbury; ignored by ENGD-W.")
     p.add_argument("--float64", action="store_true",
                    help="Run in double precision on CPU. float32 floors "
                         "rel_L2 around 1e-5..1e-6; the ENGD high-accuracy "
@@ -424,11 +446,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "dtype to float64 so params, samples and the "
                         "reference are all double.")
     p.add_argument("--diagnostics-every", type=int, default=0,
-                   help="Log Gnome's internal state — curvature spectrum, LM "
-                        "damping, trust-region usage — every N steps to a "
+                   help="Log Gnome or Woodbury internal curvature/step diagnostics every N steps to a "
                         "sibling runs/.../{run_id}.diag.jsonl. 0 (default) "
-                        "disables it entirely. Gnome only: SOAP and AdamW "
-                        "expose no such hook.")
+                        "disables it entirely. Supported by Gnome and Woodbury.")
     p.add_argument("--diagnostics-params", type=str, default=None,
                    help="Comma-separated parameter indices to log, e.g. "
                         "'0,4'. Default logs every parameter, which is one "
@@ -450,14 +470,36 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
+    if args.beta1 is None:
+        args.beta1 = 0.0 if args.optimizer == "woodbury" else 0.9
     if min(args.steps, args.n_pde, args.n_bc_per_edge) < 1:
         p.error("steps and collocation counts must be positive")
     if args.engdw_fixed and args.optimizer != "engdw":
         p.error("--engdw-fixed requires --optimizer engdw")
-    if args.optimizer == "gnome" and args.fixed_dataset and not 0 < args.aux_frac <= 1:
-        p.error("--fixed-dataset requires --aux-frac in (0,1] for Gnome")
-    if args.optimizer != "gnome" and (args.diagnostics_every > 0 or args.measure_rho_every > 0):
-        p.error("diagnostics and rho measurements are Gnome-only")
+    if args.optimizer in ("gnome", "woodbury"):
+        if not math.isfinite(args.aux_frac) or args.aux_frac <= 0:
+            p.error("--aux-frac must be finite and positive")
+        if args.fixed_dataset and args.aux_frac > 1:
+            p.error("--fixed-dataset requires --aux-frac in (0,1] for Gnome/Woodbury")
+    if args.optimizer not in ("gnome", "woodbury") and args.diagnostics_every > 0:
+        p.error("diagnostics are supported by Gnome and Woodbury")
+    if args.optimizer != "gnome" and args.measure_rho_every > 0:
+        p.error("rho measurements are Gnome-only")
+    if args.optimizer == "woodbury":
+        if not math.isfinite(args.trust_region) or args.trust_region < 0:
+            p.error("--trust-region must be finite and nonnegative")
+        if args.woodbury_warmup_steps < 0:
+            p.error("--woodbury-warmup-steps must be nonnegative")
+        if not math.isfinite(args.woodbury_damping) or args.woodbury_damping <= 0:
+            p.error("--woodbury-damping must be finite and positive")
+        if not 0 < args.history_tol < 1:
+            p.error("--history-tol must be in (0,1)")
+        if args.max_history is not None and args.max_history < 1:
+            p.error("--max-history must be positive")
+        if not 0 <= args.beta1 < 1 or not 0 <= args.beta2 < 1:
+            p.error("--beta1 and --beta2 must be in [0,1)")
+        if not math.isfinite(args.lr) or args.lr < 0:
+            p.error("--lr must be finite and nonnegative")
     if args.optimizer == "engdw":
         if not math.isfinite(args.engdw_damping) or args.engdw_damping <= 0:
             p.error("--engdw-damping must be finite and positive")
@@ -508,10 +550,14 @@ def train(args: argparse.Namespace) -> str:
             cosine_decay=args.cosine_decay, eps=args.eps,
             beta1=args.beta1, beta2=args.beta2,
             trust_region=args.trust_region,
+            woodbury_damping=args.woodbury_damping, history_tol=args.history_tol,
+            max_history=args.max_history, gram_float64=args.gram_float64,
+            woodbury_warmup_steps=args.woodbury_warmup_steps,
         )
 
-    n_pde_aux = max(1, int(args.n_pde * args.aux_frac)) if args.optimizer == "gnome" else 0
-    n_bc_aux_per_edge = max(1, int(args.n_bc_per_edge * args.aux_frac)) if args.optimizer == "gnome" else 0
+    uses_surrogate = args.optimizer in ("gnome", "woodbury")
+    n_pde_aux = max(1, int(args.n_pde * args.aux_frac)) if uses_surrogate else 0
+    n_bc_aux_per_edge = max(1, int(args.n_bc_per_edge * args.aux_frac)) if uses_surrogate else 0
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
@@ -537,7 +583,7 @@ def train(args: argparse.Namespace) -> str:
         "n_bc_aux_per_edge": n_bc_aux_per_edge,
         "fixed_dataset": fixed_dataset,
         "sampling": "fixed" if fixed_dataset else "resample_each_step",
-        "aux_sampling": ("subsample_fixed_main_each_step" if fixed_dataset else "resample_each_step") if args.optimizer == "gnome" else None,
+        "aux_sampling": ("subsample_fixed_main_each_step" if fixed_dataset else "resample_each_step") if uses_surrogate else None,
         # Non-zero means a sibling {run_id}.diag.jsonl exists for this run.
         "diagnostics_every": args.diagnostics_every,
         "device": str(device),
@@ -558,9 +604,9 @@ def train(args: argparse.Namespace) -> str:
     # over and slow load_run() down for everyone not looking at it.
     diag = None
     if args.diagnostics_every > 0:
-        if args.optimizer != "gnome":
+        if args.optimizer not in ("gnome", "woodbury"):
             raise SystemExit(
-                f"--diagnostics-every is Gnome-only; --optimizer "
+                f"--diagnostics-every requires Gnome or Woodbury; --optimizer "
                 f"{args.optimizer} exposes no diagnostics hook."
             )
         diag_params = (
@@ -603,6 +649,11 @@ def train(args: argparse.Namespace) -> str:
         if diag is not None:
             print(f"  diagnostics every {args.diagnostics_every} steps "
                   f"→ {diag.path}", flush=True)
+        if args.optimizer == "woodbury":
+            print(f"  history_max={opt_cfg['history_size']} | damping={args.woodbury_damping:g} | "
+                  f"trust_radius={opt_cfg['trust_radius']} | "
+                  f"curvature_warmup={args.woodbury_warmup_steps} | "
+                  f"beta1={args.beta1:g} beta2={args.beta2:g} | gram={opt_cfg['gram_dtype']}", flush=True)
     x_ref, y_ref, u_ref = poisson_reference()
 
     t_start = time.perf_counter()
@@ -618,7 +669,7 @@ def train(args: argparse.Namespace) -> str:
                 fixed_batch = main_batch
         else:
             main_batch = fixed_batch
-        if args.optimizer == "gnome":
+        if uses_surrogate:
             if fixed_dataset:
                 aux_batch = sample_aux_from_batch(main_batch, n_pde_aux, n_bc_aux_per_edge)
             else:
@@ -658,7 +709,7 @@ def train(args: argparse.Namespace) -> str:
                 print(f"  [rho @ step {step + 1}]")
                 print(format_records(records, prefix="    "), flush=True)
 
-        applied_lr = current_lr(opt)
+        applied_lr = opt.param_groups[0]["applied_lr"] if args.optimizer == "woodbury" else current_lr(opt)
         if scheduler is not None:
             scheduler.step()
 
@@ -683,7 +734,8 @@ def train(args: argparse.Namespace) -> str:
             last_rel_l2 = rl2
             best_avg = min(best_avg, last_avg)
             best_rel_l2 = min(best_rel_l2, rl2)
-            run.log_val(step + 1, loss=last_avg, lr=current_lr(opt),
+            run.log_val(step + 1, loss=last_avg,
+                        lr=applied_lr if args.optimizer == "woodbury" else current_lr(opt),
                         pde=tl["pde"], bc=tl["bc"], rel_l2=rl2)
             if not args.quiet:
                 ms_per = (time.perf_counter() - t_start) / (step + 1) * 1000

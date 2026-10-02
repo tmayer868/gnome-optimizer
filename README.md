@@ -29,6 +29,7 @@ installed as optional-dependency groups:
 | *(base)* | `uv sync` | the `gnome` optimizer package |
 | `experiments` | `uv sync --extra experiments` | the regression + PINN benchmarks (scipy, matplotlib) |
 | `llm` | `uv sync --extra llm` | the WikiText GPT benchmark (datasets, transformers) |
+| `nanogpt` | `uv sync --extra nanogpt` | the Modded-NanoGPT FineWeb benchmark (huggingface-hub) |
 | `vision` | `uv sync --extra vision` | image classification, including CUB-200-2011 (torchvision, Pillow) |
 | `dev` | `uv sync --extra dev` | tests + notebooks (pytest, jupyter) |
 
@@ -152,6 +153,18 @@ This runs 30,000 steps in FP32 and the remaining steps in FP64. On Apple MPS,
 the switch moves training to CPU. Use `--float64` to start in FP64; the two
 options are mutually exclusive. The switch is recorded in the run log.
 
+Allen–Cahn also supports `--fixed-dataset` with every optimizer:
+
+```bash
+uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --fixed-dataset
+```
+
+This reuses one randomly sampled PDE/IC/BC dataset throughout training.
+Gnome draws fresh auxiliary subsets without replacement within each block;
+`--aux-frac` must be in `(0,1]`, and auxiliary sizes are capped at the main
+block sizes. Validation residual points still resample. Fixed coordinates
+are preserved when switching precision with `--float64-after`.
+
 Each takes `--optimizer gnome|soap|adamw`. **Schedule protocol:** every optimizer, Gnome
 included, gets the same linear-warmup + cosine-decay schedule, so the comparison is over the
 update rule and not over who was handed a schedule. `--cosine-decay` is the final-LR
@@ -173,7 +186,7 @@ sampled PDE/boundary batch throughout training with any optimizer:
 uv run -m experiments.pinns.poisson_pinn --optimizer gnome --fixed-dataset
 ```
 
-Gnome draws fresh auxiliary subsets from that fixed batch each step, uniformly
+Gnome and WoodburyGGN draw fresh auxiliary subsets from that fixed batch each step, uniformly
 without replacement within the PDE points and each boundary edge. `--aux-frac`
 sets the subset sizes and must be in `(0,1]` for this mode. PDE/BC loss weights
 are preserved, and curvature probes remain random.
@@ -196,6 +209,31 @@ each step; `--fixed-dataset` (or the existing `--engdw-fixed`) reuses the traini
 independent. Both `--arch mlp` and `--arch fused` are supported. Start with small
 collocation batches: the dense sample Gram has `n_pde + 4*n_bc_per_edge` rows.
 `--engdw-chunk` limits differentiation workspace, not that matrix's size.
+
+**Poisson with experimental WoodburyGGN:** `--optimizer woodbury` uses the
+existing Gnome surrogate with a finite EMA history of raw matrix gradients
+and an exact damped Woodbury solve per parameter tensor:
+
+```bash
+uv run -m experiments.pinns.poisson_pinn --optimizer woodbury \
+    --fixed-dataset --hidden 8 --depth 3 --n-pde 32 --n-bc-per-edge 4 \
+    --aux-frac 0.5 --steps 300 --lr 0.001 --woodbury-damping 0.1 \
+    --beta2 0.9 --warmup-steps 0 --cosine-decay 1 --float64 \
+    --diagnostics-every 50 --log-every 50
+```
+
+Import it as `from gnome.experimental import WoodburyGGN`. The defaults are
+`beta1=0`, `beta2=0.99`, `damping=1e-3`, and `history_tol=0.01` (459 samples
+per tensor). `--max-history` overrides the derived window; `--gram-float64`
+promotes inner products and the small solve. `--trust-region 1` adaptively
+raises damping above `--woodbury-damping` to bound each direction's L2 norm,
+using Gnome's radius `trust_region * sqrt(||W||² + 1)`. Set `--trust-region 0`
+for fixed damping. There is no coordinate clipping or weight decay.
+The optimizer holds parameters fixed for the first 100 calls
+while collecting curvature; `--woodbury-warmup-steps` changes this duration
+(`0` disables). The separate `--warmup-steps` LR ramp advances concurrently.
+See [the API, diagnostics, and validation notes](docs/woodbury_ggn.md)
+before scaling up the initial stability run.
 
 **Reaction with ENGD-W:** `experiments.pinns.reaction_pinn` also accepts
 `--optimizer engdw`, using an exact damped Gauss–Newton solve in sample space:
@@ -275,6 +313,24 @@ uv run python -m experiments.transformers.wikitext_gpt --optimizer gnome_hutchin
 `--optimizer` is `gnome_hutchinson`, `gnome_fisher`, `soap`, or `adamw`. Cross-entropy
 gradients don't vanish at the optimum, so here *every* optimizer (Gnome included) uses a
 cosine schedule.
+
+**Modded-NanoGPT optimization benchmark** (Track 3; automatic CUDA/MPS/CPU selection):
+
+```bash
+# Tiny offline development check, using MPS when available.
+uv run -m experiments.transformers.modded_nanogpt --preset dev --synthetic
+
+# Full reference configuration on one CUDA GPU, with gradient accumulation.
+uv run --extra nanogpt -m experiments.transformers.modded_nanogpt \
+    --optimizer muon --download-shards 20 --steps 3250 --save-checkpoint
+```
+
+Choose `muon`, `gnome_hutchinson`, `gnome_fisher`, `soap`, or `adamw`.
+The full preset preserves the upstream model, FineWeb token stream, global
+batch, and validation budget. Gnome uses an additional curvature pass, so its
+results are research comparisons and **do not qualify for the official track's
+single-pass rule**. The development preset is also distinct from the benchmark.
+See [protocol, Thunder Compute commands, and validation notes](docs/modded_nanogpt.md).
 
 **CUB-200-2011 bird classification** (needs the `vision` extra):
 

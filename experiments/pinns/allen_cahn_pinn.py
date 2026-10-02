@@ -53,6 +53,11 @@ optimizer. Every optimizer gets the same linear-warmup + cosine-decay schedule
 constant, which suits Gnome on MSE since its step self-anneals as the
 residual shrinks).
 
+Points are resampled each step unless ``--fixed-dataset`` is supplied.
+This reuses one uniformly sampled PDE/IC/BC batch for any optimizer; Gnome
+draws fresh auxiliary subsets of that batch each step. Validation residual
+points still resample.
+
 Use ``--float64-after N`` to run N steps in float32, then continue in
 float64 with the same optimizer state and LR schedule. On MPS the switch
 also moves training to CPU. ``--float64`` (or ``--float64-after 0``) starts
@@ -225,6 +230,18 @@ def sample_batch(
     x_ic = torch.rand(n_ic, 1, device=device) * (X_MAX - X_MIN) + X_MIN
     t_bc = torch.rand(n_bc, 1, device=device) * (T_MAX - T_MIN) + T_MIN
     return t_pde, x_pde, x_ic, t_bc
+
+
+def sample_aux_from_batch(batch, n_pde: int, n_ic: int, n_bc: int):
+    """Uniform subsets without replacement per block, preserving (t, x) pairs."""
+    t_pde, x_pde, x_ic, t_bc = batch
+    if not (1 <= n_pde <= len(t_pde) and 1 <= n_ic <= len(x_ic)
+            and 1 <= n_bc <= len(t_bc)):
+        raise ValueError("auxiliary sample counts must fit the main PDE/IC/BC batch")
+    interior = torch.randperm(len(t_pde), device=t_pde.device)[:n_pde]
+    initial = torch.randperm(len(x_ic), device=x_ic.device)[:n_ic]
+    boundary = torch.randperm(len(t_bc), device=t_bc.device)[:n_bc]
+    return t_pde[interior], x_pde[interior], x_ic[initial], t_bc[boundary]
 
 
 def stacked_residuals(
@@ -453,10 +470,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--n-pde", type=int, default=4000)
     p.add_argument("--n-ic", type=int, default=200)
     p.add_argument("--n-bc", type=int, default=200)
+    p.add_argument("--fixed-dataset", action="store_true",
+                   help="Reuse the same PDE/IC/BC training points every step for any optimizer. "
+                        "Gnome draws fresh auxiliary subsets; validation still resamples.")
     p.add_argument("--aux-frac", type=float, default=0.25,
                    help="Aux batch sizes for Gnome are max(K_min, int(N * "
                         "aux_frac)) per block. Each aux pass is a full "
-                        "higher-order residual eval, so keep small.")
+                        "higher-order residual eval, so keep small. With "
+                        "--fixed-dataset, sizes are capped at N and aux_frac "
+                        "must be in (0,1].")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--trust-region", type=float, default=1.0,
                    help="Gnome per-coordinate update bound: lambda is set to "
@@ -525,6 +547,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--runs-dir", type=str, default="runs")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
+    if min(args.steps, args.n_pde, args.n_ic, args.n_bc) < 1:
+        p.error("steps and collocation counts must be positive")
+    if args.optimizer == "gnome":
+        if not math.isfinite(args.aux_frac) or args.aux_frac <= 0:
+            p.error("--aux-frac must be finite and positive")
+        if args.fixed_dataset and args.aux_frac > 1:
+            p.error("--fixed-dataset requires --aux-frac in (0,1] for Gnome")
     if args.float64_after is not None and not 0 <= args.float64_after < args.steps:
         p.error("--float64-after must satisfy 0 <= N < --steps")
     return args
@@ -612,6 +641,10 @@ def _train(args: argparse.Namespace) -> str:
     n_pde_aux = max(8, int(args.n_pde * args.aux_frac))
     n_ic_aux = max(2, int(args.n_ic * args.aux_frac))
     n_bc_aux = max(2, int(args.n_bc * args.aux_frac))
+    if args.fixed_dataset:
+        n_pde_aux = min(args.n_pde, n_pde_aux)
+        n_ic_aux = min(args.n_ic, n_ic_aux)
+        n_bc_aux = min(args.n_bc, n_bc_aux)
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
@@ -636,6 +669,11 @@ def _train(args: argparse.Namespace) -> str:
         "n_pde_aux": n_pde_aux,
         "n_ic_aux": n_ic_aux,
         "n_bc_aux": n_bc_aux,
+        "fixed_dataset": args.fixed_dataset,
+        "sampling": "fixed" if args.fixed_dataset else "resample_each_step",
+        "aux_sampling": (
+            "subsample_fixed_main_each_step" if args.fixed_dataset else "resample_each_step"
+        ) if args.optimizer == "gnome" else None,
         "n_params": n_params,
         "x_domain": (X_MIN, X_MAX),
         "t_domain": (T_MIN, T_MAX),
@@ -686,7 +724,8 @@ def _train(args: argparse.Namespace) -> str:
             f"dtype={torch.get_default_dtype()}\n"
             f"  N_pde={args.n_pde} N_ic={args.n_ic} N_bc={args.n_bc} | "
             f"aux={n_pde_aux}/{n_ic_aux}/{n_bc_aux} | steps={args.steps} | "
-            f"blocks={blocks}",
+            f"blocks={blocks} | "
+            f"sampling={'fixed' if args.fixed_dataset else 'resample_each_step'}",
             flush=True,
         )
         if diag is not None:
@@ -706,19 +745,34 @@ def _train(args: argparse.Namespace) -> str:
     last_terms: dict[str, float] = {}
     best_avg = best_rel_l2 = float("inf")
 
+    fixed_batch = None
     for step in range(args.steps):
         if step == args.float64_after and step > 0:
             previous_device = device
             device = switch_to_float64(model, opt)
+            if fixed_batch is not None:
+                # Move off MPS before promoting; preserve the sampled coordinates.
+                fixed_batch = tuple(
+                    tensor.to(device=device).to(dtype=torch.float64)
+                    for tensor in fixed_batch
+                )
             run.log("precision", step=step, from_dtype="torch.float32",
                     dtype="torch.float64", from_device=str(previous_device),
                     device=str(device), lr=current_lr(opt))
             if not args.quiet:
                 print(f"[{EXPERIMENT}] after {step} steps: float32 → float64 "
                       f"| device={previous_device} → {device}", flush=True)
-        main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
+        if fixed_batch is None:
+            main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
+            if args.fixed_dataset:
+                fixed_batch = main_batch
+        else:
+            main_batch = fixed_batch
         if args.optimizer == "gnome":
-            aux_batch = sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device)
+            if args.fixed_dataset:
+                aux_batch = sample_aux_from_batch(main_batch, n_pde_aux, n_ic_aux, n_bc_aux)
+            else:
+                aux_batch = sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device)
 
             def main_closure():
                 r = stacked_residuals(model, main_batch, use_bc)

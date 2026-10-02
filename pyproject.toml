@@ -45,6 +45,11 @@ llm = [
     "datasets>=2.14",
     "transformers>=4.30",
 ]
+# Pretokenized FineWeb benchmark; no tokenizer or datasets package is needed.
+nanogpt = [
+    "torch>=2.4",
+    "huggingface-hub>=0.23",
+]
 # CIFAR-10 rotation-regression benchmark: torchvision for the dataset.
 cifar = [
     "torchvision>=0.15",
