@@ -44,6 +44,10 @@ def parse_args(argv=None):
     p.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     p.add_argument("--dtype", choices=["auto", "float32", "bfloat16"], default="auto")
     p.add_argument("--compile", action="store_true", help="Opt-in CUDA model compilation")
+    p.add_argument("--head-init-std", type=float, default=0.0,
+                   help="Output weight initialization std; 0 preserves the reference zero initialization")
+    p.add_argument("--fp32-embedding", action="store_true",
+                   help="Keep embedding weights/optimizer state in FP32 while retaining the chosen compute dtype")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--steps", type=int)
     for name in REFERENCE:
@@ -113,7 +117,7 @@ def parse_args(argv=None):
         if not 0 <= getattr(args, name) < 1:
             p.error(f"{name} must be in [0, 1)")
     for name in ("lr", "weight_decay", "eps", "trust_region", "max_grad_norm",
-                 "embed_lr", "head_lr", "scalar_lr", "aux_weight_decay"):
+                 "embed_lr", "head_lr", "scalar_lr", "aux_weight_decay", "head_init_std"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             p.error(f"{name} must be finite and nonnegative")
     if args.eps == 0:
@@ -293,7 +297,8 @@ def run(args):
         raise ValueError(f"Only {train.capacity} complete training batches available for {args.steps} steps; "
                          "download more shards (training never wraps)")
     val_batch = validation.next_batch()  # fixed first 10,485,760 tokens in benchmark mode
-    model = GPT(args.vocab_size, args.n_layer, args.n_embd, args.head_dim, dtype).to(device)
+    model = GPT(args.vocab_size, args.n_layer, args.n_embd, args.head_dim, dtype,
+                head_init_std=args.head_init_std, fp32_embedding=args.fp32_embedding).to(device)
     optimizers = build_optimizers(model, args, device)
     forward_model = torch.compile(model, dynamic=False) if args.compile else model
     auxiliary_rng = torch.Generator().manual_seed(args.seed + 3)
@@ -307,6 +312,8 @@ def run(args):
     hashes = source_bundle(bundle)
     config.update(
         device=str(device), compute_dtype=str(dtype), upstream_revision=UPSTREAM_REVISION,
+        embedding_parameter_dtype=str(model.embed.weight.dtype),
+        reference_initialization_matches=args.head_init_std == 0,
         n_params=sum(p.numel() for p in model.parameters()), dataset=DATASET_REPO if not args.synthetic else "synthetic",
         reference_configuration_matches=matches, extra_curvature_pass=extra_pass,
         forward_backward_token_ratio=1 + (args.aux_batch_size * args.seq_len / args.batch_tokens if extra_pass else 0),
@@ -323,6 +330,7 @@ def run(args):
     print(f"[{EXPERIMENT}] {args.optimizer} | {device} | {dtype} | {config['n_params']:,} parameters", flush=True)
     print(f"  {args.batch_tokens:,} tokens/step; {config['microbatches_per_step']} microbatches; "
           f"reference configuration matches: {matches}; extra curvature pass: {extra_pass}", flush=True)
+    print(f"  head_init_std={args.head_init_std:g}; embedding_weights={model.embed.weight.dtype}", flush=True)
     with RunLogger(EXPERIMENT, args.optimizer, args.seed, config,
                    runs_dir=str(args.runs_dir), run_id=run_id) as log:
         training_seconds = 0.0
@@ -364,7 +372,8 @@ def run(args):
                            training_seconds=training_seconds)
                 raise SystemExit(DIVERGED_EXIT)
             if not args.quiet and (completed_steps % args.log_every == 0 or completed_steps == args.steps):
-                print(f"  step {completed_steps}/{args.steps} loss={loss:.5f} {elapsed:.2f}s", flush=True)
+                print(f"  step {completed_steps}/{args.steps} loss={loss:.5f} "
+                      f"lr={args.lr * multiplier:.3e} {elapsed:.2f}s", flush=True)
         checkpoint = None
         if args.save_checkpoint:
             checkpoint = str(output / f"{run_id}.pt")

@@ -94,22 +94,31 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
     def __init__(self, vocab_size=50304, num_layers=12, model_dim=768,
-                 head_dim=128, compute_dtype=torch.float32):
+                 head_dim=128, compute_dtype=torch.float32, *,
+                 head_init_std=0.0, fp32_embedding=False):
         super().__init__()
         if model_dim % head_dim or head_dim % 4:
             raise ValueError("model_dim must divide into heads; head_dim must be a multiple of 4")
+        self.compute_dtype = compute_dtype
+        self.head_init_std = head_init_std
         self.embed = nn.Embedding(vocab_size, model_dim).to(dtype=compute_dtype)
         self.blocks = nn.ModuleList([Block(model_dim, head_dim) for _ in range(num_layers)])
         self.proj = Linear(model_dim, vocab_size)  # deliberately untied
         self.norm1 = RMSNorm(model_dim)
         self.norm2 = RMSNorm(model_dim)
         self.reset_parameters()
+        # Retain the reference's initial BF16 values, but accumulate small
+        # optimizer updates in FP32. Forward activations remain compute_dtype.
+        if fp32_embedding:
+            self.embed.float()
 
     @torch.no_grad()
     def reset_parameters(self):
         for name, p in self.named_parameters():
             if name.endswith("weight"):
-                if "proj" in name:
+                if name == "proj.weight" and self.head_init_std > 0:
+                    p.normal_(std=self.head_init_std)
+                elif "proj" in name:
                     p.zero_()
                 elif "embed" in name:
                     p.normal_()
@@ -123,7 +132,7 @@ class GPT(nn.Module):
                 raise ValueError(f"Uninitialized parameter: {name}")
 
     def forward(self, inputs):
-        x = self.norm1(self.embed(inputs))
+        x = self.norm1(self.embed(inputs).to(dtype=self.compute_dtype))
         for block in self.blocks:
             x = block(x)
         logits = self.proj(self.norm2(x)).float()
