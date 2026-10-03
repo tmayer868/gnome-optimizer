@@ -229,7 +229,16 @@ class Gnome(Optimizer):
     the full design.
 
     Args:
-        params: Iterable of parameters or parameter groups.
+        params: Iterable of parameters or parameter groups. Groups default to
+            ``update_rule="gnome"``. Set ``update_rule="adamw"`` to use dense
+            AdamW with bias-corrected gradient/gradient-square EMAs instead.
+            AdamW groups inherit lr/betas/eps/weight_decay unless overridden;
+            set these explicitly when they should differ from Gnome's values.
+            They update on the first call, skip curvature and trust clipping,
+            and store FP32 moments (FP64 for double parameters). Main-gradient
+            clipping and accumulation cover both rules. Choose the rule when
+            constructing a group; changing it on an initialized group is not
+            supported. Shared/tied parameters must appear only once.
         lr: Learning rate.
         betas: ``(beta1, beta2)`` for the gradient and curvature EMAs in
             the rotated basis.
@@ -392,6 +401,7 @@ class Gnome(Optimizer):
         merge_dims = _normalize_merge_dims(merge_dims)
 
         defaults = dict(
+            update_rule="gnome",
             lr=lr,
             betas=betas,
             shampoo_beta=shampoo_beta,
@@ -428,6 +438,38 @@ class Gnome(Optimizer):
             from gnome.diagnostics import DEFAULT_METRICS
             metrics = dict(DEFAULT_METRICS)
         self.metrics = metrics
+
+    @staticmethod
+    def _validate_update_group(group: dict) -> None:
+        rule = group["update_rule"]
+        if rule not in ("gnome", "adamw"):
+            raise ValueError(f"Invalid update_rule: {rule!r}; expected 'gnome' or 'adamw'")
+        if rule == "adamw":
+            for name in ("lr", "eps", "weight_decay"):
+                value = group[name]
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(f"AdamW {name} must be finite and nonnegative")
+            betas = group["betas"]
+            if len(betas) != 2 or any(not 0 <= b < 1 for b in betas):
+                raise ValueError("AdamW betas must contain two values in [0, 1)")
+
+    def add_param_group(self, param_group: dict) -> None:
+        group = dict(param_group)
+        self._validate_update_group({**self.defaults, **group})
+        params = group["params"]
+        if isinstance(params, torch.Tensor):
+            params = [params]
+        elif isinstance(params, set):
+            raise TypeError("Optimizer parameters must have a deterministic order, not a set")
+        else:
+            params = list(params)
+        # PyTorch rejects overlap across groups, but only warns about repeats
+        # within one group. A tensor must never receive two updates here.
+        tensors = [p[1] if isinstance(p, tuple) else p for p in params]
+        if len({id(p) for p in tensors}) != len(tensors):
+            raise ValueError("A parameter may appear only once in an optimizer group")
+        group["params"] = params
+        super().add_param_group(group)
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -590,7 +632,27 @@ class Gnome(Optimizer):
         if extra is not None:
             # Hand the base implementation only the keys it knows about.
             state_dict = {k: v for k, v in state_dict.items() if k != "gnome"}
+        # Legacy checkpoints predate update_rule and contain only Gnome groups.
+        state_dict = dict(state_dict)
+        state_dict["param_groups"] = [
+            {"update_rule": "gnome", **group} for group in state_dict["param_groups"]
+        ]
+        for group in state_dict["param_groups"]:
+            self._validate_update_group(group)
         super().load_state_dict(state_dict)
+        # Optimizer.load_state_dict casts floating state to the parameter dtype.
+        # Restore Adam moments directly from the saved tensors so BF16 weights
+        # do not round their FP32 moments during a checkpoint round trip.
+        for saved_group, group in zip(state_dict["param_groups"], self.param_groups):
+            if group["update_rule"] != "adamw":
+                continue
+            for saved_id, p in zip(saved_group["params"], group["params"]):
+                saved = state_dict["state"].get(saved_id, {})
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in saved:
+                        self.state[p][key] = saved[key].to(
+                            device=p.device, dtype=_linalg_work_dtype(p)
+                        ).clone()
         if extra is not None:
             self._step_count = int(extra["step_count"])
 
@@ -1086,7 +1148,7 @@ class Gnome(Optimizer):
             Callable[[], ClosureReturn],
             Sequence[Callable[[], ClosureReturn]],
         ],
-        aux_closure: Callable[[], ClosureReturn],
+        aux_closure: Optional[Callable[[], ClosureReturn]] = None,
     ) -> torch.Tensor:
         """Perform a single optimization step.
 
@@ -1113,6 +1175,8 @@ class Gnome(Optimizer):
                 but typically on a smaller, disjoint slice of samples.
                 Used to compute the Hutchinson surrogate gradient. Runs once
                 per logical step even when the main batch is accumulated.
+                Only parameters in ``update_rule="gnome"`` groups receive
+                surrogate gradients. Omitted/skipped for AdamW-only optimizers.
 
         The closures run independent forward passes so each backward
         releases its computation graph immediately — there is no
@@ -1123,9 +1187,9 @@ class Gnome(Optimizer):
             micro-batch closures are passed, this is their size-weighted
             mean, i.e. the loss over the concatenated main batch.
         """
-        if main_closure is None or aux_closure is None:
+        if main_closure is None:
             raise RuntimeError(
-                "Gnome.step requires (main_closure, aux_closure)."
+                "Gnome.step requires a main_closure."
             )
 
         # Normalize to a list of micro-batch closures. A single callable is
@@ -1140,14 +1204,17 @@ class Gnome(Optimizer):
             main_closures = [main_closure]
         single = len(main_closures) == 1
 
-        self._step_count += 1
-
         params, groups_for_params = [], []
         for group in self.param_groups:
             for p in group["params"]:
                 if p.requires_grad:
                     params.append(p)
                     groups_for_params.append(group)
+        gnome_indices = [i for i, group in enumerate(groups_for_params)
+                         if group["update_rule"] == "gnome"]
+        if gnome_indices and aux_closure is None:
+            raise RuntimeError("Gnome.step requires aux_closure for Gnome parameter groups.")
+        self._step_count += 1
 
         # MAIN: loop over micro-batch closures, accumulating a size-weighted
         # average gradient. Each closure runs an independent forward+backward
@@ -1187,6 +1254,14 @@ class Gnome(Optimizer):
             for i, g in enumerate(g_main):
                 if g is None:
                     continue
+                if groups_for_params[i]["update_rule"] == "adamw":
+                    if g.is_sparse:
+                        raise RuntimeError("Gnome's AdamW groups require dense gradients")
+                    if g.is_complex():
+                        raise RuntimeError("Gnome's AdamW groups require real parameters")
+                    # Promote before weighting/accumulation, not just at the
+                    # EMA update, to retain small microbatch contributions.
+                    g = g.to(_linalg_work_dtype(g))
                 # Weight by micro-batch size; the /total_n normalization is
                 # applied once after the loop. For a single closure we skip
                 # the scaling entirely to keep the update bit-identical to the
@@ -1225,24 +1300,30 @@ class Gnome(Optimizer):
                     for g in grads:
                         g.mul_(clip_coef)
 
-        # AUX: forward + backward on the aux batch. Independent graph.
-        with torch.enable_grad():
-            aux_result = aux_closure()
-        if not (isinstance(aux_result, tuple) and len(aux_result) == 2):
-            raise RuntimeError(
-                "aux_closure must return (y_hat, y); got "
-                f"{type(aux_result).__name__}"
+        # AUX: independent graph, requesting only Gnome parameter gradients.
+        # The forward stays intact: AdamW embeddings can feed Gnome layers.
+        g_aux = [None] * len(params)
+        if gnome_indices:
+            with torch.enable_grad():
+                aux_result = aux_closure()
+            if not (isinstance(aux_result, tuple) and len(aux_result) == 2):
+                raise RuntimeError(
+                    "aux_closure must return (y_hat, y); got "
+                    f"{type(aux_result).__name__}"
+                )
+            y_hat_aux, _y_aux = aux_result
+            if not y_hat_aux.requires_grad:
+                raise RuntimeError(
+                    "y_hat from aux_closure must have requires_grad=True."
+                )
+            aux_idx = torch.arange(y_hat_aux.shape[0], device=y_hat_aux.device)
+            S = self._build_surrogate(y_hat_aux, aux_idx)
+            surrogate_grads = torch.autograd.grad(
+                S, [params[i] for i in gnome_indices], allow_unused=True
             )
-        y_hat_aux, _y_aux = aux_result
-        if not y_hat_aux.requires_grad:
-            raise RuntimeError(
-                "y_hat from aux_closure must have requires_grad=True."
-            )
-        aux_idx = torch.arange(y_hat_aux.shape[0], device=y_hat_aux.device)
-        S = self._build_surrogate(y_hat_aux, aux_idx)
-        g_aux = torch.autograd.grad(S, params, allow_unused=True)
-        # aux graph is now freed
-        del y_hat_aux, aux_result
+            for i, grad in zip(gnome_indices, surrogate_grads):
+                g_aux[i] = grad
+            del y_hat_aux, aux_result
 
         with torch.no_grad():
             for idx, (p, g, G_s, group) in enumerate(
@@ -1250,11 +1331,37 @@ class Gnome(Optimizer):
             ):
                 if g is None:
                     continue
+                if group["update_rule"] == "adamw":
+                    self._adamw_param_step(p, g.detach(), group)
+                    continue
                 if G_s is None:
                     G_s = torch.zeros_like(g)
                 self._param_step(p, g.detach(), G_s.detach(), group, idx)
 
         return mean_loss
+
+    def _adamw_param_step(self, p: torch.Tensor, g: torch.Tensor, group: dict) -> None:
+        """Dense AdamW in the parameter basis; no curvature or trust clipping.
+
+        Moments use FP32 (FP64 for double parameters). Low-precision parameter
+        storage still rounds updates: use FP32 parameters to retain small steps.
+        """
+        state = self.state[p]
+        if not state:
+            state["step"] = 0
+            state["exp_avg"] = torch.zeros_like(p, dtype=_linalg_work_dtype(p))
+            state["exp_avg_sq"] = torch.zeros_like(p, dtype=_linalg_work_dtype(p))
+        state["step"] += 1
+        step = state["step"]
+        beta1, beta2 = group["betas"]
+        g = g.to(state["exp_avg"].dtype)
+        m, v = state["exp_avg"], state["exp_avg_sq"]
+        m.lerp_(g, 1 - beta1)
+        v.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+        denom = v.sqrt().div_(math.sqrt(1 - beta2 ** step)).add_(group["eps"])
+        # Decay precedes the adaptive update, matching torch.optim.AdamW.
+        p.mul_(1 - group["lr"] * group["weight_decay"])
+        p.addcdiv_(m, denom, value=-group["lr"] / (1 - beta1 ** step))
 
     def _param_step(
         self,

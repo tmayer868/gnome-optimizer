@@ -110,6 +110,37 @@ For multi-block losses (e.g. PINNs — a PDE residual plus boundary/initial term
 whose `mean(·²)` is the weighted loss, and hands the MSE surrogate the right per-block GGN.
 See the PINN experiments and [`docs/method.md`](docs/method.md) §8 for details.
 
+### AdamW parameter groups inside Gnome
+
+Set `update_rule="adamw"` on a group to update it with AdamW directly inside
+Gnome. For example, to use AdamW for a model's input embedding:
+
+```python
+embedding = model.embed.weight
+opt = Gnome([
+    {"params": [p for p in model.parameters() if p is not embedding],
+     "update_rule": "gnome"},
+    {"params": [embedding], "update_rule": "adamw", "lr": 1e-3,
+     "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": 0.0},
+], lr=1e-3, loss="cce_hutchinson")
+```
+
+The existing `opt.step(main_closure, aux_closure)` API stays the same, including
+microbatch accumulation. Both groups receive the main gradients; only Gnome
+groups receive curvature gradients and preconditioner state. AdamW groups use
+bias-corrected gradient and squared-gradient EMAs, decoupled weight decay, and
+update immediately on the first step. Gnome's trust radius, curvature damping,
+coordinate clipping, and curvature diagnostics apply only to Gnome groups.
+Optional global main-gradient clipping covers both rules.
+
+AdamW moments are FP32 (FP64 for double parameters), including after checkpoint
+loading. Keep parameters in FP32 too if small updates would round away in BF16.
+All groups share one optimizer checkpoint and work with standard LR schedulers.
+Each group inherits constructor settings unless overridden, so specify AdamW's
+`betas` and `eps` explicitly when they should differ from Gnome's. Parameters,
+including tied weights, must appear only once. Choose each group's update rule
+at construction. An AdamW-only Gnome optimizer does not need an auxiliary closure.
+
 ## Running the experiments
 
 Each experiment is a module under `experiments/`, grouped into `pinns`, `resnets`, and
