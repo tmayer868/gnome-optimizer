@@ -44,8 +44,8 @@ def parse_args(argv=None):
     p.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     p.add_argument("--dtype", choices=["auto", "float32", "bfloat16"], default="auto")
     p.add_argument("--compile", action="store_true", help="Opt-in CUDA model compilation")
-    p.add_argument("--head-init-std", type=float, default=0.0,
-                   help="Output weight initialization std; 0 preserves the reference zero initialization")
+    p.add_argument("--head-init-std", type=float, default=0.02,
+                   help="Output weight initialization std (default: WikiText's 0.02); 0 zeros only the output head")
     p.add_argument("--fp32-embedding", action="store_true",
                    help="Keep embedding weights/optimizer state in FP32 while retaining the chosen compute dtype")
     p.add_argument("--seed", type=int, default=0)
@@ -313,7 +313,8 @@ def run(args):
     config.update(
         device=str(device), compute_dtype=str(dtype), upstream_revision=UPSTREAM_REVISION,
         embedding_parameter_dtype=str(model.embed.weight.dtype),
-        reference_initialization_matches=args.head_init_std == 0,
+        initialization="wikitext", residual_init_std=model.residual_init_std,
+        reference_initialization_matches=False,
         n_params=sum(p.numel() for p in model.parameters()), dataset=DATASET_REPO if not args.synthetic else "synthetic",
         reference_configuration_matches=matches, extra_curvature_pass=extra_pass,
         forward_backward_token_ratio=1 + (args.aux_batch_size * args.seq_len / args.batch_tokens if extra_pass else 0),
@@ -330,7 +331,9 @@ def run(args):
     print(f"[{EXPERIMENT}] {args.optimizer} | {device} | {dtype} | {config['n_params']:,} parameters", flush=True)
     print(f"  {args.batch_tokens:,} tokens/step; {config['microbatches_per_step']} microbatches; "
           f"reference configuration matches: {matches}; extra curvature pass: {extra_pass}", flush=True)
-    print(f"  head_init_std={args.head_init_std:g}; embedding_weights={model.embed.weight.dtype}", flush=True)
+    print(f"  initialization=wikitext; head_init_std={args.head_init_std:g}; "
+          f"residual_init_std={model.residual_init_std:.6g}; "
+          f"embedding_weights={model.embed.weight.dtype}", flush=True)
     with RunLogger(EXPERIMENT, args.optimizer, args.seed, config,
                    runs_dir=str(args.runs_dir), run_id=run_id) as log:
         training_seconds = 0.0

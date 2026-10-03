@@ -1,8 +1,11 @@
 """Portable Track 3 model and Muon, adapted from Keller Jordan (MIT).
 
 Reference: modded_nanogpt_reference/train_gpt_simple.py and its LICENSE.
-The default architecture, initialization, and Muon math match that snapshot.
+The architecture and Muon math match that snapshot. Initialization follows
+our WikiText GPT: std 0.02 weights with depth-scaled residual projections.
 """
+
+import math
 
 import torch
 from torch import nn
@@ -95,41 +98,45 @@ class Block(nn.Module):
 class GPT(nn.Module):
     def __init__(self, vocab_size=50304, num_layers=12, model_dim=768,
                  head_dim=128, compute_dtype=torch.float32, *,
-                 head_init_std=0.0, fp32_embedding=False):
+                 head_init_std=0.02, fp32_embedding=False):
         super().__init__()
         if model_dim % head_dim or head_dim % 4:
             raise ValueError("model_dim must divide into heads; head_dim must be a multiple of 4")
         self.compute_dtype = compute_dtype
         self.head_init_std = head_init_std
-        self.embed = nn.Embedding(vocab_size, model_dim).to(dtype=compute_dtype)
+        self.residual_init_std = 0.02 / math.sqrt(2 * num_layers)
+        self.embed = nn.Embedding(vocab_size, model_dim)
         self.blocks = nn.ModuleList([Block(model_dim, head_dim) for _ in range(num_layers)])
         self.proj = Linear(model_dim, vocab_size)  # deliberately untied
         self.norm1 = RMSNorm(model_dim)
         self.norm2 = RMSNorm(model_dim)
         self.reset_parameters()
-        # Retain the reference's initial BF16 values, but accumulate small
-        # optimizer updates in FP32. Forward activations remain compute_dtype.
-        if fp32_embedding:
-            self.embed.float()
+        # Draw the initialization in FP32, as in WikiText. Optionally retain
+        # FP32 embedding weights for accumulating small optimizer updates.
+        self.embed.to(dtype=torch.float32 if fp32_embedding else compute_dtype)
 
     @torch.no_grad()
     def reset_parameters(self):
         for name, p in self.named_parameters():
             if name.endswith("weight"):
-                if name == "proj.weight" and self.head_init_std > 0:
-                    p.normal_(std=self.head_init_std)
-                elif "proj" in name:
-                    p.zero_()
-                elif "embed" in name:
-                    p.normal_()
+                if name == "proj.weight":
+                    if self.head_init_std == 0:
+                        p.zero_()
+                    else:
+                        p.normal_(std=self.head_init_std)
                 else:
-                    p.normal_(std=0.33**0.5 / p.size(-1)**0.5)
+                    p.normal_(std=0.02)
             elif name.endswith("bias"):
                 p.zero_()
             elif name.endswith("gains"):
                 p.fill_(1)
             else:
                 raise ValueError(f"Uninitialized parameter: {name}")
+        # WikiText applies a second initialization pass to the two residual
+        # output matrices in each block, scaling by the number of layers.
+        for block in self.blocks:
+            block.attn.proj.weight.normal_(std=self.residual_init_std)
+            block.mlp.proj.weight.normal_(std=self.residual_init_std)
 
     def forward(self, inputs):
         x = self.norm1(self.embed(inputs).to(dtype=self.compute_dtype))

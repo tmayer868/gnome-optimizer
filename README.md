@@ -320,14 +320,16 @@ cosine schedule.
 # Tiny offline development check, using MPS when available.
 uv run -m experiments.transformers.modded_nanogpt --preset dev --synthetic
 
-# Full reference configuration on one CUDA GPU, with gradient accumulation.
+# Full benchmark model/data on one CUDA GPU, with gradient accumulation.
 uv run --extra nanogpt -m experiments.transformers.modded_nanogpt \
     --optimizer muon --download-shards 20 --steps 3250 --save-checkpoint
 ```
 
 Choose `muon`, `gnome_hutchinson`, `gnome_fisher`, `soap`, or `adamw`.
 The full preset preserves the upstream model, FineWeb token stream, global
-batch, and validation budget. Gnome uses an additional curvature pass, so its
+batch, and validation budget. Initialization follows WikiText: std 0.02
+embeddings/linear weights, depth-scaled residual projections, zero biases,
+and unit normalization gains. Gnome uses an additional curvature pass, so its
 results are research comparisons and **do not qualify for the official track's
 single-pass rule**. The development preset is also distinct from the benchmark.
 See [protocol, Thunder Compute commands, and validation notes](docs/modded_nanogpt.md).
