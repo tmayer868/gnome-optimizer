@@ -1475,14 +1475,14 @@ class Gnome(Optimizer):
             lam = eps
         else:
             T = trust_radius * (
-                p.square().sum() + 10
+                p.square().sum() + p.numel()
             ).sqrt()
             lam = self._lm_lambda(grad_hat, gnd_hat, T, eps,
                                   lam_prev=state.get("lm_lambda"))
             state["lm_lambda"] = lam
         # Newton step in the rotated basis, damped by lam.
-        update_rot = grad_hat / gnd_hat.add(lam)
-        # update_rot = update_rot.clamp(-1, 1)
+        update_rot = grad_hat / gnd_hat.add(eps)
+        update_rot = update_rot.clamp(-1, 1)
 
         if self._diagnostics_due():
             self._emit_diagnostics(
