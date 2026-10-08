@@ -78,7 +78,12 @@ def parse_args(argv=None):
     p.add_argument("--scalar-lr", type=float, default=0.015, help="Muon auxiliary AdamW only")
     p.add_argument("--aux-weight-decay", type=float, default=0.001, help="Muon auxiliary AdamW only")
     p.add_argument("--warmup-steps", type=int, default=0)
-    p.add_argument("--cooldown-frac", type=float, default=0.7, help="Final fraction with linear LR decay")
+    p.add_argument("--lr-schedule", choices=["linear", "cosine"], default="linear",
+                   help="Linear warmup, then reference linear cooldown or immediate cosine decay")
+    p.add_argument("--min-lr-frac", type=float, default=0.1,
+                   help="Cosine schedule's final LR as a fraction of each group's initial LR")
+    p.add_argument("--cooldown-frac", type=float, default=0.7,
+                   help="Final fraction with linear LR decay; ignored for --lr-schedule cosine")
     p.add_argument("--val-every", type=int, help="Default: 125, then 25 during the final 10%%")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--data-dir", type=Path, default=Path("experiments/data/fineweb10B"))
@@ -124,6 +129,8 @@ def parse_args(argv=None):
         p.error("val-every must be positive")
     if not 0 <= args.warmup_steps < args.steps or not 0 <= args.cooldown_frac <= 1:
         p.error("require 0 <= warmup-steps < steps and 0 <= cooldown-frac <= 1")
+    if not 0 <= args.min_lr_frac <= 1:
+        p.error("min-lr-frac must be in [0, 1]")
     for name in ("beta1", "beta2", "shampoo_beta", "muon_momentum", "embed_beta1", "embed_beta2"):
         if not 0 <= getattr(args, name) < 1:
             p.error(f"{name} must be in [0, 1)")
@@ -169,9 +176,22 @@ def synchronize(device):
         torch.mps.synchronize()
 
 
-def schedule_multiplier(step, steps, cooldown_frac, warmup_steps=0):
+def schedule_multiplier(step, steps, cooldown_frac, warmup_steps=0, *,
+                        lr_schedule="linear", min_lr_frac=0.1):
+    """Multiplier for a zero-indexed optimizer step.
+
+    Warmup reaches 1 on its last update. Cosine then decays over all remaining
+    updates, reaching min_lr_frac on the final update (steps - 1). Without
+    warmup it starts at 1; a single-update cosine run uses the final floor.
+    The reference linear cooldown retains its original indexing and behavior.
+    """
     if step < warmup_steps:
         return (step + 1) / warmup_steps
+    if lr_schedule == "cosine":
+        peak_step = max(warmup_steps - 1, 0)
+        decay_steps = steps - 1 - peak_step
+        progress = min(1.0, max(0.0, (step - peak_step) / decay_steps)) if decay_steps > 0 else 1.0
+        return min_lr_frac + 0.5 * (1 - min_lr_frac) * (1 + math.cos(math.pi * progress))
     if cooldown_frac == 0:
         return 1.0
     return min(1.0, (1 - step / steps) / cooldown_frac)
@@ -195,6 +215,7 @@ def build_optimizers(model, args, device):
             loss="cce_hutchinson" if args.optimizer == "gnome_hutchinson" else "cce",
             shampoo_beta=args.shampoo_beta, precondition_frequency=args.precondition_frequency,
             max_precond_dim=args.max_precond_dim,
+            norm_free=True,
             trust_radius=args.trust_region or None, max_grad_norm=args.max_grad_norm or None,
         )]
     elif args.optimizer == "soap":
@@ -366,7 +387,7 @@ def run(args):
         final_val_loss = float("nan")
         for step in range(args.steps + 1):
             interval = args.val_every or (125 if step / args.steps < 0.9 else 25)
-            if step == 0 or step == args.steps or step % interval == 0:
+            if step > 0 and (step == args.steps or step % interval == 0):
                 final_val_loss = evaluate(forward_model, val_batch, args.microbatch_size, device)
                 log.log_val(step, loss=final_val_loss,
                             ppl=math.exp(min(final_val_loss, 80)), training_seconds=training_seconds,
@@ -380,7 +401,10 @@ def run(args):
                     raise SystemExit(DIVERGED_EXIT)
             if step == args.steps:
                 break
-            multiplier = schedule_multiplier(step, args.steps, args.cooldown_frac, args.warmup_steps)
+            multiplier = schedule_multiplier(
+                step, args.steps, args.cooldown_frac, args.warmup_steps,
+                lr_schedule=args.lr_schedule, min_lr_frac=args.min_lr_frac,
+            )
             for opt in optimizers:
                 for group in opt.param_groups:
                     group["lr"] = group["initial_lr"] * multiplier
