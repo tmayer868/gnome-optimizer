@@ -110,6 +110,7 @@ import torch.nn.functional as F
 from torch.optim.optimizer import Optimizer
 import math
 import random
+import numpy as np
 
 ClosureReturn = Tuple[torch.Tensor, torch.Tensor]
 MergeDims = Union[bool, str, Sequence[Sequence[int]]]
@@ -1474,16 +1475,18 @@ class Gnome(Optimizer):
         if trust_radius is None:
             lam = eps
         else:
-            T = trust_radius * (
-                p.square().sum() + p.numel()
-            ).sqrt()
+            T = trust_radius * math.sqrt(
+                p.numel()# 10 + p.square().sum()
+            )
             lam = self._lm_lambda(grad_hat, gnd_hat, T, eps,
                                   lam_prev=state.get("lm_lambda"))
             state["lm_lambda"] = lam
+            # print(lam)
         # Newton step in the rotated basis, damped by lam.
-        update_rot = grad_hat / gnd_hat.add(eps)
-        update_rot = update_rot.clamp(-1, 1)
-
+        update_rot = grad_hat / (grad_hat.abs() + gnd_hat * trust_radius) # (1 - gnd_hat.clamp(-1, 1))# / gnd_hat.add(lam)
+        # update_rot = update_rot.clamp(-trust_radius, trust_radius)
+        # if np.random.rand() < .01:
+        #     print(update_rot.min(), update_rot.max(), update_rot.abs().mean())
         if self._diagnostics_due():
             self._emit_diagnostics(
                 idx, p, group, grad_hat, gnd_hat, update_rot, lam, lr
@@ -1497,7 +1500,7 @@ class Gnome(Optimizer):
             merge_dims=group["merge_dims"],
             max_precond_dim=group["max_precond_dim"],
         )
-        update = update.clamp(min=-1.0, max=1.0)
+        # update = update.clamp(min=-1.0, max=1.0)
 
         p.add_(update, alpha=-lr)
         if group["weight_decay"] > 0.0:

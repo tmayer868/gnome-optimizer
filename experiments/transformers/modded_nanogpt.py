@@ -215,7 +215,7 @@ def build_optimizers(model, args, device):
             loss="cce_hutchinson" if args.optimizer == "gnome_hutchinson" else "cce",
             shampoo_beta=args.shampoo_beta, precondition_frequency=args.precondition_frequency,
             max_precond_dim=args.max_precond_dim,
-            norm_free=True,
+            norm_free=False,
             trust_radius=args.trust_region or None, max_grad_norm=args.max_grad_norm or None,
         )]
     elif args.optimizer == "soap":
