@@ -1472,6 +1472,7 @@ class Gnome(Optimizer):
         # preserve this upper bound; decoupled weight decay is separate.
         eps = group["eps"]
         trust_radius = group["trust_radius"]
+        grad_hat = torch.sign(grad_hat)
         if trust_radius is None:
             lam = eps
         else:
@@ -1483,7 +1484,7 @@ class Gnome(Optimizer):
             state["lm_lambda"] = lam
             # print(lam)
         # Newton step in the rotated basis, damped by lam.
-        update_rot = grad_hat / (grad_hat.abs() + gnd_hat * trust_radius) # (1 - gnd_hat.clamp(-1, 1))# / gnd_hat.add(lam)
+        update_rot = grad_hat / gnd_hat.add(lam)
         # update_rot = update_rot.clamp(-trust_radius, trust_radius)
         # if np.random.rand() < .01:
         #     print(update_rot.min(), update_rot.max(), update_rot.abs().mean())
