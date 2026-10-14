@@ -1472,25 +1472,28 @@ class Gnome(Optimizer):
         # preserve this upper bound; decoupled weight decay is separate.
         eps = group["eps"]
         trust_radius = group["trust_radius"]
-        _grad_hat = torch.sign(grad_hat)# torch.sign(.9 * grad_m + .1 * g_rot) # grad_hat.abs() *
-        # gnd_hat /= gnd_hat.norm()
+        grad_hat = grad_hat # grad_hat.abs() *
+        # _grad_hat = torch.sign(grad_hat)
         if trust_radius is None:
             lam = eps
         else:
             T = trust_radius * math.sqrt(
                 p.numel()# 10 + p.square().sum()
             )
-            lam = self._lm_lambda(_grad_hat, gnd_hat, T, eps,
+            lam = self._lm_lambda(grad_hat, gnd_hat, T, eps,
                                   lam_prev=state.get("lm_lambda"))
             state["lm_lambda"] = lam
             # print(lam)
         # Newton step in the rotated basis, damped by lam.
-        gnd_hat /= grad_hat.abs().add(eps)
-        update_rot = _grad_hat  * (1 - (trust_radius * gnd_hat).clamp(max=.999)) # / gnd_hat.add(lam)
+        # gnd_hat /= grad_hat.abs().add(eps)
+        # linear_curvature_penalty = (1 - (trust_radius * gnd_hat).clamp(max=.98))
+        # update_rot = _grad_hat  / (1 + trust_radius * gnd_hat)# / gnd_hat.add(lam)
+        update_rot = torch.sign(grad_hat) * ((grad_hat / gnd_hat.add(eps)).abs().clamp(min=trust_radius, max=1.0))
+        # update_rot = grad_hat / (grad_hat.abs() + trust_radius * gnd_hat + eps)
         # update_rot = update_rot.clamp(min=-1, max=1)
         # update_rot = update_rot.clamp(-trust_radius, trust_radius)
-        # if np.random.rand() < .01:
-        #     print(update_rot.min(), update_rot.max(), update_rot.abs().mean())
+        # if np.random.rand() < .005:
+        #     print(linear_curvature_penalty.min(), linear_curvature_penalty.max(), linear_curvature_penalty.abs().mean())
         if self._diagnostics_due():
             self._emit_diagnostics(
                 idx, p, group, grad_hat, gnd_hat, update_rot, lam, lr
