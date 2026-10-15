@@ -128,6 +128,11 @@ INDEX_HTML = r"""<!doctype html>
   <label>val metric:
     <select id="metric" class="metric"></select></label>
   <label><input type="checkbox" id="logy" checked /> log y-axis</label>
+  <label>min step:
+    <input type="number" id="min-step" value="0" min="0" step="1"
+           style="width: 80px;" />
+    <span class="hint">both charts (0 = all)</span>
+  </label>
   <label>train smoothing:
     <input type="number" id="smoothing-window" value="100" min="1" max="10000" step="10"
            style="width: 70px;" />
@@ -145,6 +150,10 @@ INDEX_HTML = r"""<!doctype html>
 
 <h3>Hyperparameters</h3>
 <div id="meta"></div>
+
+<h3>Train metrics</h3>
+<p class="hint">Latest logged values, with the step for each metric.</p>
+<div id="train-metrics"></div>
 
 <script>
 const COLOR_A = "#58a6ff";
@@ -250,6 +259,11 @@ function decimate(pts, maxPoints) {
 function getSmoothingWindow() {
   const raw = parseInt(document.getElementById("smoothing-window").value, 10);
   return Number.isFinite(raw) && raw >= 1 ? raw : 1;
+}
+
+function getMinStep() {
+  const raw = Number(document.getElementById("min-step").value);
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 0;
 }
 
 function dataset(role, pts) {
@@ -390,6 +404,40 @@ function renderMeta() {
   target.innerHTML = `<table><thead><tr><th>key</th><th class="a-color">A</th><th class="b-color">B</th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 
+function renderTrainMetrics() {
+  const target = document.getElementById("train-metrics");
+  const trainA = runA?.series?.train || {};
+  const trainB = runB?.series?.train || {};
+  const names = [...new Set([...Object.keys(trainA), ...Object.keys(trainB)])].sort();
+  if (!names.length) {
+    target.textContent = runA || runB
+      ? "No training metrics logged yet."
+      : "Select runs to compare training metrics.";
+    return;
+  }
+  const table = document.createElement("table");
+  table.innerHTML = `<thead><tr><th>Metric</th>
+    <th class="a-color num">A · latest</th><th class="a-color num">A · step</th>
+    <th class="b-color num">B · latest</th><th class="b-color num">B · step</th>
+    </tr></thead>`;
+  const body = table.createTBody();
+  for (const name of names) {
+    const row = body.insertRow();
+    row.insertCell().textContent = name;
+    for (const train of [trainA, trainB]) {
+      const series = train[name];
+      const last = series ? series.values.length - 1 : -1;
+      const valueCell = row.insertCell();
+      valueCell.className = "num";
+      valueCell.textContent = fmt(last >= 0 ? series.values[last] : null);
+      const stepCell = row.insertCell();
+      stepCell.className = "num";
+      stepCell.textContent = last >= 0 ? (series.steps[last] ?? "—") : "—";
+    }
+  }
+  target.replaceChildren(table);
+}
+
 async function refresh() {
   document.getElementById("status").innerText = "refreshing…";
   const runs = await listRuns();
@@ -402,25 +450,33 @@ async function refresh() {
   populateMetricSelect();
   const metric = document.getElementById("metric").value;
   const window = getSmoothingWindow();
+  const minStep = getMinStep();
+  // Filter the data itself so hidden early spikes don't affect y-axis scaling.
+  const visible = pts => pts.filter(p => p.x >= minStep);
   document.getElementById("train-window-label").innerText = window;
   document.getElementById("val-heading").innerText = "Val " + (metric || "metric");
   charts.val.options.scales.y.title.text = metric || "value";
 
-  const valA = runA ? points(valSeries(runA, metric)) : [];
-  const valB = runB ? points(valSeries(runB, metric)) : [];
-  const trainA = runA ? decimate(rollingMean(runA.series?.train?.loss, window), 4000) : [];
-  const trainB = runB ? decimate(rollingMean(runB.series?.train?.loss, window), 4000) : [];
+  const valA = runA ? visible(points(valSeries(runA, metric))) : [];
+  const valB = runB ? visible(points(valSeries(runB, metric))) : [];
+  // Smooth before filtering to preserve the rolling mean at the cutoff;
+  // decimate afterwards so the visible range keeps its detail.
+  const trainA = runA ? decimate(visible(rollingMean(runA.series?.train?.loss, window)), 4000) : [];
+  const trainB = runB ? decimate(visible(rollingMean(runB.series?.train?.loss, window)), 4000) : [];
 
+  charts.val.options.scales.x.min = minStep || undefined;
+  charts.train.options.scales.x.min = minStep || undefined;
   applyLogScale();
   setChart(charts.val, valA, valB);
   setChart(charts.train, trainA, trainB);
 
   renderSummary(metric);
   renderMeta();
+  renderTrainMetrics();
   document.getElementById("status").innerText = "ok · " + new Date().toLocaleTimeString();
 }
 
-["run-a", "run-b", "since-filter", "exp-filter", "metric", "logy", "smoothing-window"]
+["run-a", "run-b", "since-filter", "exp-filter", "metric", "logy", "smoothing-window", "min-step"]
   .forEach(id => document.getElementById(id).addEventListener("change", refresh));
 document.getElementById("smoothing-window").addEventListener("input", () => {
   document.getElementById("train-window-label").innerText = getSmoothingWindow();

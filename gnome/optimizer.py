@@ -1472,28 +1472,24 @@ class Gnome(Optimizer):
         # preserve this upper bound; decoupled weight decay is separate.
         eps = group["eps"]
         trust_radius = group["trust_radius"]
-        grad_hat = grad_hat # grad_hat.abs() *
-        # _grad_hat = torch.sign(grad_hat)
         if trust_radius is None:
             lam = eps
         else:
             T = trust_radius * math.sqrt(
-                p.numel()# 10 + p.square().sum()
+                p.numel() # 10 + p.square().sum()
             )
             lam = self._lm_lambda(grad_hat, gnd_hat, T, eps,
                                   lam_prev=state.get("lm_lambda"))
             state["lm_lambda"] = lam
-            # print(lam)
         # Newton step in the rotated basis, damped by lam.
-        # gnd_hat /= grad_hat.abs().add(eps)
-        # linear_curvature_penalty = (1 - (trust_radius * gnd_hat).clamp(max=.98))
-        # update_rot = _grad_hat  / (1 + trust_radius * gnd_hat)# / gnd_hat.add(lam)
-        update_rot = torch.sign(grad_hat) * ((grad_hat / gnd_hat.add(eps)).abs().clamp(min=trust_radius, max=1.0))
-        # update_rot = grad_hat / (grad_hat.abs() + trust_radius * gnd_hat + eps)
-        # update_rot = update_rot.clamp(min=-1, max=1)
-        # update_rot = update_rot.clamp(-trust_radius, trust_radius)
-        # if np.random.rand() < .005:
-        #     print(linear_curvature_penalty.min(), linear_curvature_penalty.max(), linear_curvature_penalty.abs().mean())
+        damping = (
+            (grad_hat / gnd_hat.add(eps))
+            .abs()
+            .clamp(min=trust_radius, max=1.0)
+        )
+        update_rot = torch.sign(grad_hat) * damping
+        update_rot *= math.sqrt(p.numel()) / update_rot.norm()
+        # update_rot = grad_hat / gnd_hat.add(lam)
         if self._diagnostics_due():
             self._emit_diagnostics(
                 idx, p, group, grad_hat, gnd_hat, update_rot, lam, lr
@@ -1507,7 +1503,6 @@ class Gnome(Optimizer):
             merge_dims=group["merge_dims"],
             max_precond_dim=group["max_precond_dim"],
         )
-        # update = update.clamp(min=-1.0, max=1.0)
 
         p.add_(update, alpha=-lr)
         if group["weight_decay"] > 0.0:
