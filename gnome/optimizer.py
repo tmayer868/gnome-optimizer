@@ -1491,6 +1491,7 @@ class Gnome(Optimizer):
         # Zero-initialized projections can block gradients upstream. Keep a
         # zero update at zero instead of dividing by zero during normalization.
         update_rot = update_rot / update_rot.norm().clamp_min(torch.finfo(update_rot.dtype).tiny)
+
         update_rot *= math.sqrt(p.numel())
         # update_rot = grad_hat / gnd_hat.add(lam)
         if self._diagnostics_due():
