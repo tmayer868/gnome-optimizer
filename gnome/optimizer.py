@@ -1488,7 +1488,10 @@ class Gnome(Optimizer):
             .clamp(min=trust_radius, max=1.0)
         )
         update_rot = torch.sign(grad_hat) * damping
-        update_rot *= math.sqrt(p.numel()) / update_rot.norm()
+        # Zero-initialized projections can block gradients upstream. Keep a
+        # zero update at zero instead of dividing by zero during normalization.
+        update_rot = update_rot / update_rot.norm().clamp_min(torch.finfo(update_rot.dtype).tiny)
+        update_rot *= math.sqrt(p.numel())
         # update_rot = grad_hat / gnd_hat.add(lam)
         if self._diagnostics_due():
             self._emit_diagnostics(
