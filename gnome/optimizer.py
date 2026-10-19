@@ -1103,8 +1103,8 @@ class Gnome(Optimizer):
         the root is unique when ``phi(eps) > T``; otherwise the constraint is
         slack and the bracket floor keeps ``lambda = eps`` (an undamped
         Newton step). Newton is run on Hebden's reciprocal form
-        ``1/T - 1/phi``, which is nearly linear in lambda and converges in
-        2-3 iterations, warm-started from the previous step's lambda inside
+        ``1/T - 1/phi``, which is nearly linear in lambda and often converges
+        in 2-3 iterations, warm-started from the previous step's lambda inside
         an analytic bracket derived from ``min(v)`` and ``max(v)``. All ops
         stay on device -- no ``.item()``, no convergence check, no sync.
 
@@ -1116,15 +1116,13 @@ class Gnome(Optimizer):
         sensitivity; ``l_p`` for large p is the middle ground, and is this
         solver with the exponent changed.)
 
-        **Do not "simplify" the dphi line.** ``.clamp_max`` binds to ``.sum()``
-        before the unary minus, so ``-(q/d).sum().clamp_max(-1e-30)`` clamps a
-        *positive* sum to -1e-30 and negates it to +1e-30 -- wrong sign and
-        wrong magnitude, which makes Newton saturate the bracket instead of
-        solving for the root, silently pinning lambda at the bracket bottom.
-        The parenthesization below is load-bearing.
+        Compute ``slope = -phi'/phi`` from normalized update components.
+        Forming ``sum(m² / (v + lambda)³)`` first can overflow in FP32 for
+        small damping, making the derivative infinite and freezing Newton
+        at the bracket floor. The normalized correction also avoids forming
+        a ``phi²`` numerator.
         """
-        m2 = m * m
-        gn = m2.sum().sqrt()
+        gn = m.norm()
         ratio = gn / T
 
         # Analytic bracket from vmin <= v_i <= vmax.
@@ -1136,10 +1134,10 @@ class Gnome(Optimizer):
 
         for _ in range(iters):
             d = v + lam
-            q = m2 / (d * d)
-            phi = q.sum().sqrt().clamp_min(1e-30)
-            dphi = (-(q / d).sum()).clamp_max(-1e-30) / phi
-            lam = (lam - phi * (phi / T - 1.0) / dphi).clamp(lo, hi)
+            u = m / d
+            phi = u.norm().clamp_min(1e-30)
+            slope = ((u / phi).square() / d).sum().clamp_min(1e-30)
+            lam = (lam + (phi / T - 1.0) / slope).clamp(lo, hi)
 
         return lam
 
@@ -1475,15 +1473,16 @@ class Gnome(Optimizer):
         if trust_radius is None:
             lam = eps
         else:
-            T = trust_radius * math.sqrt(
+            T = math.sqrt(
                 p.numel() # 10 + p.square().sum()
             )
             lam = self._lm_lambda(grad_hat, gnd_hat, T, eps,
                                   lam_prev=state.get("lm_lambda"))
             state["lm_lambda"] = lam
         # Newton step in the rotated basis, damped by lam.
+        update_unorm = grad_hat / gnd_hat.add(lam)
         damping = (
-            (grad_hat / gnd_hat.add(eps))
+            update_unorm
             .abs()
             .clamp(min=trust_radius, max=1.0)
         )
@@ -1491,8 +1490,7 @@ class Gnome(Optimizer):
         # Zero-initialized projections can block gradients upstream. Keep a
         # zero update at zero instead of dividing by zero during normalization.
         update_rot = update_rot / update_rot.norm().clamp_min(torch.finfo(update_rot.dtype).tiny)
-
-        update_rot *= math.sqrt(p.numel())
+        update_rot *= update_unorm.norm()# math.sqrt(p.numel())
         # update_rot = grad_hat / gnd_hat.add(lam)
         if self._diagnostics_due():
             self._emit_diagnostics(

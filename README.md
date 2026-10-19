@@ -424,6 +424,30 @@ the final record also includes total wall time. `--save-checkpoint` saves the
 final model, optimizer state, and configuration alongside the JSONL. The test
 set does not select the saved checkpoint or control early stopping.
 
+**Covertype tabular classification** (no additional dependencies):
+
+```bash
+uv run python -u -m experiments.tabular.covertype --optimizer gnome --save-checkpoint
+```
+
+Choices are `gnome` (Hutchinson), `gnome_hutchinson`, `gnome_fisher`, `adamw`,
+`soap`, and `muon`. A width-256 residual MLP trains with a fixed stratified
+70/15/15 split, training-only feature standardization, and warmup + cosine decay.
+The dataset downloads once and is cached locally. Device selection prefers CUDA,
+then MPS, then CPU. See [docs/covertype.md](docs/covertype.md) for commands,
+optimizer routing, and the split protocol.
+
+**Otto Group product classification** (same tabular model and optimizer choices):
+
+```bash
+uv run python -u -m experiments.tabular.otto --optimizer gnome --save-checkpoint
+```
+
+Automatically downloads the labeled data from OpenML, or accepts Kaggle
+`train.csv` via `--data-file`. The 93 count features receive `log1p` and
+training-only standardization; the nine-class model reports cross-entropy and
+accuracy on a fixed 70/15/15 split. See [docs/otto.md](docs/otto.md).
+
 Pass `--help` to any experiment for the full argument list.
 
 ## Run artifacts
