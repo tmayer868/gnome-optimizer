@@ -78,8 +78,10 @@ def parse_args(argv=None):
     p.add_argument("--scalar-lr", type=float, default=0.015, help="Muon auxiliary AdamW only")
     p.add_argument("--aux-weight-decay", type=float, default=0.001, help="Muon auxiliary AdamW only")
     p.add_argument("--warmup-steps", type=int, default=0)
-    p.add_argument("--lr-schedule", choices=["linear", "cosine"], default="linear",
+    p.add_argument("--lr-schedule", choices=["linear", "cosine", "polynomial"], default="linear",
                    help="Linear warmup, then reference linear cooldown or immediate cosine decay")
+    p.add_argument("--lr-pow", type=float, default=1.20,
+                   help="Power for polynomial decay.")
     p.add_argument("--min-lr-frac", type=float, default=0.1,
                    help="Cosine schedule's final LR as a fraction of each group's initial LR")
     p.add_argument("--cooldown-frac", type=float, default=0.7,
@@ -177,7 +179,7 @@ def synchronize(device):
 
 
 def schedule_multiplier(step, steps, cooldown_frac, warmup_steps=0, *,
-                        lr_schedule="linear", min_lr_frac=0.1):
+                        lr_schedule="linear", min_lr_frac=0.1, power=1.2):
     """Multiplier for a zero-indexed optimizer step.
 
     Warmup reaches 1 on its last update. Cosine then decays over all remaining
@@ -192,6 +194,10 @@ def schedule_multiplier(step, steps, cooldown_frac, warmup_steps=0, *,
         decay_steps = steps - 1 - peak_step
         progress = min(1.0, max(0.0, (step - peak_step) / decay_steps)) if decay_steps > 0 else 1.0
         return min_lr_frac + 0.5 * (1 - min_lr_frac) * (1 + math.cos(math.pi * progress))
+    elif lr_schedule == "polynomial":
+        peak_step = max(warmup_steps - 1, 0)
+        decay_steps = steps - 1 - peak_step
+        return (1.0 - min_lr_frac) * (1 - (step + 1) / decay_steps) ** power + min_lr_frac
     if cooldown_frac == 0:
         return 1.0
     return min(1.0, (1 - step / steps) / cooldown_frac)
@@ -404,6 +410,7 @@ def run(args):
             multiplier = schedule_multiplier(
                 step, args.steps, args.cooldown_frac, args.warmup_steps,
                 lr_schedule=args.lr_schedule, min_lr_frac=args.min_lr_frac,
+                power=args.lr_pow
             )
             for opt in optimizers:
                 for group in opt.param_groups:

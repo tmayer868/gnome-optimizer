@@ -1473,24 +1473,27 @@ class Gnome(Optimizer):
         if trust_radius is None:
             lam = eps
         else:
-            T = math.sqrt(
+            T = trust_radius * math.sqrt(
                 p.numel() # 10 + p.square().sum()
             )
             lam = self._lm_lambda(grad_hat, gnd_hat, T, eps,
                                   lam_prev=state.get("lm_lambda"))
             state["lm_lambda"] = lam
         # Newton step in the rotated basis, damped by lam.
-        update_unorm = grad_hat / gnd_hat.add(lam)
+        if lam > eps:
+            update_unorm = grad_hat / gnd_hat.add(lam).mul(trust_radius)
+        else:
+            update_unorm = grad_hat / gnd_hat.add(lam)
         damping = (
             update_unorm
             .abs()
-            .clamp(min=trust_radius, max=1.0)
+            .clamp(min=0.0, max=1.0)
         )
         update_rot = torch.sign(grad_hat) * damping
         # Zero-initialized projections can block gradients upstream. Keep a
         # zero update at zero instead of dividing by zero during normalization.
         update_rot = update_rot / update_rot.norm().clamp_min(torch.finfo(update_rot.dtype).tiny)
-        update_rot *= update_unorm.norm()# math.sqrt(p.numel())
+        update_rot *= update_unorm.norm() # math.sqrt(p.numel()) update_unorm.norm()
         # update_rot = grad_hat / gnd_hat.add(lam)
         if self._diagnostics_due():
             self._emit_diagnostics(
