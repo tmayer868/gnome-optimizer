@@ -173,6 +173,7 @@ def build_optimizer(
     beta1: float = 0.9, beta2: float = 0.99, eps: float = 1e-6,
     trust_region: float = 1.0, aux_batch_size: int = 32,
     merge_dims: str = "none",
+    use_soap_basis: bool = False,
 ):
     """Return ``(optimizer, config)``.
 
@@ -185,6 +186,7 @@ def build_optimizer(
     gamma/beta tensors carry no cross-coordinate structure worth a factor.
     """
     common_gnome = dict(
+        use_soap_basis=use_soap_basis,
         lr=lr, weight_decay=weight_decay,
         betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
         precondition_frequency=10,
@@ -289,6 +291,7 @@ def main():
         beta1=args.beta1, beta2=args.beta2, eps=args.eps,
         trust_region=args.trust_region, aux_batch_size=args.aux_batch_size,
         merge_dims=args.merge_dims,
+        use_soap_basis=args.use_soap_basis,
     )
     K = opt_cfg.get("aux_batch_size", 0) if is_gnome else 0
 

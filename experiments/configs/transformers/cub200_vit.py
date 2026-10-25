@@ -64,6 +64,7 @@ CONFIG = {
             "correct_bias": True
         },
         "gnome": {
+            "use_soap_basis": True,
             "lr": 7e-4,
             "betas": [0.95, 0.95],
             "eps": 1e-12,

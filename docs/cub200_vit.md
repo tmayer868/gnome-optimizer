@@ -84,6 +84,8 @@ Gnome uses `cce_hutchinson` by default; change `optimizers.gnome.loss` to `cce`
 for Fisher sampling. Its main closure uses the entire training batch and its
 auxiliary closure uses a fresh subset without replacement, capped at the current
 batch size. `aux_batch_size` therefore also works on the final partial batch.
+Set `optimizers.gnome.use_soap_basis` to `True` to build the basis from the
+main gradient while keeping the surrogate curvature estimate; it defaults to `False`.
 Set `trust_radius` to `None` to disable it. The runner uses the current local
 Gnome implementation without modifying it.
 

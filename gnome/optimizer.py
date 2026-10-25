@@ -260,6 +260,12 @@ class Gnome(Optimizer):
             Note it rescales ``v_hat``, so ``lr`` generally needs retuning
             when toggled.
         precondition_frequency: Steps between eigenbasis refreshes.
+        use_soap_basis: If True, initialize and update the Kronecker basis
+            factors from the main loss gradient instead of the surrogate.
+            Uses the accumulated, optionally clipped main gradient. The
+            rotated curvature EMA still uses the surrogate gradient, so this
+            changes only the basis source. Default False; can be overridden
+            per parameter group and is saved in optimizer checkpoints.
         max_precond_dim: Modes larger than this are skipped (no Kronecker
             factor maintained along that dimension).
         trust_radius: l2 trust region on the update in the rotated basis.
@@ -366,6 +372,7 @@ class Gnome(Optimizer):
         diagnostics: Optional[Callable[[dict], None]] = None,
         diagnostics_every: int = 100,
         metrics: Optional[dict] = None,
+        use_soap_basis: bool = False,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -413,6 +420,7 @@ class Gnome(Optimizer):
             merge_dims=merge_dims,
             precondition_1d=precondition_1d,
             trust_radius=trust_radius,
+            use_soap_basis=use_soap_basis,
         )
         super().__init__(params, defaults)
         self._data_format = data_format
@@ -442,6 +450,8 @@ class Gnome(Optimizer):
 
     @staticmethod
     def _validate_update_group(group: dict) -> None:
+        if not isinstance(group["use_soap_basis"], bool):
+            raise ValueError("use_soap_basis must be a bool")
         rule = group["update_rule"]
         if rule not in ("gnome", "adamw"):
             raise ValueError(f"Invalid update_rule: {rule!r}; expected 'gnome' or 'adamw'")
@@ -633,10 +643,13 @@ class Gnome(Optimizer):
         if extra is not None:
             # Hand the base implementation only the keys it knows about.
             state_dict = {k: v for k, v in state_dict.items() if k != "gnome"}
-        # Legacy checkpoints predate update_rule and contain only Gnome groups.
+        # Legacy checkpoints use Gnome groups and a surrogate-derived basis.
         state_dict = dict(state_dict)
         state_dict["param_groups"] = [
-            {"update_rule": "gnome", **group} for group in state_dict["param_groups"]
+            # Accept checkpoints written with the original misspelled option.
+            {"update_rule": "gnome", "use_soap_basis": group.get("use_soap_basi", False),
+             **{key: value for key, value in group.items() if key != "use_soap_basi"}}
+            for group in state_dict["param_groups"]
         ]
         for group in state_dict["param_groups"]:
             self._validate_update_group(group)
@@ -855,8 +868,9 @@ class Gnome(Optimizer):
         merge_dims: MergeDims,
         precondition_1d: bool,
     ) -> None:
-        """Update the Kronecker factors from the surrogate gradient G_s and,
-        on schedule, refresh the eigenbasis Q.
+        """Update the Kronecker factors from the supplied basis gradient and,
+        on schedule, refresh the eigenbasis Q. The input is the surrogate by
+        default, or the main gradient when use_soap_basis is enabled.
 
         ``grad_m`` is a first-moment (vector) quantity so it is translated
         out of the old basis and back into the new basis when Q is
@@ -1371,6 +1385,7 @@ class Gnome(Optimizer):
         idx: int = 0,
     ) -> None:
         state = self.state[p]
+        basis_grad = g if group["use_soap_basis"] else G_s
 
         if "initial_sq_norm" not in state:
             norm_sq = p.detach().square().sum()
@@ -1391,7 +1406,7 @@ class Gnome(Optimizer):
                 else group["betas"][1]
             )
             self._init_preconditioner(
-                G_s, state,
+                basis_grad, state,
                 precondition_frequency=group["precondition_frequency"],
                 shampoo_beta=shampoo_beta,
                 max_precond_dim=group["max_precond_dim"],
@@ -1399,7 +1414,7 @@ class Gnome(Optimizer):
                 merge_dims=group["merge_dims"],
             )
             self._update_preconditioner(
-                G_s, state,
+                basis_grad, state,
                 max_precond_dim=group["max_precond_dim"],
                 merge_dims=group["merge_dims"],
                 precondition_1d=group["precondition_1d"],
@@ -1414,7 +1429,7 @@ class Gnome(Optimizer):
         lr = group["lr"]
         grad_m, gnd_m = state["grad_m"], state["gnd_m"]
 
-        # Project loss gradient and surrogate into the GGN-derived eigenbasis.
+        # Project loss gradient and surrogate into the selected eigenbasis.
         g_rot = self._project(
             g, state,
             merge_dims=group["merge_dims"],
@@ -1485,14 +1500,12 @@ class Gnome(Optimizer):
         damping = (
             update_unorm
             .abs()
-            .clamp(min=0.05, max=1.0)
+            .clamp(min=0.0, max=1.0)
         )
+
         update_rot = torch.sign(grad_hat) * damping
         # Zero-initialized projections can block gradients upstream. Keep a
         # zero update at zero instead of dividing by zero during normalization.
-        # update_rot = update_rot / update_rot.norm().clamp_min(torch.finfo(update_rot.dtype).tiny)
-        # update_rot *= update_unorm.norm() # math.sqrt(p.numel()) update_unorm.norm()
-        # update_rot = grad_hat / gnd_hat.add(lam)
         if self._diagnostics_due():
             self._emit_diagnostics(
                 idx, p, group, grad_hat, gnd_hat, update_rot, lam, lr
@@ -1511,10 +1524,10 @@ class Gnome(Optimizer):
         if group["weight_decay"] > 0.0:
             p.add_(p, alpha=-lr * group["weight_decay"])
 
-        # Refresh Kronecker factors with the new surrogate; eigenbasis is
+        # Refresh Kronecker factors with the selected gradient; eigenbasis is
         # recomputed on schedule.
         self._update_preconditioner(
-            G_s, state,
+            basis_grad, state,
             max_precond_dim=group["max_precond_dim"],
             merge_dims=group["merge_dims"],
             precondition_1d=group["precondition_1d"],

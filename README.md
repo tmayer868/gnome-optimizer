@@ -92,6 +92,9 @@ Key arguments:
   `aux_closure` (10 in the example above). Controls the curvature estimate's variance, not
   bias. It is *not* a constructor argument — Gnome reads K from the aux batch you provide.
 - `eps` — curvature damping (larger → closer to gradient descent).
+- `use_soap_basis` — defaults to `False`. Set `True` to build and refresh the
+  Kronecker basis from the main loss gradient, as in SOAP. The curvature EMA
+  still uses the auxiliary surrogate, retaining Gnome's update rule.
 - `trust_radius` — relative L2 update budget:
   `trust_radius * sqrt(p.square().sum() + initial_sq_norm)`, before multiplying
   by the learning rate. The squared initialization norm is captured when the

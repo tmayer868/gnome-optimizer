@@ -77,6 +77,7 @@ def build_optimizers(model, args):
                   betas=(args.beta1, args.beta2), eps=args.eps)
     if args.optimizer.startswith("gnome"):
         return [Gnome(model.parameters(), **common,
+                      use_soap_basis=args.use_soap_basis,
                       loss="cce" if args.optimizer == "gnome_fisher" else "cce_hutchinson",
                       trust_radius=args.trust_region or None, norm_free=args.norm_free,
                       max_grad_norm=args.max_grad_norm or None,

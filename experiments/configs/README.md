@@ -40,6 +40,12 @@ CONFIG = {
 }
 ```
 
+Categorical cross-entropy experiments expose `use_soap_basis=False` for Gnome.
+Set it to `True` to build the basis from the main loss gradient while retaining
+the surrogate-based curvature estimate. For the ViT, this setting is nested at
+`CONFIG["optimizers"]["gnome"]["use_soap_basis"]`; other CCE runners use a
+top-level key. The NanoGPT Kaggle config inherits it from the base config.
+
 Keep the full dictionary when copying a config; the abbreviated example above
 shows syntax only. `None` retains automatic selection where the old runner
 supported it, such as optimizer-dependent defaults in NanoGPT and tabular

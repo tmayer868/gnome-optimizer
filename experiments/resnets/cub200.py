@@ -203,6 +203,7 @@ def build_optimizer(
     beta1: float = 0.9, beta2: float = 0.99, eps: float = 1e-6,
     trust_region: float = 1.0, aux_batch_size: int = 10,
     merge_dims: str = "none",
+    use_soap_basis: bool = False,
 ):
     """CUB optimizer settings, independent of other benchmark modules.
 
@@ -226,6 +227,7 @@ def build_optimizer(
         opt = SOAP(params, **cfg)
     else:
         cfg.update(
+            use_soap_basis=use_soap_basis,
             eps=eps, trust_radius=trust_region if trust_region > 0 else None,
             norm_free=False,
             loss="cce" if name == "gnome_fisher" else "cce_hutchinson",
@@ -311,6 +313,7 @@ def train(args) -> str:
         beta1=args.beta1, beta2=args.beta2, eps=args.eps,
         trust_region=args.trust_region, aux_batch_size=args.aux_batch_size,
         merge_dims=args.merge_dims,
+        use_soap_basis=args.use_soap_basis,
     )
     total_steps = args.epochs * len(loader)
     if args.max_steps is not None:

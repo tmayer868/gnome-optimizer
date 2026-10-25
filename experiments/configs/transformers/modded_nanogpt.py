@@ -4,6 +4,8 @@ None keeps an existing automatic/default-dependent setting where supported.
 """
 
 CONFIG = {
+    # Gnome only: build the basis from the main gradient; keep surrogate curvature.
+    'use_soap_basis': True,
     # Choices: 'benchmark', 'dev'.
     'preset': 'benchmark',
     # Choices: 'muon', 'gnome_hutchinson', 'gnome_fisher', 'soap', 'adamw'.
@@ -18,28 +20,28 @@ CONFIG = {
     # head
     'head_init_std': 0.0,
     # Keep embedding weights/optimizer state in FP32 while retaining the chosen compute dtype
-    'fp32_embedding': False,
+    'fp32_embedding': True,
     'seed': 0,
-    'steps': None,
+    'steps': 6_000,
     'vocab_size': None,
-    'n_layer': None,
-    'n_embd': None,
-    'head_dim': None,
-    'seq_len': None,
-    'batch_tokens': None,
+    'n_layer': 6,
+    'n_embd': 384,
+    'head_dim': 64,
+    'seq_len': 256,
+    'batch_tokens': 32_000,
     'val_tokens': None,
     # Sequences per forward; global batch is unchanged
-    'microbatch_size': 4,
+    'microbatch_size': 16,
     # Gnome curvature sequences sampled from the main batch
-    'aux_batch_size': 1,
+    'aux_batch_size': 5,
     # Gnome/SOAP/AdamW LR, or Muon hidden-matrix LR
-    'lr': None,
+    'lr': 2e-3,
     'weight_decay': None,
-    'beta1': None,
-    'beta2': None,
-    'eps': None,
+    'beta1': .90,
+    'beta2': .99,
+    'eps': 1e-12,
     'shampoo_beta': 0.99,
-    'precondition_frequency': 10,
+    'precondition_frequency': 1,
     'max_precond_dim': 4096,
     # Gnome relative L2 trust radius; 0 disables
     'trust_region': 1.0,
@@ -68,7 +70,7 @@ CONFIG = {
     'warmup_steps': 0,
     # Linear warmup, then reference linear cooldown or immediate cosine decay Choices: 'linear',
     # 'cosine', 'polynomial'.
-    'lr_schedule': 'linear',
+    'lr_schedule': 'polynomial',
     # Power for polynomial decay.
     'lr_pow': 1.2,
     # Cosine schedule's final LR as a fraction of each group's initial LR
@@ -76,7 +78,7 @@ CONFIG = {
     # Final fraction with linear LR decay; ignored for lr_schedule cosine
     'cooldown_frac': 0.7,
     # Default: 125, then 25 during the final 10%
-    'val_every': None,
+    'val_every': 6_000,
     'log_every': 10,
     'data_dir': 'experiments/data/fineweb10B',
     # Opt-in download: N training shards, about 200 MB each

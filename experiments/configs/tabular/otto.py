@@ -4,6 +4,8 @@ None keeps an existing automatic/default-dependent setting where supported.
 """
 
 CONFIG = {
+    # Gnome only: build the basis from the main gradient; keep surrogate curvature.
+    'use_soap_basis': False,
     # Choices: 'gnome', 'gnome_hutchinson', 'gnome_fisher', 'adamw', 'soap', 'muon'.
     'optimizer': 'gnome',
     # Choices: 'auto', 'cpu', 'mps', 'cuda'.

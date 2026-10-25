@@ -214,7 +214,8 @@ def load_wikitext103(seq_len: int, batch_size: int, seed: int):
 
 def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float,
                                trust_region: float = 1.0,
-                               max_grad_norm: float | None = None):
+                               max_grad_norm: float | None = None,
+                               use_soap_basis: bool = False):
     """Construct one of the four supported optimizers.
 
     Both Gnome variants share every hyperparameter except ``loss=`` so the
@@ -230,6 +231,7 @@ def build_optimizer_and_config(name: str, params, lr: float, weight_decay: float
     seq_len × vocab worth of Rademacher coverage so small aux is fine here.
     """
     common_gnome = dict(
+        use_soap_basis=use_soap_basis,
         lr=lr, weight_decay=weight_decay,
         betas=(0.9, 0.99), shampoo_beta=0.99, eps=1e-12,
         precondition_frequency=20,
@@ -338,6 +340,7 @@ def main():
     opt, opt_cfg = build_optimizer_and_config(
         args.optimizer, model.parameters(), args.lr, args.weight_decay,
         trust_region=args.trust_region, max_grad_norm=args.max_grad_norm,
+        use_soap_basis=args.use_soap_basis,
     )
     K = opt_cfg.get("aux_batch_size", 4) if args.optimizer.startswith("gnome") else 0
 

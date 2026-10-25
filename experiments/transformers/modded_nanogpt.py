@@ -164,6 +164,7 @@ def build_optimizers(model, args, device):
             ]
         optimizers = [Gnome(
             parameters, **common,
+            use_soap_basis=args.use_soap_basis,
             loss="cce_hutchinson" if args.optimizer == "gnome_hutchinson" else "cce",
             shampoo_beta=args.shampoo_beta, precondition_frequency=args.precondition_frequency,
             max_precond_dim=args.max_precond_dim,
