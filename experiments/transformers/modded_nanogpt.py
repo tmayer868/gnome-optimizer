@@ -1,7 +1,9 @@
 """Modded-NanoGPT optimization Track 3, with portable MPS/CUDA execution.
 
-    uv run -m experiments.transformers.modded_nanogpt --preset dev --synthetic
-    uv run -m experiments.transformers.modded_nanogpt --optimizer muon --download-shards 20
+    # Edit experiments/configs/transformers/modded_nanogpt.py: preset='dev', synthetic=True
+    uv run -m experiments.transformers.modded_nanogpt
+    # Edit experiments/configs/transformers/modded_nanogpt.py: optimizer='muon', download_shards=20
+    uv run -m experiments.transformers.modded_nanogpt
 
 See docs/modded_nanogpt.md for the reference protocol and Gnome's extra-pass
 qualification. This runner uses one device, preserving global batch size by
@@ -37,64 +39,8 @@ DEV = dict(vocab_size=50304, n_layer=2, n_embd=128, head_dim=64,
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--preset", choices=["benchmark", "dev"], default="benchmark")
-    p.add_argument("--optimizer", choices=["muon", "gnome_hutchinson", "gnome_fisher", "soap", "adamw"],
-                   default="gnome_hutchinson")
-    p.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
-    p.add_argument("--dtype", choices=["auto", "float32", "bfloat16"], default="auto")
-    p.add_argument("--compile", action="store_true", help="Opt-in CUDA model compilation")
-    p.add_argument("--head-init-std", type=float, default=0.0,
-                   help="Output weight initialization std (default: reference zero init); overrides only the output head")
-    p.add_argument("--fp32-embedding", action="store_true",
-                   help="Keep embedding weights/optimizer state in FP32 while retaining the chosen compute dtype")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--steps", type=int)
-    for name in REFERENCE:
-        p.add_argument("--" + name.replace("_", "-"), type=int)
-    p.add_argument("--microbatch-size", type=int, default=4, help="Sequences per forward; global batch is unchanged")
-    p.add_argument("--aux-batch-size", type=int, default=1, help="Gnome curvature sequences sampled from the main batch")
-    p.add_argument("--lr", type=float, help="Gnome/SOAP/AdamW LR, or Muon hidden-matrix LR")
-    p.add_argument("--weight-decay", type=float)
-    p.add_argument("--beta1", type=float)
-    p.add_argument("--beta2", type=float)
-    p.add_argument("--eps", type=float)
-    p.add_argument("--shampoo-beta", type=float, default=0.99)
-    p.add_argument("--precondition-frequency", type=int, default=10)
-    p.add_argument("--max-precond-dim", type=int, default=4096)
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome relative L2 trust radius; 0 disables")
-    p.add_argument("--max-grad-norm", type=float, default=0, help="0 disables clipping (reference default)")
-    p.add_argument("--muon-momentum", type=float, default=0.95)
-    p.add_argument("--embedding-optimizer", choices=["same", "adamw"], default="same",
-                   help="For Gnome runs, optionally update input embeddings with AdamW inside Gnome")
-    p.add_argument("--embed-lr", type=float,
-                   help="Embedding AdamW LR (default: 0.7 for Muon, 0.001 for Gnome)")
-    p.add_argument("--embed-beta1", type=float, default=0.9, help="Gnome embedding AdamW only")
-    p.add_argument("--embed-beta2", type=float, default=0.999, help="Gnome embedding AdamW only")
-    p.add_argument("--embed-eps", type=float, default=1e-8, help="Gnome embedding AdamW only")
-    p.add_argument("--embed-weight-decay", type=float, default=0.0, help="Gnome embedding AdamW only")
-    p.add_argument("--head-lr", type=float, default=0.004, help="Muon auxiliary AdamW only")
-    p.add_argument("--scalar-lr", type=float, default=0.015, help="Muon auxiliary AdamW only")
-    p.add_argument("--aux-weight-decay", type=float, default=0.001, help="Muon auxiliary AdamW only")
-    p.add_argument("--warmup-steps", type=int, default=0)
-    p.add_argument("--lr-schedule", choices=["linear", "cosine", "polynomial"], default="linear",
-                   help="Linear warmup, then reference linear cooldown or immediate cosine decay")
-    p.add_argument("--lr-pow", type=float, default=1.20,
-                   help="Power for polynomial decay.")
-    p.add_argument("--min-lr-frac", type=float, default=0.1,
-                   help="Cosine schedule's final LR as a fraction of each group's initial LR")
-    p.add_argument("--cooldown-frac", type=float, default=0.7,
-                   help="Final fraction with linear LR decay; ignored for --lr-schedule cosine")
-    p.add_argument("--val-every", type=int, help="Default: 125, then 25 during the final 10%%")
-    p.add_argument("--log-every", type=int, default=10)
-    p.add_argument("--data-dir", type=Path, default=Path("experiments/data/fineweb10B"))
-    p.add_argument("--download-shards", type=int, default=0, help="Opt-in download: N training shards, about 200 MB each")
-    p.add_argument("--download-only", action="store_true")
-    p.add_argument("--synthetic", action="store_true", help="Offline development check, requires --preset dev")
-    p.add_argument("--runs-dir", type=Path, default=Path("runs"))
-    p.add_argument("--save-checkpoint", action="store_true")
-    p.add_argument("--quiet", action="store_true")
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
     args = p.parse_args(argv)
     defaults = REFERENCE if args.preset == "benchmark" else DEV
     for key, value in defaults.items():
@@ -307,7 +253,8 @@ def source_bundle(path):
     """Capture dirty/local sources too; a git SHA alone cannot reproduce them."""
     root = Path(__file__).resolve().parents[2]
     sources = [Path(__file__), Path(__file__).with_name("modded_nanogpt_model.py"),
-               Path(__file__).with_name("fineweb_data.py"), root / "pyproject.toml"]
+               Path(__file__).with_name("fineweb_data.py"), root / "pyproject.toml",
+               root / "experiments/configs/transformers/modded_nanogpt.py"]
     for folder in ("gnome", "experiments/baselines", "experiments/common",
                    "experiments/transformers/modded_nanogpt_reference"):
         sources += [p for p in (root / folder).rglob("*") if p.suffix == ".py" or p.name == "LICENSE"]

@@ -32,9 +32,12 @@ Three things are randomized per sample, each closing a specific shortcut:
                the product and brings that to ~0.15, so most of the task now
                requires estimating *where* the energy sits, not how much.
 
-    uv run python -m experiments.resnets.grating_freq --optimizer gnome --seed 0
-    uv run python -m experiments.resnets.grating_freq --optimizer soap  --seed 0 --cosine-decay 0
-    uv run python -m experiments.resnets.grating_freq --optimizer adamw --seed 0 --cosine-decay 0
+    # Edit experiments/configs/resnets/grating_freq.py: optimizer='gnome', seed=0
+    uv run python -m experiments.resnets.grating_freq
+    # Edit experiments/configs/resnets/grating_freq.py: optimizer='soap', seed=0, cosine_decay=0.0
+    uv run python -m experiments.resnets.grating_freq
+    # Edit experiments/configs/resnets/grating_freq.py: optimizer='adamw', seed=0, cosine_decay=0.0
+    uv run python -m experiments.resnets.grating_freq
 """
 
 from __future__ import annotations
@@ -365,55 +368,10 @@ def main():
           f"best_mae_cycles={best_mae_cycles:.3f}", flush=True)
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--optimizer", required=True, choices=["gnome", "soap", "adamw"])
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--amp-min", type=float, default=AMP_MIN,
-                   help="Lower end of the per-sample grating amplitude (drawn "
-                        "log-uniformly), on the same [-1,1] scale as the image. "
-                        "The amplitude range is the difficulty knob: widening it "
-                        "confounds the energy-magnitude shortcut but lowers SNR "
-                        "against image clutter. amp_min == amp_max makes the "
-                        "task ~94%% solvable by total variation alone.")
-    p.add_argument("--amp-max", type=float, default=AMP_MAX,
-                   help="Upper end of the per-sample grating amplitude.")
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
-                        "damping.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
-                        "-> more gradient-descent-like, smaller -> fuller Newton "
-                        "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.9,
-                   help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.99,
-                   help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
-    p.add_argument("--weight-decay", type=float, default=0.01)
-    p.add_argument("--model", choices=MODEL_NAMES, default="resnet12",
-                   help="Architecture (default resnet12).")
-    p.add_argument("--norm", choices=["gn", "bn"], default="gn",
-                   help="Normalization: GroupNorm (default) or BatchNorm.")
-    p.add_argument("--warmup-steps", type=int, default=100,
-                   help="LR warmup steps, applied to every optimizer.")
-    p.add_argument("--cosine-decay", type=float, default=1.0,
-                   help="Final-LR fraction for the SOAP/AdamW cosine decay: "
-                        "0.0 decays to zero (default), 1.0 disables decay. "
-                        "Gnome (MSE) never decays regardless.")
-    p.add_argument("--log-every", type=int, default=50,
-                   help="Print a running-mean train loss every N steps within "
-                        "an epoch (0 disables). Per-step train loss is logged "
-                        "to the artifact regardless.")
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
 
 
 if __name__ == "__main__":

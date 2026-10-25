@@ -54,14 +54,16 @@ Jacobian differentiation workspace, not the full Jacobian or Gram storage.
 
 Usage:
 
-    uv run -m experiments.pinns.convection_pinn --optimizer gnome --beta 40
-    uv run -m experiments.pinns.convection_pinn --optimizer adamw --beta 40
-    uv run -m experiments.pinns.convection_pinn --optimizer engdw --beta 40 \\
-        --n-pde 128 --n-ic 32 --n-bc 32 --engdw-line-search --steps 1000
-    uv run -m experiments.pinns.convection_pinn --optimizer gnome --beta 40 \\
-        --embed periodic --arch modified
-    uv run -m experiments.pinns.convection_pinn --optimizer gnome \\
-        --arch fused-modified --fuse-every 2 --depth 6
+    # Edit experiments/configs/pinns/convection_pinn.py: optimizer='gnome', beta=40.0
+    uv run -m experiments.pinns.convection_pinn
+    # Edit experiments/configs/pinns/convection_pinn.py: optimizer='adamw', beta=40.0
+    uv run -m experiments.pinns.convection_pinn
+    # Edit experiments/configs/pinns/convection_pinn.py: optimizer='engdw', beta=40.0, n_pde=128, n_ic=32, n_bc=32, engdw_line_search=True, steps=1000
+    uv run -m experiments.pinns.convection_pinn
+    # Edit experiments/configs/pinns/convection_pinn.py: optimizer='gnome', beta=40.0, embed='periodic', arch='modified'
+    uv run -m experiments.pinns.convection_pinn
+    # Edit experiments/configs/pinns/convection_pinn.py: optimizer='gnome', arch='fused-modified', fuse_every=2, depth=6
+    uv run -m experiments.pinns.convection_pinn
 """
 
 from __future__ import annotations
@@ -373,110 +375,8 @@ def build_optimizer(
 # ========================= CLI / training =========================
 
 def parse_args(argv=None) -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--optimizer", required=True,
-                   choices=["gnome", "soap", "adamw", "engdw"])
-    p.add_argument("--beta", type=float, default=40.0,
-                   help="Convection speed. THE knob for this benchmark: the "
-                        "PDE is trivial at every value, but first-order "
-                        "optimizers start failing around 20 and are "
-                        "comprehensively broken by 30-40. The published "
-                        "comparison numbers in the module docstring are for "
-                        "30-40. Sweep it to draw the failure curve — that "
-                        "curve is the result, more than any single number.")
-    p.add_argument("--arch",
-                   choices=["mlp", "modified", "fused", "fused-modified"],
-                   default="mlp",
-                   help="Network. Defaults to the plain MLP, which is what "
-                        "the published failure results use — switching to "
-                        "'modified' changes the architecture as well as the "
-                        "optimizer and muddies the comparison.")
-    p.add_argument("--fuse-every", type=int, default=0,
-                   help="--arch fused / fused-modified only: consecutive "
-                        "hidden layers per parameter tensor. 1 = one tensor "
-                        "per layer, the control every larger value is "
-                        "compared against. 0 (default) fuses the whole stack.")
-    p.add_argument("--embed", choices=["none", "periodic"], default="none",
-                   help="Input embedding. 'none' (default) feeds raw [t, x] "
-                        "and imposes periodicity softly, as a third residual "
-                        "block — this is the published setup. 'periodic' "
-                        "feeds [t, cos x, sin x], making periodicity exact "
-                        "and DROPPING the BC block; note this also hands the "
-                        "network a basis in which sin(x - beta t) is linear, "
-                        "so it is not a like-for-like comparison.")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--steps", type=int, default=50_000)
-    p.add_argument("--n-pde", type=int, default=4000)
-    p.add_argument("--n-ic", type=int, default=256)
-    p.add_argument("--n-bc", type=int, default=256)
-    p.add_argument("--aux-frac", type=float, default=0.05,
-                   help="Aux batch fraction for Gnome's curvature surrogate.")
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome trust region: lambda is set to the smallest "
-                        "value with ||m/(v+lambda)||_2 <= this * sqrt(P). "
-                        "0 disables the solve.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature damping in m/(v+eps). Gnome only.")
-    p.add_argument("--beta1", type=float, default=0.9,
-                   help="First-moment EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.99,
-                   help="Second-moment / preconditioner EMA for Gnome, SOAP.")
-    p.add_argument("--weight-decay", type=float, default=1e-8)
-    p.add_argument(
-        "--engdw-damping", type=float, default=1e-6,
-        help="ENGD-W fixed damping in JJ^T + lambda I; convection starting "
-             "value, not a tuned result. No weight decay or LR schedule is used.",
-    )
-    p.add_argument(
-        "--engdw-momentum", type=float, default=0.0,
-        help="ENGD-W SPRING-style regularization-center momentum in [0, 1). "
-             "Zero preserves the original solver; try 0.9, 0.95, or 0.99.",
-    )
-    p.add_argument(
-        "--engdw-line-search", action="store_true",
-        help="Choose the lowest same-batch loss on 13 log-spaced step sizes "
-             "from 1e-3 to 1, overriding --lr (same grid as Poisson-5D).",
-    )
-    p.add_argument(
-        "--engdw-fixed", action="store_true",
-        help="ENGD-W only: sample PDE/IC/BC training points once and reuse "
-             "them every step. Validation points remain independently sampled.",
-    )
-    p.add_argument(
-        "--engdw-chunk", type=int, default=32,
-        help="Samples per vectorized Jacobian chunk for ENGD-W; limits differentiation "
-             "workspace, while the full Jacobian and sample Gram remain dense.",
-    )
-    p.add_argument("--hidden", type=int, default=50,
-                   help="Network width. Default 50 follows Krishnapriyan.")
-    p.add_argument("--depth", type=int, default=5,
-                   help="Linear-layer count for --arch mlp/fused (4 hidden "
-                        "layers of width 50 is the published net); gated "
-                        "hidden-layer count for --arch modified.")
-    p.add_argument("--warmup-steps", type=int, default=200)
-    p.add_argument("--cosine-decay", type=float, default=0.0,
-                   help="Final-LR fraction for the cosine decay: 0.0 decays "
-                        "to zero, 1.0 disables decay.")
-    p.add_argument("--float64", action="store_true",
-                   help="Run in double precision on CPU. ENGD-W automatically uses "
-                        "float64 on CPU/CUDA without this flag. Forces device=cpu "
-                        "(MPS has no float64) and sets the global default "
-                        "dtype, so params, collocation samples and the "
-                        "analytic reference are all double. Worth having "
-                        "here because the PDE residual carries a factor of "
-                        "beta: at beta=40 any error in u_x is amplified 40x "
-                        "before it reaches the loss, so the residual hits "
-                        "the float32 floor while u itself still looks clean. "
-                        "Costs roughly an order of magnitude in wall time.")
-    p.add_argument("--diagnostics-every", type=int, default=0,
-                   help="Log Gnome's internal state every N steps to a "
-                        "sibling {run_id}.diag.jsonl. 0 disables. Gnome only.")
-    p.add_argument("--diagnostics-params", type=str, default=None,
-                   help="Comma-separated parameter indices to log.")
-    p.add_argument("--log-every", type=int, default=200)
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
     return p.parse_args(argv)
 
 

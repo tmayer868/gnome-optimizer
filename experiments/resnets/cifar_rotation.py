@@ -23,9 +23,12 @@ labels are discarded: only the pixels matter, since the target is the rotation
 angle. (This used to pull CIFAR-10; same images at heart, and CIFAR-100 shares
 the cache with ``experiments/resnets/cifar100.py``.)
 
-    uv run python -m experiments.resnets.cifar_rotation --optimizer gnome --seed 0
-    uv run python -m experiments.resnets.cifar_rotation --optimizer soap  --seed 0 --cosine-decay 0
-    uv run python -m experiments.resnets.cifar_rotation --optimizer adamw --seed 0 --cosine-decay 0
+    # Edit experiments/configs/resnets/cifar_rotation.py: optimizer='gnome', seed=0
+    uv run python -m experiments.resnets.cifar_rotation
+    # Edit experiments/configs/resnets/cifar_rotation.py: optimizer='soap', seed=0, cosine_decay=0.0
+    uv run python -m experiments.resnets.cifar_rotation
+    # Edit experiments/configs/resnets/cifar_rotation.py: optimizer='adamw', seed=0, cosine_decay=0.0
+    uv run python -m experiments.resnets.cifar_rotation
 
 Gnome and SOAP convolution-factor partitions use the same modes as CIFAR-100:
 
@@ -356,54 +359,10 @@ def main():
           f"best_mae_deg={best_mae_deg:.2f}", flush=True)
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--optimizer", required=True, choices=["gnome", "soap", "adamw"])
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
-                        "damping.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
-                        "-> more gradient-descent-like, smaller -> fuller Newton "
-                        "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.9,
-                   help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.99,
-                   help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
-    p.add_argument("--weight-decay", type=float, default=0.00)
-    p.add_argument(
-        "--merge-dims",
-        choices=tuple(MERGE_DIMS_MODES),
-        default="none",
-        help="Gnome/SOAP convolution-factor grouping: 'none'=[O][I][H][W], "
-             "'greedy'=size-bounded greedy merging, 'spatial'=[O][I][HW], "
-             "or 'patch'=[O][IHW]. Ignored by AdamW.",
-    )
-    p.add_argument("--model", choices=MODEL_NAMES, default="resnet12",
-                   help="Architecture (default resnet12).")
-    p.add_argument("--norm", choices=["gn", "bn"], default="gn",
-                   help="Normalization: GroupNorm (default) or BatchNorm.")
-    p.add_argument("--warmup-steps", type=int, default=100,
-                   help="LR warmup steps, applied to every optimizer.")
-    p.add_argument("--cosine-decay", type=float, default=1.0,
-                   help="Final-LR fraction for the SOAP/AdamW cosine decay: "
-                        "0.0 decays to zero (default), 1.0 disables decay. "
-                        "Gnome (MSE) never decays regardless.")
-    p.add_argument("--log-every", type=int, default=50,
-                   help="Print a running-mean train loss every N steps within "
-                        "an epoch (0 disables). Per-step train loss is logged "
-                        "to the artifact regardless.")
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
 
 
 if __name__ == "__main__":

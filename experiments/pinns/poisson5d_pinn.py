@@ -55,11 +55,15 @@ memory), so at the paper's N=3500 it is a Thunder/CUDA job, not a laptop one.
 
 Usage::
 
-    uv run -m experiments.pinns.poisson5d_pinn --optimizer gnome --seed 0 --lr 1e-2
-    uv run -m experiments.pinns.poisson5d_pinn --optimizer soap  --seed 0
-    uv run -m experiments.pinns.poisson5d_pinn --optimizer adamw --seed 0
+    # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='gnome', seed=0, lr=0.01
+    uv run -m experiments.pinns.poisson5d_pinn
+    # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='soap', seed=0
+    uv run -m experiments.pinns.poisson5d_pinn
+    # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='adamw', seed=0
+    uv run -m experiments.pinns.poisson5d_pinn
     # reference natural-gradient line (GPU/float64):
-    uv run -m experiments.pinns.poisson5d_pinn --optimizer engdw --lr 5.2289e-2
+    # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='engdw', lr=0.052289
+    uv run -m experiments.pinns.poisson5d_pinn
 """
 
 from __future__ import annotations
@@ -322,92 +326,10 @@ def build_optimizer(
 
 # ========================= CLI / training =========================
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--optimizer", required=True,
-                   choices=["gnome", "soap", "adamw", "engdw"])
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--dtype", choices=["float32", "float64"], default="float32",
-                   help="Compute precision. float64 pushes below the ~1e-5 "
-                        "single-precision floor of second-order PDE autodiff, "
-                        "but MPS has no float64 so it falls back to CPU (slow) "
-                        "— use CUDA for real float64 runs. Note: Gnome computes "
-                        "its preconditioner eigenbasis internally in float32 "
-                        "regardless; only the Laplacian/gradient/param path is "
-                        "true float64.")
-    p.add_argument("--steps", type=int, default=20000)
-    p.add_argument("--d", type=int, default=5, help="Problem dimension.")
-    p.add_argument("--hidden", type=int, default=64, help="MLP width.")
-    p.add_argument("--depth", type=int, default=5,
-                   help="Total number of linear layers (input + hidden + output).")
-    p.add_argument("--n-int", type=int, default=3000,
-                   help="Interior collocation points per step (paper: 3000).")
-    p.add_argument("--n-bc", type=int, default=500,
-                   help="Boundary collocation points per step (paper: 500).")
-    p.add_argument("--aux-n-int", type=int, default=180,
-                   help="Interior points for Gnome's GGN aux batch (disjoint, "
-                        "small). Gnome only.")
-    p.add_argument("--aux-n-bc", type=int, default=30,
-                   help="Boundary points for Gnome's GGN aux batch. Gnome only.")
-    p.add_argument("--lr", type=float, default=1e-3,
-                   help="Base learning rate. Gnome typically wants a larger lr "
-                        "here (e.g. 1e-2) than the SOAP/AdamW baselines.")
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
-                        "damping.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
-                        "-> more gradient-descent-like, smaller -> fuller Newton "
-                        "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.9,
-                   help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.99,
-                   help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
-    p.add_argument("--weight-decay", type=float, default=1e-8)
-    p.add_argument("--warmup-steps", type=int, default=200,
-                   help="Linear LR warmup steps, applied to every optimizer.")
-    p.add_argument("--cosine-decay", type=float, default=0.0,
-                   help="Final-LR fraction for the baseline cosine decay: 0.0 "
-                        "decays to zero (standard treatment), 1.0 disables "
-                        "decay. Gnome (MSE) never decays regardless.")
-    p.add_argument("--bc-volume-weight", action="store_true",
-                   help="Use |∂Ω|=2d weighting on the BC block (paper's "
-                        "Background loss) instead of equal block weights "
-                        "(paper's Methods residual). See header note.")
-    p.add_argument("--engdw-damping", type=float, default=6.804474e-8,
-                   help="ENGD-W Tikhonov damping λ in (JJᵀ+λI). Default is the "
-                        "paper's Fig 8 fixed-lr 5D value; pair with --lr "
-                        "5.2289e-2. engdw only.")
-    p.add_argument("--engdw-line-search", action="store_true",
-                   help="ENGD-W: use the paper's inherited line search instead "
-                        "of a fixed --lr (then pair with damping 3.173212e-12, "
-                        "the Fig 7 value). engdw only.")
-    p.add_argument("--engdw-chunk", type=int, default=None,
-                   help="jacrev chunk_size for the ENGD-W Jacobian (memory vs "
-                        "speed; lower = less memory). None = no chunking. engdw only.")
-    p.add_argument("--n-eval", type=int, default=30000,
-                   help="Size of the fixed held-out set for rel_l2 (paper: 30k).")
-    p.add_argument("--eval-seed", type=int, default=1234,
-                   help="Seed for the fixed held-out eval set.")
-    p.add_argument("--diagnostics-every", type=int, default=0,
-                   help="Log Gnome's internal state — curvature spectrum, LM "
-                        "damping, trust-region usage — every N steps to a "
-                        "sibling runs/.../{run_id}.diag.jsonl. 0 (default) "
-                        "disables it entirely. Gnome only: SOAP and AdamW "
-                        "expose no such hook.")
-    p.add_argument("--diagnostics-params", type=str, default=None,
-                   help="Comma-separated parameter indices to log, e.g. "
-                        "'0,4'. Default logs every parameter, which is one "
-                        "record per tensor per logged step — narrow it to "
-                        "keep the file readable.")
-    p.add_argument("--log-every", type=int, default=200)
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
 
 
 def train(args: argparse.Namespace) -> str:

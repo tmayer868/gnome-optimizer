@@ -28,10 +28,14 @@ Requires ``datasets`` + ``transformers`` (the ``llm`` extra):
 
 Usage:
 
-    uv run -m experiments.transformers.wikitext_gpt --optimizer gnome_hutchinson --seed 0
-    uv run -m experiments.transformers.wikitext_gpt --optimizer gnome_fisher     --seed 0
-    uv run -m experiments.transformers.wikitext_gpt --optimizer soap             --seed 0
-    uv run -m experiments.transformers.wikitext_gpt --optimizer adamw            --seed 0
+    # Edit experiments/configs/transformers/wikitext_gpt.py: optimizer='gnome_hutchinson', seed=0
+    uv run -m experiments.transformers.wikitext_gpt
+    # Edit experiments/configs/transformers/wikitext_gpt.py: optimizer='gnome_fisher', seed=0
+    uv run -m experiments.transformers.wikitext_gpt
+    # Edit experiments/configs/transformers/wikitext_gpt.py: optimizer='soap', seed=0
+    uv run -m experiments.transformers.wikitext_gpt
+    # Edit experiments/configs/transformers/wikitext_gpt.py: optimizer='adamw', seed=0
+    uv run -m experiments.transformers.wikitext_gpt
 
 The first run downloads ~500MB of WikiText-103 and tokenizes it (~5
 minutes); HuggingFace caches the tokenized result so re-runs skip both.
@@ -290,48 +294,10 @@ def evaluate(model: nn.Module, dataloader, device: torch.device):
 
 # ========================= Training =========================
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument(
-        "--optimizer", required=True,
-        choices=["gnome_fisher", "gnome_hutchinson", "soap", "adamw"],
-    )
-    p.add_argument("--seed", type=int, default=0)
-    # The transformer needs more steps than the CNN experiments; we cap by
-    # total optimizer steps rather than epochs so the budget is comparable
-    # across batch sizes.
-    p.add_argument("--max-steps", type=int, default=5000,
-                   help="Total optimizer steps to run.")
-    p.add_argument("--batch-size", type=int, default=48,
-                   help="Batch size per optimizer step. Raise this to scale "
-                        "the effective batch (single-batch steps here).")
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
-                        "damping.")
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--lr-min-frac", type=float, default=0.1,
-                   help="Cosine schedule floor as a fraction of lr (final lr).")
-    p.add_argument("--warmup-steps", type=int, default=100)
-    p.add_argument("--weight-decay", type=float, default=1e-5)
-    p.add_argument("--max-grad-norm", type=float, default=1.0,
-                   help="Global-norm gradient clipping. Gnome applies it "
-                        "internally to the main gradient; other optimizers "
-                        "use torch.nn.utils.clip_grad_norm_.")
-    p.add_argument("--seq-len", type=int, default=128)
-    p.add_argument("--n-layer", type=int, default=10)
-    p.add_argument("--n-head", type=int, default=8)
-    p.add_argument("--n-embd", type=int, default=352)
-    p.add_argument("--val-every", type=int, default=500,
-                   help="Run validation every N optimizer steps.")
-    p.add_argument("--log-every", type=int, default=50,
-                   help="Print a running-mean train loss every N steps.")
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
 
 
 def cosine_with_warmup(step: int, warmup: int, total: int, min_frac: float) -> float:

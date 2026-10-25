@@ -57,7 +57,7 @@ has about `4.0053e-5` relative L2 error against Cole–Hopf on its own grid.
 New Burgers runs use the float64 Cole–Hopf reference for `rel_l2`, perform error
 arithmetic in float64 on CPU, and log `reference_method`, `reference_dtype`,
 quadrature order, and grid size. Model inference retains the training dtype:
-pass `--float64` for double-precision training and inference. The optional
+pass `float64` for double-precision training and inference. The optional
 `rel_l2_jaxpi` still measures against the original JAXPI dataset. Historical
 logs retain their previous reference and should not be compared at the
 `1e-6` scale without rescoring saved models.

@@ -52,9 +52,10 @@ its Gauss-Newton step self-anneals). Reference: analytic (no download).
 
 Usage:
 
-    uv run -m experiments.pinns.wave_pinn --optimizer gnome --arch modified \\
-        --embed fourier --fourier-scale 10 --hard-bc
-    uv run -m experiments.pinns.wave_pinn --optimizer soap  --arch mlp --embed none
+    # Edit experiments/configs/pinns/wave_pinn.py: optimizer='gnome', arch='modified', embed='fourier', fourier_scale=10.0, hard_bc=True
+    uv run -m experiments.pinns.wave_pinn
+    # Edit experiments/configs/pinns/wave_pinn.py: optimizer='soap', arch='mlp', embed='none'
+    uv run -m experiments.pinns.wave_pinn
 """
 
 from __future__ import annotations
@@ -363,96 +364,10 @@ def build_optimizer(
 
 # ========================= CLI / training =========================
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--optimizer", required=True,
-                   choices=["gnome", "soap", "adamw"])
-    p.add_argument("--fuse-every", type=int, default=0,
-                   help="--arch fused only: consecutive hidden layers per "
-                        "parameter tensor. 1 = one tensor per layer, the "
-                        "control every larger value is compared against "
-                        "(identical function and initialization, only the "
-                        "grouping differs). 0 (default) fuses the whole "
-                        "stack. --depth 4 leaves only k=2 hidden layers to "
-                        "group, so raise --depth to give this room.")
-    p.add_argument("--second-mode", type=float, default=2.0 * C_SPEED,
-                   help="Spatial mode number m of the second component: the "
-                        "solution is sin(pi x)cos(c pi t) + A sin(m pi x)"
-                        "cos(c m pi t). Any m solves the same PDE with the "
-                        "same Dirichlet BCs, so this changes ONLY which "
-                        "harmonic sits on top of the fundamental. 4 "
-                        "(default) is jaxpi's benchmark, giving "
-                        "sin(4 pi x)cos(8 pi t); 3 is the Double-PINN "
-                        "paper's, giving sin(3 pi x)cos(6 pi t). Lower m is "
-                        "an easier target — less high-frequency content for "
-                        "the network to resolve — so runs at different m are "
-                        "NOT comparable to each other, only to the paper "
-                        "that uses that m.")
-    p.add_argument("--arch",
-                   choices=["mlp", "modified", "fused", "fused-modified"],
-                   default="modified",
-                   help="Network: plain tanh MLP or the gated modified MLP.")
-    p.add_argument("--embed", choices=["none", "periodic", "fourier"],
-                   default="fourier",
-                   help="Input embedding. 'fourier' = trainable Fourier "
-                        "features (the spectral aid wave wants).")
-    p.add_argument("--fourier-dim", type=int, default=128,
-                   help="Fourier embedding output dim (even). --embed fourier.")
-    p.add_argument("--fourier-scale", type=float, default=8.0,
-                   help="Initial Fourier frequency spread "
-                        "(B ~ N(0, scale²)); B is trained with the model. "
-                        "jaxpi uses ~10 for wave. --embed fourier.")
-    p.add_argument("--hard-bc", action="store_true",
-                   help="Enforce Dirichlet u=0 by construction via "
-                        "u = sin(πx)·N(t,x); drops the soft bc loss block.")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--steps", type=int, default=20000)
-    p.add_argument("--n-pde", type=int, default=4000)
-    p.add_argument("--n-ic", type=int, default=200,
-                   help="IC points (shared by the displacement and velocity "
-                        "IC blocks).")
-    p.add_argument("--n-bc", type=int, default=200)
-    p.add_argument("--aux-frac", type=float, default=0.10,
-                   help="Aux batch sizes for Gnome are max(K_min, int(N * "
-                        "aux_frac)) per block. Each aux pass is a full "
-                        "higher-order residual eval, so keep small.")
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "     
-                        "damping.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps). Gnome "
-                        "only; SOAP/AdamW keep eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.9)
-    p.add_argument("--beta2", type=float, default=0.99)
-    p.add_argument("--weight-decay", type=float, default=1e-8)
-    p.add_argument("--hidden", type=int, default=256, help="Network width.")
-    p.add_argument("--depth", type=int, default=4,
-                   help="Network depth: Linear-layer count for --arch mlp, "
-                        "number of gated hidden layers for --arch modified.")
-    p.add_argument("--warmup-steps", type=int, default=200)
-    p.add_argument("--cosine-decay", type=float, default=0.0,
-                   help="Final-LR fraction for the baseline cosine decay: 0.0 "
-                        "decays to zero, 1.0 disables. Gnome never decays.")
-    p.add_argument("--diagnostics-every", type=int, default=0,
-                   help="Log Gnome's internal state — curvature spectrum, LM "
-                        "damping, trust-region usage — every N steps to a "
-                        "sibling runs/.../{run_id}.diag.jsonl. 0 (default) "
-                        "disables it entirely. Gnome only: SOAP and AdamW "
-                        "expose no such hook.")
-    p.add_argument("--diagnostics-params", type=str, default=None,
-                   help="Comma-separated parameter indices to log, e.g. "
-                        "'0,4'. Default logs every parameter, which is one "
-                        "record per tensor per logged step — narrow it to "
-                        "keep the file readable.")
-    p.add_argument("--log-every", type=int, default=200)
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
 
 
 def train(args: argparse.Namespace) -> str:

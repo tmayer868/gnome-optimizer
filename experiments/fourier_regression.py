@@ -58,9 +58,12 @@ optimizer actually reached rather than only how much total error is left. That
 is the metric the loss curve hides, in the same spirit as ``beta_dist`` in
 ``ols_regression``.
 
-    uv run python -m experiments.fourier_regression --optimizer gnome --seed 0
-    uv run python -m experiments.fourier_regression --optimizer soap  --seed 0
-    uv run python -m experiments.fourier_regression --optimizer adamw --seed 0
+    # Edit experiments/configs/fourier_regression.py: optimizer='gnome', seed=0
+    uv run python -m experiments.fourier_regression
+    # Edit experiments/configs/fourier_regression.py: optimizer='soap', seed=0
+    uv run python -m experiments.fourier_regression
+    # Edit experiments/configs/fourier_regression.py: optimizer='adamw', seed=0
+    uv run python -m experiments.fourier_regression
 """
 
 from __future__ import annotations
@@ -444,65 +447,10 @@ def main():
               f"{share:5.1%} of variance   recovered {rec:6.3f}")
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--optimizer", required=True, choices=["gnome", "soap", "adamw"])
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--steps", type=int, default=20000)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=3e-3)
-    p.add_argument("--dim", type=int, default=4,
-                   help="Input dimension, and the primary difficulty knob. At "
-                        "20k AdamW steps: d=4 -> r2 0.90, d=8 -> 0.62, "
-                        "d=16 -> 0.32. Above ~8 the task stops responding to "
-                        "extra capacity or steps and just measures how much of "
-                        "the low band you got.")
-    p.add_argument("--n-modes", type=int, default=128,
-                   help="Number of Fourier modes summed into the target.")
-    p.add_argument("--alpha", type=float, default=0.3,
-                   help="Amplitude spectrum exponent, a_k = f_k^-alpha. 0.0 is "
-                        "flat (energy spread evenly over octaves, hardest); "
-                        "1.0 puts 80%% of the variance in the lowest octave and "
-                        "makes the high frequencies decoration.")
-    p.add_argument("--width", type=int, default=256)
-    p.add_argument("--depth", type=int, default=4,
-                   help="Hidden layers. Capacity is not the binding constraint "
-                        "here — see the docstring sweep — so raising these "
-                        "mostly buys wall time.")
-    p.add_argument("--activation", choices=["gelu", "tanh", "silu"], default="gelu")
-    p.add_argument("--n-val", type=int, default=8192,
-                   help="Frozen validation points, drawn once per seed.")
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
-                        "damping.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
-                        "-> more gradient-descent-like, smaller -> fuller Newton "
-                        "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.9,
-                   help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.99,
-                   help="Second-moment / preconditioner EMA (also shampoo_beta) "
-                        "for Gnome and SOAP.")
-    p.add_argument("--weight-decay", type=float, default=0.0,
-                   help="Default 0: inputs are resampled every step, so there "
-                        "is nothing to regularize and decay only biases the fit.")
-    p.add_argument("--warmup-steps", type=int, default=200,
-                   help="LR warmup steps, applied to every optimizer.")
-    p.add_argument("--cosine-decay", type=float, default=1.0,
-                   help="Final-LR fraction for the SOAP/AdamW cosine decay: "
-                        "0.0 decays to zero (default), 1.0 disables decay. "
-                        "Gnome (MSE) never decays regardless.")
-    p.add_argument("--eval-every", type=int, default=1000,
-                   help="Validation cadence in steps. Per-step train loss is "
-                        "logged to the artifact regardless.")
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
 
 
 if __name__ == "__main__":

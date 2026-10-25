@@ -19,9 +19,12 @@ Dataset: the full ``nu-delta/utkface`` (~23.7k images, columns
 ``datasets`` and cached under ``experiments/data/utkface_hf/`` (first call
 downloads and decodes — a minute or two, then reused).
 
-    uv run python -m experiments.resnets.utkface --optimizer gnome --seed 0
-    uv run python -m experiments.resnets.utkface --optimizer soap  --seed 0 --cosine-decay 0
-    uv run python -m experiments.resnets.utkface --optimizer adamw --seed 0 --cosine-decay 0
+    # Edit experiments/configs/resnets/utkface.py: optimizer='gnome', seed=0
+    uv run python -m experiments.resnets.utkface
+    # Edit experiments/configs/resnets/utkface.py: optimizer='soap', seed=0, cosine_decay=0.0
+    uv run python -m experiments.resnets.utkface
+    # Edit experiments/configs/resnets/utkface.py: optimizer='adamw', seed=0, cosine_decay=0.0
+    uv run python -m experiments.resnets.utkface
 
 Gnome and SOAP convolution-factor partitions use the same modes as CIFAR-100:
 
@@ -460,65 +463,10 @@ def main():
           f"best_mae_years={best_mae_years:.2f}", flush=True)
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--optimizer", required=True, choices=["gnome", "soap", "adamw"])
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
-                        "damping.")
-    p.add_argument("--eps", type=float, default=1e-12,
-                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
-                        "-> more gradient-descent-like, smaller -> fuller Newton "
-                        "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.9,
-                   help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.99,
-                   help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
-    p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument(
-        "--merge-dims",
-        choices=tuple(MERGE_DIMS_MODES),
-        default="none",
-        help="Gnome/SOAP convolution-factor grouping: 'none'=[O][I][H][W], "
-             "'greedy'=size-bounded greedy merging, 'spatial'=[O][I][HW], "
-             "or 'patch'=[O][IHW]. Ignored by AdamW.",
-    )
-    p.add_argument("--model", choices=MODEL_NAMES, default="resnet12",
-                   help="Architecture. resnet12 (default) is a custom net "
-                        "between resnet8 and resnet18.")
-    p.add_argument("--norm", choices=["gn", "bn"], default="gn",
-                   help="Normalization: GroupNorm (default) or BatchNorm.")
-    p.add_argument("--image-size", type=int, default=64,
-                   help="Side length to resize the UTKFace crops to.")
-    p.add_argument("--val-frac", type=float, default=0.2,
-                   help="Seeded validation holdout fraction (no canonical split).")
-    p.add_argument("--warmup-steps", type=int, default=100,
-                   help="LR warmup steps, applied to every optimizer.")
-    p.add_argument("--cosine-decay", type=float, default=1.0,
-                   help="Final-LR fraction for the SOAP/AdamW cosine decay: "
-                        "0.0 decays to zero (default), 1.0 disables decay. "
-                        "Gnome (MSE) never decays regardless.")
-    p.add_argument("--no-augment", dest="augment", action="store_false",
-                   help="Disable train-time augmentation (on by default).")
-    p.set_defaults(augment=True)
-    p.add_argument("--aug-max-rotation-deg", type=float, default=10.0)
-    p.add_argument("--aug-max-scale", type=float, default=1.1)
-    p.add_argument("--aug-hflip-prob", type=float, default=0.5)
-    p.add_argument("--log-every", type=int, default=50,
-                   help="Print a running-mean train loss every N steps within "
-                        "an epoch (0 disables). Per-step train loss is logged "
-                        "to the artifact regardless.")
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
 
 
 if __name__ == "__main__":

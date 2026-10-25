@@ -37,13 +37,16 @@ x-derivatives, so only C0 agreement is part of the canonical problem.
 
 Usage:
 
-    uv run -m experiments.pinns.reaction_pinn --optimizer gnome --rho 5
-    uv run -m experiments.pinns.reaction_pinn --optimizer adamw --rho 5
-    uv run -m experiments.pinns.reaction_pinn --optimizer soap --rho 10
-    uv run -m experiments.pinns.reaction_pinn --optimizer engdw --rho 5 \
-        --engdw-line-search --engdw-damping 1e-6 --engdw-chunk 128 --steps 1000
-    uv run -m experiments.pinns.reaction_pinn --optimizer gnome --rho 5 \
-        --arch fused-modified --fuse-every 2 --depth 6
+    # Edit experiments/configs/pinns/reaction_pinn.py: optimizer='gnome', rho=5.0
+    uv run -m experiments.pinns.reaction_pinn
+    # Edit experiments/configs/pinns/reaction_pinn.py: optimizer='adamw', rho=5.0
+    uv run -m experiments.pinns.reaction_pinn
+    # Edit experiments/configs/pinns/reaction_pinn.py: optimizer='soap', rho=10.0
+    uv run -m experiments.pinns.reaction_pinn
+    # Edit experiments/configs/pinns/reaction_pinn.py: optimizer='engdw', rho=5.0, engdw_line_search=True, engdw_damping=1e-06, engdw_chunk=128, steps=1000
+    uv run -m experiments.pinns.reaction_pinn
+    # Edit experiments/configs/pinns/reaction_pinn.py: optimizer='gnome', rho=5.0, arch='fused-modified', fuse_every=2, depth=6
+    uv run -m experiments.pinns.reaction_pinn
 """
 
 from __future__ import annotations
@@ -378,110 +381,8 @@ def build_optimizer(
 # ========================= CLI and training =========================
 
 def parse_args(argv=None) -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument(
-        "--optimizer", required=True, choices=["gnome", "soap", "adamw", "engdw"]
-    )
-    p.add_argument(
-        "--rho", type=float, default=5.0,
-        help="Reaction coefficient. Vanilla whole-domain PINNs are already "
-             "near 100%% relative error at rho=5; rho=10 is the harder "
-             "published rung.",
-    )
-    p.add_argument(
-        "--arch",
-        choices=["mlp", "modified", "fused", "fused-modified"],
-        default="mlp",
-        help="The plain MLP matches the published benchmark; other choices "
-             "are architecture or tensor-grouping ablations.",
-    )
-    p.add_argument(
-        "--fuse-every", type=int, default=0,
-        help="Fused architectures only: hidden layers per parameter tensor. "
-             "One is the per-layer control; zero fuses the whole stack.",
-    )
-    p.add_argument(
-        "--embed", choices=["none", "periodic"], default="none",
-        help="Raw inputs plus a soft BC (published setup), or an exact "
-             "periodic embedding that drops the BC block.",
-    )
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--steps", type=int, default=100_000)
-    p.add_argument("--n-pde", type=int, default=4000)
-    p.add_argument("--n-ic", type=int, default=256)
-    p.add_argument("--n-bc", type=int, default=256)
-    p.add_argument(
-        "--aux-frac", type=float, default=0.05,
-        help="Fraction of each residual block used by Gnome's auxiliary "
-             "curvature pass.",
-    )
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument(
-        "--trust-region", type=float, default=1.0,
-        help="Gnome trust radius; zero disables the trust-region solve.",
-    )
-    p.add_argument(
-        "--eps", type=float, default=1e-6,
-        help="Gnome curvature damping. Baselines retain their own epsilon.",
-    )
-    p.add_argument("--beta1", type=float, default=0.9)
-    p.add_argument("--beta2", type=float, default=0.99)
-    p.add_argument("--weight-decay", type=float, default=1e-8)
-    p.add_argument(
-        "--engdw-damping", type=float, default=1e-6,
-        help="ENGD-W fixed damping in JJ^T + lambda I; reaction starting "
-             "value, not a tuned result. No weight decay or LR schedule is used.",
-    )
-    p.add_argument(
-        "--engdw-momentum", type=float, default=0.0,
-        help="ENGD-W SPRING-style regularization-center momentum in [0, 1). "
-             "Zero preserves the original solver; try 0.9, 0.95, or 0.99.",
-    )
-    p.add_argument(
-        "--engdw-line-search", action="store_true",
-        help="Choose the lowest same-batch loss on 13 log-spaced step sizes "
-             "from 1e-3 to 1, overriding --lr (same grid as Poisson-5D).",
-    )
-    p.add_argument(
-        "--engdw-fixed", action="store_true",
-        help="ENGD-W only: sample PDE/IC/BC training points once and reuse "
-             "them every step. Validation points remain independently sampled.",
-    )
-    p.add_argument(
-        "--engdw-chunk", type=int, default=32,
-        help="Samples per vectorized Jacobian chunk for ENGD-W; limits differentiation "
-             "workspace, while the full Jacobian and sample Gram remain dense.",
-    )
-    p.add_argument(
-        "--hidden", type=int, default=50,
-        help="Network width; 50 matches the published model.",
-    )
-    p.add_argument(
-        "--depth", type=int, default=5,
-        help="Linear-layer count for MLP/fused (four hidden layers at the "
-             "default); gated hidden-layer count for modified variants.",
-    )
-    p.add_argument("--warmup-steps", type=int, default=200)
-    p.add_argument(
-        "--cosine-decay", type=float, default=0.0,
-        help="Final learning-rate fraction after cosine decay.",
-    )
-    p.add_argument(
-        "--float64", action="store_true",
-        help="Use float64 (always enabled for ENGD-W), falling back to CPU "
-             "when the selected device is MPS.",
-    )
-    p.add_argument(
-        "--diagnostics-every", type=int, default=0,
-        help="Write Gnome internals every N steps; zero disables it.",
-    )
-    p.add_argument(
-        "--diagnostics-params", type=str, default=None,
-        help="Comma-separated parameter indices for Gnome diagnostics.",
-    )
-    p.add_argument("--log-every", type=int, default=200)
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
     return p.parse_args(argv)
 
 

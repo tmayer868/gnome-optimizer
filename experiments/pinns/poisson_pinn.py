@@ -39,11 +39,14 @@ compatibility flag.
 
 Usage:
 
-    uv run -m experiments.pinns.poisson_pinn --optimizer gnome --seed 0
-    uv run -m experiments.pinns.poisson_pinn --optimizer soap  --seed 0
-    uv run -m experiments.pinns.poisson_pinn --optimizer adamw --seed 0
-    uv run -m experiments.pinns.poisson_pinn --optimizer engdw --n-pde 128 \
-        --n-bc-per-edge 16 --engdw-line-search --steps 1000
+    # Edit experiments/configs/pinns/poisson_pinn.py: optimizer='gnome', seed=0
+    uv run -m experiments.pinns.poisson_pinn
+    # Edit experiments/configs/pinns/poisson_pinn.py: optimizer='soap', seed=0
+    uv run -m experiments.pinns.poisson_pinn
+    # Edit experiments/configs/pinns/poisson_pinn.py: optimizer='adamw', seed=0
+    uv run -m experiments.pinns.poisson_pinn
+    # Edit experiments/configs/pinns/poisson_pinn.py: optimizer='engdw', n_pde=128, n_bc_per_edge=16, engdw_line_search=True, steps=1000
+    uv run -m experiments.pinns.poisson_pinn
 """
 
 from __future__ import annotations
@@ -360,115 +363,8 @@ def build_optimizer(
 # ========================= CLI / training =========================
 
 def parse_args(argv=None) -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--optimizer", required=True,
-                   choices=["gnome", "soap", "adamw", "engdw", "woodbury"])
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--steps", type=int, default=50000,
-                   help="Default 50k — Poisson converges much faster than "
-                        "evolution PDEs; usually plateaus within 20-30k.")
-    p.add_argument("--n-pde", type=int, default=2000)
-    p.add_argument("--n-bc-per-edge", type=int, default=50,
-                   help="Boundary points per edge (total BC sample is 4× this).")
-    p.add_argument("--fixed-dataset", action="store_true",
-                   help="Reuse the same PDE/BC training points every step for any optimizer. "
-                        "Gnome/Woodbury draw fresh auxiliary subsets of those points; validation still resamples.")
-    p.add_argument("--aux-frac", type=float, default=0.05)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome/Woodbury per-tensor L2 bound: choose damping so "
-                        "||direction|| <= trust_region * sqrt(||W||^2 + 1). "
-                        "LR scales the bounded direction. 0 disables adaptive damping.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
-                        "-> more gradient-descent-like, smaller -> fuller Newton "
-                        "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=None,
-                   help="First-moment EMA: default 0 for Woodbury, 0.9 for Gnome/SOAP.")
-    p.add_argument("--beta2", type=float, default=0.99,
-                   help="Curvature EMA for Woodbury; second-moment / preconditioner EMA for Gnome/SOAP.")
-    p.add_argument("--weight-decay", type=float, default=1e-8)
-    p.add_argument("--woodbury-damping", type=float, default=1e-3,
-                   help="Woodbury damping floor; fixed damping when --trust-region 0.")
-    p.add_argument("--woodbury-warmup-steps", type=int, default=100,
-                   help="Hold parameters fixed while collecting curvature for the first N steps. "
-                        "0 disables. Independent of the concurrent --warmup-steps LR ramp.")
-    p.add_argument("--history-tol", type=float, default=0.01,
-                   help="Woodbury EMA tail tolerance; history=ceil(log(tol)/log(beta2)).")
-    p.add_argument("--max-history", type=int, default=None,
-                   help="Override Woodbury's derived history length (matrix samples per parameter).")
-    p.add_argument("--gram-float64", action="store_true",
-                   help="Woodbury float64 inner products, solve and reconstruction; CPU on MPS.")
-    p.add_argument("--engdw-damping", type=float, default=1e-6,
-                   help="ENGD-W fixed damping in J J^T + lambda I; no weight decay or schedule.")
-    p.add_argument("--engdw-momentum", type=float, default=0.0,
-                   help="ENGD-W regularization-center momentum in [0,1).")
-    p.add_argument("--engdw-line-search", action="store_true",
-                   help="ENGD-W same-batch grid line search over [1e-3,1], overriding --lr.")
-    p.add_argument("--engdw-chunk", type=int, default=32,
-                   help="Points per Jacobian chunk; the full Jacobian and sample Gram remain dense.")
-    p.add_argument("--engdw-fixed", action="store_true",
-                   help="ENGD-W-only compatibility flag for --fixed-dataset.")
-    p.add_argument("--hidden", type=int, default=64, help="MLP width.")
-    p.add_argument("--depth", type=int, default=5, help="MLP depth.")
-    p.add_argument("--arch", type=str, default="mlp",
-                   choices=["mlp", "fused"],
-                   help="Weight grouping — same function class either way, "
-                        "different parameter tensors for the optimizer to "
-                        "precondition over. 'mlp' (default) stores one [W|b] "
-                        "matrix per layer; 'fused' additionally groups "
-                        "hidden layers per --fuse-every.")
-    p.add_argument("--fuse-every", type=int, default=0,
-                   help="--arch fused only: consecutive hidden layers per "
-                        "parameter tensor. 1 = one tensor per layer, which is "
-                        "the control every larger value is compared against "
-                        "(identical function and initialization, only the "
-                        "grouping differs). 0 (default) fuses the whole stack. "
-                        "A short final chunk is fine if it does not divide "
-                        "depth-2. Not just a modelling knob: fewer, bigger "
-                        "tensors cut Gnome's per-tensor per-step overhead, so "
-                        "at modest width raising this is also a speedup (~8%% "
-                        "for 1 -> 2 at hidden=64 depth=10). That reverses once "
-                        "the eigenbasis refresh dominates, well above "
-                        "hidden=64.")
-    p.add_argument("--warmup-steps", type=int, default=200,
-                   help="Linear LR warmup for Gnome, SOAP, AdamW, Woodbury; ENGD-W has no schedule.")
-    p.add_argument("--cosine-decay", type=float, default=0.0,
-                   help="Final-LR fraction for the baseline cosine decay: 0.0 "
-                        "decays to zero (standard treatment), 1.0 disables "
-                        "decay. Applies to Gnome, SOAP, AdamW, Woodbury; ignored by ENGD-W.")
-    p.add_argument("--float64", action="store_true",
-                   help="Run in double precision on CPU. float32 floors "
-                        "rel_L2 around 1e-5..1e-6; the ENGD high-accuracy "
-                        "benchmark (Müller & Zeinhofer) reaches ~1e-7, which "
-                        "is only reproducible in float64. Forces device=cpu "
-                        "(MPS has no float64) and sets the global default "
-                        "dtype to float64 so params, samples and the "
-                        "reference are all double.")
-    p.add_argument("--diagnostics-every", type=int, default=0,
-                   help="Log Gnome or Woodbury internal curvature/step diagnostics every N steps to a "
-                        "sibling runs/.../{run_id}.diag.jsonl. 0 (default) "
-                        "disables it entirely. Supported by Gnome and Woodbury.")
-    p.add_argument("--diagnostics-params", type=str, default=None,
-                   help="Comma-separated parameter indices to log, e.g. "
-                        "'0,4'. Default logs every parameter, which is one "
-                        "record per tensor per logged step — narrow it to "
-                        "keep the file readable.")
-    p.add_argument("--measure-rho-every", type=int, default=0,
-                   help="Every N steps, measure exactly how much curvature "
-                        "the eigenbasis fails to diagonalize (rho), writing "
-                        "runs/.../{run_id}.rho.jsonl. 0 (default) disables. "
-                        "Costs one backward pass per sample (see "
-                        "--measure-rho-samples), so keep N large. Gnome only.")
-    p.add_argument("--measure-rho-samples", type=int, default=256,
-                   help="Residual entries per rho measurement. This is the "
-                        "cost knob: one backward pass each.")
-    p.add_argument("--measure-rho-kron-floor", action="store_true",
-                   help="Also compute the best-Kronecker-product error. "
-                        "Builds a (P x P) matrix, so small layers only.")
-    p.add_argument("--log-every", type=int, default=200)
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
     args = p.parse_args(argv)
     if args.beta1 is None:
         args.beta1 = 0.0 if args.optimizer == "woodbury" else 0.9

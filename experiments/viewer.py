@@ -19,7 +19,8 @@ Usage:
     uv run -m experiments.viewer
     # then open http://localhost:8765 in a browser
 
-    uv run -m experiments.viewer --port 9000 --runs-dir runs
+    # Edit experiments/configs/viewer.py: port=9000, runs_dir='runs'
+    uv run -m experiments.viewer
 """
 
 from __future__ import annotations
@@ -690,12 +691,10 @@ class _Handler(BaseHTTPRequestHandler):
         return entries
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--runs-dir", default="runs")
-    args = ap.parse_args()
+def main(argv=None):
+    from experiments.common.config import ConfigParser
+    ap = ConfigParser(__file__)
+    args = ap.parse_args(argv)
 
     _Handler.runs_dir = args.runs_dir
     httpd = ThreadingHTTPServer((args.host, args.port), _Handler)

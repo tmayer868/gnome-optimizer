@@ -34,9 +34,12 @@ which suits Gnome since its step self-anneals as the residual shrinks).
 
 Usage:
 
-    uv run -m experiments.pinns.navier_stokes_pinn --optimizer gnome --seed 0
-    uv run -m experiments.pinns.navier_stokes_pinn --optimizer soap  --seed 0
-    uv run -m experiments.pinns.navier_stokes_pinn --optimizer adamw --seed 0
+    # Edit experiments/configs/pinns/navier_stokes_pinn.py: optimizer='gnome', seed=0
+    uv run -m experiments.pinns.navier_stokes_pinn
+    # Edit experiments/configs/pinns/navier_stokes_pinn.py: optimizer='soap', seed=0
+    uv run -m experiments.pinns.navier_stokes_pinn
+    # Edit experiments/configs/pinns/navier_stokes_pinn.py: optimizer='adamw', seed=0
+    uv run -m experiments.pinns.navier_stokes_pinn
 """
 
 from __future__ import annotations
@@ -416,66 +419,10 @@ def build_optimizer(
 
 # ========================= CLI / training =========================
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--optimizer", required=True,
-                   choices=["gnome", "soap", "adamw"])
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--steps", type=int, default=200000)
-    p.add_argument("--n-data", type=int, default=5000,
-                   help="Number of sparse (u, v) observation points "
-                        "(fixed at training start).")
-    p.add_argument("--n-pde", type=int, default=10000,
-                   help="Fresh collocation points per step.")
-    p.add_argument("--aux-frac", type=float, default=0.03)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
-                        "damping.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
-                        "-> more gradient-descent-like, smaller -> fuller Newton "
-                        "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.9,
-                   help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.99,
-                   help="Second-moment / preconditioner EMA (also shampoo_beta) "
-                        "for Gnome and SOAP.")
-    p.add_argument("--weight-decay", type=float, default=1e-8)
-    p.add_argument("--hidden", type=int, default=128)
-    p.add_argument("--depth", type=int, default=8)
-    p.add_argument("--warmup-steps", type=int, default=200,
-                   help="Linear LR warmup steps, applied to every optimizer.")
-    p.add_argument("--cosine-decay", type=float, default=0.0,
-                   help="Final-LR fraction for the baseline cosine decay: 0.0 "
-                        "decays to zero (standard treatment), 1.0 disables "
-                        "decay. Gnome (MSE) never decays regardless.")
-    p.add_argument("--diagnostics-every", type=int, default=0,
-                   help="Log Gnome's internal state — curvature spectrum, LM "
-                        "damping, trust-region usage — every N steps to a "
-                        "sibling runs/.../{run_id}.diag.jsonl. 0 (default) "
-                        "disables it entirely. Gnome only: SOAP and AdamW "
-                        "expose no such hook.")
-    p.add_argument("--diagnostics-params", type=str, default=None,
-                   help="Comma-separated parameter indices to log, e.g. "
-                        "'0,4'. Default logs every parameter, which is one "
-                        "record per tensor per logged step — narrow it to "
-                        "keep the file readable.")
-    p.add_argument("--log-every", type=int, default=200)
-    p.add_argument("--w-data-u", type=float, default=1.0)
-    p.add_argument("--w-data-v", type=float, default=1.0)
-    p.add_argument("--w-continuity", type=float, default=1.0)
-    p.add_argument("--w-momentum-x", type=float, default=1.0)
-    p.add_argument("--w-momentum-y", type=float, default=1.0)
-    p.add_argument("--lambda1-init", type=float, default=0.0)
-    p.add_argument("--lambda2-init", type=float, default=0.0)
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
 
 
 def train(args: argparse.Namespace) -> str:

@@ -82,13 +82,16 @@ function each iteration — so its points are drawn once and held constant.
 
 Usage::
 
-    uv run -m experiments.pinns.ldc_pinn --optimizer gnome
-    uv run -m experiments.pinns.ldc_pinn --optimizer soap
-    uv run -m experiments.pinns.ldc_pinn --optimizer adamw+lbfgs
+    # Edit experiments/configs/pinns/ldc_pinn.py: optimizer='gnome'
+    uv run -m experiments.pinns.ldc_pinn
+    # Edit experiments/configs/pinns/ldc_pinn.py: optimizer='soap'
+    uv run -m experiments.pinns.ldc_pinn
+    # Edit experiments/configs/pinns/ldc_pinn.py: optimizer='adamw+lbfgs'
+    uv run -m experiments.pinns.ldc_pinn
 
     # short smoke on the first rung only
-    uv run -m experiments.pinns.ldc_pinn --optimizer gnome \\
-        --re-stages 100 --stage-steps 2000 --log-every 200
+    # Edit experiments/configs/pinns/ldc_pinn.py: optimizer='gnome', re_stages=[100], stage_steps=[2000], log_every=200
+    uv run -m experiments.pinns.ldc_pinn
 """
 
 from __future__ import annotations
@@ -531,120 +534,10 @@ def lbfgs_phase(
 
 # ========================= CLI / training =========================
 
-def _int_list(s: str) -> list[int]:
-    return [int(v) for v in s.replace(" ", "").split(",") if v]
-
-
-def _float_list(s: str) -> list[float]:
-    return [float(v) for v in s.replace(" ", "").split(",") if v]
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--optimizer", required=True,
-                   choices=["gnome", "soap", "adamw+lbfgs"])
-    p.add_argument("--arch", choices=["mlp", "modified"], default="modified",
-                   help="Network: plain tanh MLP or the gated modified MLP "
-                        "(Wang et al. 2021). --hidden / --depth control both.")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--re-stages", type=_int_list,
-                   default=[100, 400, 1000, 3200, 5000],
-                   help="Reynolds-number curriculum, comma-separated. Each "
-                        "stage warm-starts from the previous one's weights "
-                        "AND optimizer state. Every value needs a reference "
-                        f"solution; available: {AVAILABLE_RE}.")
-    p.add_argument("--stage-steps", type=_int_list, default=[20000],
-                   help="Steps per curriculum stage, comma-separated. A single "
-                        "value applies to every stage except the last, which "
-                        "gets --final-stage-steps.")
-    p.add_argument("--final-stage-steps", type=int, default=140_000,
-                   help="Steps for the last curriculum stage when "
-                        "--stage-steps is a single value. The final Re is "
-                        "where the accuracy is actually earned.")
-    p.add_argument("--lid", choices=["regularized", "uniform"],
-                   default="regularized",
-                   help="Lid velocity profile. 'regularized' is jaxpi's "
-                        "1-cosh(50(x-1/2))/cosh(25), which removes the corner "
-                        "singularity but does NOT match the reference data "
-                        "(generated with a uniform lid) in two thin corner "
-                        "strips. 'uniform' matches the reference exactly and "
-                        "reinstates the singularity.")
-    p.add_argument("--block-weights", type=_float_list, default=None,
-                   help="Static per-block loss weights λ_j, comma-separated in "
-                        f"{','.join(BLOCK_NAMES)} order, giving the loss "
-                        "Σ_j λ_j·mean(r_j²). Default is equal weighting. "
-                        "jaxpi's LDC init_weights are '1,1,10,100,100' — they "
-                        "then adapt them with grad-norm balancing, which is "
-                        "not ported, so passing that is the static "
-                        "approximation of their starting point.")
-    p.add_argument("--n-pde", type=int, default=4000,
-                   help="Interior collocation points per step.")
-    p.add_argument("--n-bc", type=int, default=256,
-                   help="Boundary points per edge per step (4x this total).")
-    p.add_argument("--aux-frac", type=float, default=0.03,
-                   help="Aux batch sizes for Gnome are max(K_min, int(N * "
-                        "aux_frac)) per block. Each aux pass is a full "
-                        "second-order residual eval, so keep small.")
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
-                        "damping.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
-                        "-> more gradient-descent-like, smaller -> fuller "
-                        "Newton step. Gnome only; SOAP/AdamW keep eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.9,
-                   help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.99,
-                   help="Second-moment / preconditioner EMA (also shampoo_beta) "
-                        "for Gnome and SOAP.")
-    p.add_argument("--weight-decay", type=float, default=1e-8)
-    p.add_argument("--hidden", type=int, default=256, help="Network width.")
-    p.add_argument("--depth", type=int, default=4,
-                   help="Network depth: Linear-layer count for --arch mlp, "
-                        "number of gated hidden layers for --arch modified.")
-    p.add_argument("--warmup-steps", type=int, default=200,
-                   help="Linear LR warmup steps, applied to every optimizer.")
-    p.add_argument("--cosine-decay", type=float, default=0.0,
-                   help="Final-LR fraction for the baseline cosine decay: 0.0 "
-                        "decays to zero (standard treatment), 1.0 disables "
-                        "decay. Gnome (MSE) never decays regardless.")
-    p.add_argument("--lbfgs-steps", type=int, default=500,
-                   help="L-BFGS OUTER steps after the AdamW phase "
-                        "(--optimizer adamw+lbfgs only). Each outer step runs "
-                        "up to --lbfgs-max-iter inner iterations, so the total "
-                        "L-BFGS budget is lbfgs_steps * lbfgs_max_iter. Runs "
-                        "full-batch on a fixed collocation set.")
-    p.add_argument("--lbfgs-max-iter", type=int, default=20,
-                   help="Inner L-BFGS iterations per outer step. Must be >1: "
-                        "the strong-Wolfe line search cannot recover from a "
-                        "cold (identity) Hessian in a single iteration and "
-                        "stalls. adamw+lbfgs only.")
-    p.add_argument("--lbfgs-history", type=int, default=50,
-                   help="L-BFGS history size (number of stored curvature "
-                        "pairs). adamw+lbfgs only.")
-    p.add_argument("--lbfgs-lr", type=float, default=1.0,
-                   help="L-BFGS learning rate; with the strong-Wolfe line "
-                        "search 1.0 is standard. adamw+lbfgs only.")
-    p.add_argument("--diagnostics-every", type=int, default=0,
-                   help="Log Gnome's internal state — curvature spectrum, LM "
-                        "damping, trust-region usage — every N steps to a "
-                        "sibling runs/.../{run_id}.diag.jsonl. 0 (default) "
-                        "disables it entirely. Gnome only: SOAP and AdamW "
-                        "expose no such hook.")
-    p.add_argument("--diagnostics-params", type=str, default=None,
-                   help="Comma-separated parameter indices to log, e.g. "
-                        "'0,4'. Default logs every parameter, which is one "
-                        "record per tensor per logged step — narrow it to "
-                        "keep the file readable.")
-    p.add_argument("--log-every", type=int, default=200)
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
 
 
 def resolve_stage_steps(args: argparse.Namespace) -> list[int]:

@@ -35,7 +35,8 @@ best diagonal GGN approximation in Gnome's basis.
 
 Example:
 
-    uv run -m experiments.test_ggn_approximations --steps 100
+    # Edit experiments/configs/test_ggn_approximations.py: steps=100
+    uv run -m experiments.test_ggn_approximations
 """
 
 from __future__ import annotations
@@ -299,34 +300,10 @@ def print_report(
         )
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--steps", type=int, default=100)
-    parser.add_argument(
-        "--n-pde",
-        type=int,
-        default=32,
-        help="Interior Poisson collocation points per step.",
-    )
-    parser.add_argument(
-        "--n-bc-per-edge",
-        type=int,
-        default=8,
-        help="Boundary points per edge (four times this many in total).",
-    )
-    parser.add_argument("--ema-beta", type=float, default=0.95)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--report-every", type=int, default=25)
-    parser.add_argument(
-        "--hidden-dims",
-        type=int,
-        nargs="+",
-        default=[32, 64, 32],
-        metavar="WIDTH",
-        help="Hidden-layer widths, for example: --hidden-dims 32 64 32",
-    )
-    return parser.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    parser = ConfigParser(__file__)
+    return parser.parse_args(argv)
 
 
 def main() -> None:

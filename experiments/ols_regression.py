@@ -40,9 +40,12 @@ rotate (SOAP and Gnome track the off-diagonal curvature and can). Crank
 
 Usage:
 
-    uv run -m experiments.ols_regression --optimizer gnome --seed 0
-    uv run -m experiments.ols_regression --optimizer adamw --seed 0
-    uv run -m experiments.ols_regression --optimizer soap  --seed 0
+    # Edit experiments/configs/ols_regression.py: optimizer='gnome', seed=0
+    uv run -m experiments.ols_regression
+    # Edit experiments/configs/ols_regression.py: optimizer='adamw', seed=0
+    uv run -m experiments.ols_regression
+    # Edit experiments/configs/ols_regression.py: optimizer='soap', seed=0
+    uv run -m experiments.ols_regression
 """
 
 from __future__ import annotations
@@ -144,58 +147,10 @@ def make_dataset(
     return X.to(torch.float32), y.to(torch.float32)
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--optimizer", required=True,
-                   choices=["gnome", "soap", "adamw"])
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--epochs", type=int, default=50)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-2)
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
-                        "damping.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
-                        "-> more gradient-descent-like, smaller -> fuller Newton "
-                        "step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.9,
-                   help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.99,
-                   help="Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.")
-    # Weight decay biases beta_hat away from beta_true (ridge), which
-    # contaminates the distance metric. Default to 0 here.
-    p.add_argument("--weight-decay", type=float, default=0.0)
-    p.add_argument("--n-train", type=int, default=32_000)
-    p.add_argument("--n-val", type=int, default=2048)
-    p.add_argument("--dim", type=int, default=64,
-                   help="Number of features d.")
-    p.add_argument("--condition-number", type=float, default=1e3,
-                   help="Ratio of largest to smallest eigenvalue of cov(X). "
-                        "Larger -> more ill-conditioned -> bigger gap.")
-    p.add_argument("--noise-std", type=float, default=0.1,
-                   help="Standard deviation of additive Gaussian label noise.")
-    p.add_argument("--warmup-steps", type=int, default=200,
-                   help="Linear LR warmup steps, applied to every optimizer.")
-    p.add_argument("--cosine-decay", type=float, default=0.0,
-                   help="Final-LR fraction for the baseline cosine decay: 0.0 "
-                        "decays to zero (standard treatment), 1.0 disables "
-                        "decay entirely (raw SOAP/AdamW). Gnome (MSE) never "
-                        "decays regardless.")
-    p.add_argument("--rotate", action="store_true",
-                   help="Apply a random orthogonal rotation to cov(X) so the "
-                        "Hessian is non-axis-aligned. Off by default: the "
-                        "exact-recovery gap is a denominator effect that shows "
-                        "even with a diagonal Hessian. Turning it on adds a "
-                        "second handicap for AdamW (per-coordinate scaling "
-                        "cannot rotate).")
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
 
 
 def main():

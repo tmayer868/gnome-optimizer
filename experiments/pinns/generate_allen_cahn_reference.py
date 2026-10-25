@@ -234,25 +234,10 @@ def generate_allen_cahn_reference(
     return output
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--modes", type=int, default=4095)
-    parser.add_argument(
-        "--check-modes",
-        type=int,
-        default=2047,
-        help="Lower odd resolution used for the convergence report; 0 disables.",
-    )
-    parser.add_argument("--time-steps", type=int, default=200)
-    parser.add_argument("--rtol", type=float, default=2e-11)
-    parser.add_argument("--atol", type=float, default=2e-13)
-    parser.add_argument("--output", default=DEFAULT_OUTPUT)
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Regenerate and overwrite an existing matching output file.",
-    )
-    return parser.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    parser = ConfigParser(__file__)
+    return parser.parse_args(argv)
 
 
 def main() -> None:

@@ -87,12 +87,13 @@ warmup then constant, which suits Gnome's self-annealing Gauss-Newton step).
 
 Usage::
 
-    uv run -m experiments.pinns.inviscid_burgers_pinn --optimizer gnome --seed 0
-    uv run -m experiments.pinns.inviscid_burgers_pinn --optimizer soap  --seed 0
-    # the paper's collocation sweep:
-    for n in 625 1250 2500 5000 10000; do
-      uv run -m experiments.pinns.inviscid_burgers_pinn --optimizer gnome --n-pde $n
-    done
+    # Edit experiments/configs/pinns/inviscid_burgers_pinn.py: optimizer='gnome', seed=0
+    uv run -m experiments.pinns.inviscid_burgers_pinn
+    # Edit experiments/configs/pinns/inviscid_burgers_pinn.py: optimizer='soap', seed=0
+    uv run -m experiments.pinns.inviscid_burgers_pinn
+    # For the paper's collocation sweep, set RUNS in scripts/sweep.py to:
+    # grid("inviscid_burgers_pinn", optimizer="gnome", n_pde=[625, 1250, 2500, 5000, 10000])
+    uv run python scripts/sweep.py
 """
 
 from __future__ import annotations
@@ -361,89 +362,10 @@ def build_optimizer(
 
 # ========================= CLI / training =========================
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--optimizer", required=True,
-                   choices=["gnome", "soap", "adamw"])
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--steps", type=int, default=5000,
-                   help="Paper protocol: 5000 iterations for every case.")
-    p.add_argument("--n-pde", type=int, default=2500,
-                   help="Interior collocation points. Paper sweeps 625, 1250, "
-                        "2500, 5000, 10000 (Table 10).")
-    p.add_argument("--n-ic", type=int, default=256,
-                   help="Initial-condition points at t=0. Not stated in the "
-                        "paper for this rung.")
-    p.add_argument("--ic-weight", type=float, default=1.0,
-                   help="Weight on the IC block: mean(out^2) = mean(r_pde^2) + "
-                        "ic_weight*mean(r_ic^2). Eq. 50 uses equal weights.")
-    p.add_argument("--roe-delta", type=float, default=10.0,
-                   help="Shock-detection threshold: Omega_s = {u_x <= -delta}. "
-                        "Undocumented in the paper. Before shock formation the "
-                        "slope at the origin is pi/(1-pi*t), so delta should "
-                        "sit well above pi.")
-    p.add_argument("--roe-offset", type=float, default=0.01,
-                   help="Offset for the left/right states u(x -+ offset, t) in "
-                        "the Roe average. Undocumented in the paper; should be "
-                        "below a typical collocation spacing.")
-    p.add_argument("--roe-detach", action="store_true",
-                   help="Freeze the Roe average as a coefficient (the literal "
-                        "'linearize' reading) instead of differentiating "
-                        "through it. Changes the parameter gradients.")
-    p.add_argument("--embedding", type=str, default="periodic",
-                   choices=["periodic", "raw"],
-                   help="periodic: (t, cos pi x, sin pi x), BCs exact, the "
-                        "paper's setup. raw: (t, x) — periodicity is then not "
-                        "enforced at all and there is no BC block, so expect "
-                        "drift at the domain edges.")
-    p.add_argument("--aux-frac", type=float, default=0.03,
-                   help="Aux batch sizes for Gnome are max(K_min, int(N * "
-                        "aux_frac)) per block. Each aux pass is a full "
-                        "residual eval, so this is not free — keep small.")
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome l2 trust radius: lambda is the smallest value "
-                        ">= eps with ||m_hat/(v_hat+lambda)||_2 <= this * "
-                        "sqrt(P), i.e. a bound on the RMS per-coordinate step. "
-                        "0 disables it.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature-damping epsilon in m_hat/(v_hat+eps). "
-                        "Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.9)
-    p.add_argument("--beta2", type=float, default=0.99)
-    p.add_argument("--weight-decay", type=float, default=1e-8)
-    p.add_argument("--hidden", type=int, default=30, help="MLP width.")
-    p.add_argument("--depth", type=int, default=7,
-                   help="Total linear layers (paper: 6 hidden + output = 7, "
-                        "giving 4801 params at --hidden 30).")
-    p.add_argument("--dtype", type=str, default="float32",
-                   choices=["float32", "float64"],
-                   help="float32 suffices here — the paper's accuracies are "
-                        "~1e-2/1e-3, set by the shock, not by precision.")
-    p.add_argument("--warmup-steps", type=int, default=200)
-    p.add_argument("--cosine-decay", type=float, default=0.0,
-                   help="Final-LR fraction for the baseline cosine decay: 0.0 "
-                        "decays to zero, 1.0 disables decay. Gnome never "
-                        "decays regardless.")
-    p.add_argument("--n-eval-x", type=int, default=1000,
-                   help="Spatial points at t=1 (paper's WENO reference: 1000).")
-    p.add_argument("--n-eval-t", type=int, default=51,
-                   help="Time slices in the space-time eval grid.")
-    p.add_argument("--diagnostics-every", type=int, default=0,
-                   help="Log Gnome's internal state — curvature spectrum, LM "
-                        "damping, trust-region usage — every N steps to a "
-                        "sibling runs/.../{run_id}.diag.jsonl. 0 (default) "
-                        "disables it entirely. Gnome only: SOAP and AdamW "
-                        "expose no such hook.")
-    p.add_argument("--diagnostics-params", type=str, default=None,
-                   help="Comma-separated parameter indices to log, e.g. "
-                        "'0,4'. Default logs every parameter, which is one "
-                        "record per tensor per logged step — narrow it to "
-                        "keep the file readable.")
-    p.add_argument("--log-every", type=int, default=100)
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
 
 
 def train(args: argparse.Namespace) -> str:

@@ -70,16 +70,22 @@ independently generated spectral reference can be selected with
 
 Usage:
 
-    uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --arch modified
-    uv run -m experiments.pinns.allen_cahn_pinn --optimizer soap  --arch mlp
-    uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome \
-        --embed fourier --embed-dim 32 --embed-scale 10
-    uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome \
-        --diagnostics-every 500 --diagnostics-params 0
-    uv run -m experiments.pinns.allen_cahn_pinn --optimizer adamw --arch modified
-    uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --embed periodic
-    uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --embed polynomial
-    uv run -m experiments.pinns.allen_cahn_pinn --optimizer gnome --float64-after 30000
+    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', arch='modified'
+    uv run -m experiments.pinns.allen_cahn_pinn
+    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='soap', arch='mlp'
+    uv run -m experiments.pinns.allen_cahn_pinn
+    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', embed='fourier', embed_dim=32, embed_scale=10.0
+    uv run -m experiments.pinns.allen_cahn_pinn
+    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', diagnostics_every=500, diagnostics_params='0'
+    uv run -m experiments.pinns.allen_cahn_pinn
+    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='adamw', arch='modified'
+    uv run -m experiments.pinns.allen_cahn_pinn
+    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', embed='periodic'
+    uv run -m experiments.pinns.allen_cahn_pinn
+    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', embed='polynomial'
+    uv run -m experiments.pinns.allen_cahn_pinn
+    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', float64_after=30000
+    uv run -m experiments.pinns.allen_cahn_pinn
 """
 
 from __future__ import annotations
@@ -393,7 +399,7 @@ def build_optimizer(
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
-            precondition_frequency=20,
+            precondition_frequency=5,
             trust_radius=(trust_region if trust_region > 0 else None),
             loss="mse", precondition_1d=True,
         )
@@ -402,7 +408,7 @@ def build_optimizer(
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
-            precondition_frequency=20, precondition_1d=True,
+            precondition_frequency=1, precondition_1d=True,
         )
         opt = SOAP(params, **cfg)
     elif name == "adamw":
@@ -422,130 +428,9 @@ def build_optimizer(
 
 # ========================= CLI / training =========================
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--optimizer", required=True,
-                   choices=["gnome", "soap", "adamw"])
-    p.add_argument("--arch",
-                   choices=["mlp", "modified", "fused", "fused-modified"],
-                   default="modified",
-                   help="Network: plain tanh MLP, the gated modified MLP "
-                        "(Wang et al. 2021), or 'fused' — the plain MLP with "
-                        "[W|b] merged per layer and hidden layers grouped "
-                        "per --fuse-every. --hidden / --depth control all "
-                        "three.")
-    p.add_argument("--fuse-every", type=int, default=0,
-                   help="--arch fused only: consecutive hidden layers per "
-                        "parameter tensor. 1 = one tensor per layer, the "
-                        "control every larger value is compared against "
-                        "(identical function and initialization, only the "
-                        "grouping differs). 0 (default) fuses the whole "
-                        "stack. Note --depth 4 leaves only k=2 hidden layers "
-                        "to group, so raise --depth to give this room.")
-    p.add_argument("--embed", choices=["none", "periodic", "polynomial", "fourier"],
-                   default="none",
-                   help="Input embedding. 'none' feeds raw [t, x] and keeps "
-                        "the soft periodic BC block. 'periodic' feeds "
-                        "[t, cos(pi x), sin(pi x)], making the network "
-                        "exactly period-2 in x — periodicity then holds for "
-                        "every derivative and the BC block is DROPPED (two "
-                        "blocks instead of three). 'polynomial' feeds "
-                        "[t, 1-x^2, x(1-x^2)]; endpoint values match, but "
-                        "derivatives need not, so it keeps the BC block. "
-                        "'fourier' feeds trainable "
-                        "Fourier features [sin(zB), cos(zB)] over raw "
-                        "z = [t, x]; not exactly periodic, so it KEEPS the "
-                        "BC block. See --embed-dim / --embed-scale.")
-    p.add_argument("--embed-dim", type=int, default=256,
-                   help="Fourier feature output dim (even). --embed fourier.")
-    p.add_argument("--embed-scale", type=float, default=10.0,
-                   help="Init bandwidth of the Fourier frequencies: "
-                        "B ~ N(0, scale^2). B is trained, so this is the "
-                        "starting point, not a fixed bandwidth — but a high "
-                        "init still gives a rough surface to start from. "
-                        "Sweep it. --embed fourier.")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--steps", type=int, default=100_000,
-                   help="Allen-Cahn is stiff; may want more than the default.")
-    p.add_argument("--n-pde", type=int, default=4000)
-    p.add_argument("--n-ic", type=int, default=200)
-    p.add_argument("--n-bc", type=int, default=200)
-    p.add_argument("--fixed-dataset", action="store_true",
-                   help="Reuse the same PDE/IC/BC training points every step for any optimizer. "
-                        "Gnome draws fresh auxiliary subsets; validation still resamples.")
-    p.add_argument("--aux-frac", type=float, default=0.25,
-                   help="Aux batch sizes for Gnome are max(K_min, int(N * "
-                        "aux_frac)) per block. Each aux pass is a full "
-                        "higher-order residual eval, so keep small. With "
-                        "--fixed-dataset, sizes are capped at N and aux_frac "
-                        "must be in (0,1].")
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
-                        "damping.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature-damping epsilon in m̂/(v̂+eps): larger "
-                        "-> more gradient-descent-like, smaller -> fuller Newton "
-                        "step. Allen-Cahn's canyon geometry may want it larger "
-                        "than the 1e-6 default. Gnome only; SOAP/AdamW keep "
-                        "eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.99,
-                   help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.999,
-                   help="Second-moment / preconditioner EMA (also shampoo_beta) "
-                        "for Gnome and SOAP.")
-    p.add_argument("--weight-decay", type=float, default=1e-8)
-    p.add_argument("--hidden", type=int, default=256, help="Network width.")
-    p.add_argument("--depth", type=int, default=4,
-                   help="Network depth: Linear-layer count for --arch mlp, "
-                        "number of gated hidden layers for --arch modified.")
-    p.add_argument("--warmup-steps", type=int, default=200,
-                   help="Linear LR warmup steps, applied to every optimizer.")
-    p.add_argument("--cosine-decay", type=float, default=0.0,
-                   help="Final-LR fraction for the baseline cosine decay: 0.0 "
-                        "decays to zero (standard treatment), 1.0 disables "
-                        "decay. Gnome (MSE) never decays regardless.")
-    precision = p.add_mutually_exclusive_group()
-    precision.add_argument("--float64", action="store_true",
-                   help="Run in double precision. Allen-Cahn's stiff canyon "
-                        "geometry can push the residual below the float32 "
-                        "floor (~1e-6 relative), where the Gauss-Newton "
-                        "curvature estimate is reading round-off; float64 "
-                        "moves that floor out of the way. MPS has no double "
-                        "support, so this falls back to CPU there.")
-    precision.add_argument("--float64-after", type=int, metavar="N",
-                           help="Switch to float64 after N float32 steps, "
-                                "preserving optimizer state and LR schedule. "
-                                "Requires 0 <= N < --steps; 0 starts in "
-                                "float64. MPS moves to CPU at the switch.")
-    p.add_argument(
-        "--reference",
-        choices=["jaxpi", "highres"],
-        default="jaxpi",
-        help="Reference used for rel_l2. 'jaxpi' is the published 201x512 "
-             "Chebfun table and remains the compatibility default. "
-             "'highres' uses experiments/reference_solutions/"
-             "allen_cahn_highres.mat and generates it automatically when "
-             "missing.",
-    )
-    p.add_argument("--diagnostics-every", type=int, default=0,
-                   help="Log Gnome's internal state — curvature spectrum, LM "
-                        "damping, trust-region usage — every N steps to a "
-                        "sibling runs/.../{run_id}.diag.jsonl. 0 (default) "
-                        "disables it entirely. Gnome only: SOAP and AdamW "
-                        "expose no such hook.")
-    p.add_argument("--diagnostics-params", type=str, default=None,
-                   help="Comma-separated parameter indices to log, e.g. "
-                        "'0,4'. Default logs every parameter, which is one "
-                        "record per tensor per logged step — narrow it to "
-                        "keep the file readable.")
-    p.add_argument("--log-every", type=int, default=200)
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
     args = p.parse_args(argv)
     if min(args.steps, args.n_pde, args.n_ic, args.n_bc) < 1:
         p.error("steps and collocation counts must be positive")

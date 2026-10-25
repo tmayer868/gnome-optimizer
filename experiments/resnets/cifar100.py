@@ -30,10 +30,14 @@ where Gnome's step self-anneals as the residual shrinks: cross-entropy
 gradients do not self-anneal, since the Fisher stays O(1) at the optimum rather
 than going to zero.
 
-    uv run python -m experiments.resnets.cifar100 --optimizer gnome_hutchinson --seed 0
-    uv run python -m experiments.resnets.cifar100 --optimizer gnome_fisher     --seed 0
-    uv run python -m experiments.resnets.cifar100 --optimizer soap             --seed 0
-    uv run python -m experiments.resnets.cifar100 --optimizer adamw            --seed 0
+    # Edit experiments/configs/resnets/cifar100.py: optimizer='gnome_hutchinson', seed=0
+    uv run python -m experiments.resnets.cifar100
+    # Edit experiments/configs/resnets/cifar100.py: optimizer='gnome_fisher', seed=0
+    uv run python -m experiments.resnets.cifar100
+    # Edit experiments/configs/resnets/cifar100.py: optimizer='soap', seed=0
+    uv run python -m experiments.resnets.cifar100
+    # Edit experiments/configs/resnets/cifar100.py: optimizer='adamw', seed=0
+    uv run python -m experiments.resnets.cifar100
 
 Gnome's and SOAP's convolution-factor partition can be selected independently:
 
@@ -439,63 +443,10 @@ def main():
           f"mean={mean_step_time_ms:.1f} ms/step", flush=True)
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--optimizer", required=True,
-                   choices=["gnome_fisher", "gnome_hutchinson", "soap", "adamw"])
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--batch-size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--trust-region", type=float, default=1.0,
-                   help="Gnome per-coordinate update bound: lambda is set to "
-                        "the smallest value with max|m̂/(v̂+lambda)| <= this, "
-                        "so no coordinate moves more than lr*trust_region in "
-                        "a step. Larger -> weaker bound -> longer steps. "
-                        "0 disables it, falling back to plain m̂/(v̂+eps) "
-                        "damping.")
-    p.add_argument("--eps", type=float, default=1e-6,
-                   help="Gnome curvature-damping epsilon; with the trust region "
-                        "active this is only the lower bound on lambda, so it "
-                        "can go much smaller than the pre-trust-region default. "
-                        "Gnome only; SOAP/AdamW keep their fixed eps=1e-8.")
-    p.add_argument("--beta1", type=float, default=0.9,
-                   help="First-moment (momentum) EMA for Gnome and SOAP.")
-    p.add_argument("--beta2", type=float, default=0.99,
-                   help="Second-moment / preconditioner EMA (also shampoo_beta) "
-                        "for Gnome and SOAP.")
-    p.add_argument("--weight-decay", type=float, default=0.01)
-    p.add_argument("--aux-batch-size", type=int, default=10,
-                   help="Aux batch K for the Gnome surrogate, drawn as a subset "
-                        "of the main batch. Cheap here: the Hutchinson "
-                        "surrogate's per-sample tensor is only (K, 100).")
-    p.add_argument(
-        "--merge-dims",
-        choices=tuple(MERGE_DIMS_MODES),
-        default="none",
-        help="Gnome/SOAP convolution-factor grouping: 'none'=[O][I][H][W], "
-             "'greedy'=existing size-bounded merge, 'spatial'=[O][I][HW], "
-             "or 'patch'=[O][IHW]. Ignored by AdamW.",
-    )
-    p.add_argument("--model", choices=MODEL_NAMES, default="resnet12",
-                   help="Architecture (default resnet12).")
-    p.add_argument("--norm", choices=["gn", "bn"], default="gn",
-                   help="Normalization: GroupNorm (default) or BatchNorm. "
-                        "GroupNorm keeps the per-sample block structure the "
-                        "surrogate assumes (see docs/method.md 5.3).")
-    p.add_argument("--no-augment", action="store_true",
-                   help="Disable flip + random-crop augmentation.")
-    p.add_argument("--warmup-steps", type=int, default=200,
-                   help="LR warmup steps, applied to every optimizer including "
-                        "Gnome (CCE does not self-anneal).")
-    p.add_argument("--lr-min-frac", type=float, default=0.1,
-                   help="Cosine floor: final lr as a fraction of peak.")
-    p.add_argument("--log-every", type=int, default=50,
-                   help="Print a running-mean train loss every N steps (0 "
-                        "disables). Per-step train loss is logged regardless.")
-    p.add_argument("--runs-dir", type=str, default="runs")
-    p.add_argument("--quiet", action="store_true")
-    return p.parse_args()
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
 
 
 if __name__ == "__main__":
