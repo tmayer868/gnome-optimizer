@@ -8,6 +8,50 @@ first use, and subsequent runs reuse the matching local cache.
 Closed-form analytic references remain defined in their experiment source, and
 training datasets remain under `experiments/data/`.
 
+## Allen–Cahn
+
+The existing `allen_cahn_highres.mat` contains 4,095 periodic Fourier points
+plus a duplicated endpoint, at 201 times on `[0, 1]`. A refinement study on
+2026-11-07 generated `allen_cahn_highres_8191.mat` and
+`allen_cahn_highres_8191_tight.mat`, each with 8,191 periodic points plus the
+duplicated endpoint. The original cache is retained; `reference="highres"`
+now selects `allen_cahn_highres_8191_tight.mat` for evaluation during training.
+
+Both refined solves use the existing Fourier-collocation/DOP853 solver.
+The standard solve uses `rtol=2e-11`, `atol=2e-13`; the tight solve uses
+`rtol=2e-13`, `atol=2e-15`. They use the same 201 time samples as the original.
+Results and artifact hashes are recorded in
+[`allen_cahn_8191_validation.json`](allen_cahn_8191_validation.json).
+
+| Comparison | Relative L2 difference |
+| --- | ---: |
+| 2,047 vs 4,095 points, excluding initial time | 5.84794e-7 |
+| 4,095 vs 8,191 points, excluding initial time | 1.44738e-7 |
+| 4,095 vs 8,191 points, times at least 0.1 | 3.78184e-8 |
+| Worst individual time slice, 4,095 vs 8,191, at t=0.005 | 1.77828e-6 |
+| Standard vs tight integration tolerances at 8,191 points | 4.82010e-14 |
+
+Spatial comparisons interpolate the coarse solution onto the fine periodic
+grid with Fourier resampling. Initial time is excluded because its exact
+analytic values are available; interpolating its nonsmooth periodic extension
+would introduce a separate interpolation error. On the original runner's
+201-by-4,096 grid, the difference from the refined tight solution is about
+1.55527e-7, using analytic values at initial time and the duplicated endpoint.
+
+The spatial refinement differences shrink by a factor of 4.04. Assuming that
+trend continues gives an estimated remaining aggregate relative L2 error of
+about 4.76e-8 for the 8,191-point reference. This is an asymptotic estimate,
+not a certified error bound or a guarantee for individual early-time slices.
+The tolerance check shows negligible sensitivity to the requested integration
+tolerances compared with the spatial refinement differences.
+
+For evaluation of an already available model, load the tight artifact with
+`allen_cahn_reference(cache_path="experiments/reference_solutions/allen_cahn_highres_8191_tight.mat", reference="highres")`.
+The runner's `reference="highres"` setting loads this same tight artifact by
+default. If missing, it generates 8,191 points at `rtol=2e-13`, `atol=2e-15`,
+with a 4,095-point convergence check. The standalone generator has matching
+defaults. Historical 4,095-point results remain tied to the original cache.
+
 ## Ginzburg–Landau
 
 `experiments.pinns.generate_ginzburg_landau_reference` generates a complex128

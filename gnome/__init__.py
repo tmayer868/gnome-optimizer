@@ -2,7 +2,6 @@
 
 from gnome.blocks import stack_residuals
 from gnome.diagnostics import (
-    DEFAULT_METRICS,
     CollectDiagnostics,
     JsonlDiagnostics,
     PrintDiagnostics,
@@ -14,7 +13,6 @@ from gnome.rho import format_records, measure_rho
 __all__ = [
     "Gnome",
     "stack_residuals",
-    "DEFAULT_METRICS",
     "PrintDiagnostics",
     "JsonlDiagnostics",
     "CollectDiagnostics",

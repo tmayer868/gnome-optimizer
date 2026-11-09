@@ -59,9 +59,7 @@ def parse_args(argv=None):
     if args.eps is None:
         args.eps = 1e-10 if args.optimizer == "muon" else 1e-8
     if args.embed_lr is None:
-        args.embed_lr = 0.7 if args.optimizer == "muon" else 0.001
-    if args.embedding_optimizer != "same" and not args.optimizer.startswith("gnome"):
-        p.error("--embedding-optimizer adamw requires a Gnome optimizer")
+        args.embed_lr = 0.7
     positive = [*REFERENCE, "steps", "microbatch_size", "aux_batch_size", "log_every",
                 "precondition_frequency", "max_precond_dim"]
     for key in positive:
@@ -79,16 +77,15 @@ def parse_args(argv=None):
         p.error("require 0 <= warmup-steps < steps and 0 <= cooldown-frac <= 1")
     if not 0 <= args.min_lr_frac <= 1:
         p.error("min-lr-frac must be in [0, 1]")
-    for name in ("beta1", "beta2", "shampoo_beta", "muon_momentum", "embed_beta1", "embed_beta2"):
+    for name in ("beta1", "beta2", "shampoo_beta", "muon_momentum"):
         if not 0 <= getattr(args, name) < 1:
             p.error(f"{name} must be in [0, 1)")
     for name in ("lr", "weight_decay", "eps", "trust_region", "max_grad_norm",
-                 "embed_lr", "head_lr", "scalar_lr", "aux_weight_decay", "head_init_std",
-                 "embed_eps", "embed_weight_decay"):
+                 "embed_lr", "head_lr", "scalar_lr", "aux_weight_decay", "head_init_std"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             p.error(f"{name} must be finite and nonnegative")
-    if args.eps == 0 or args.embed_eps == 0:
-        p.error("eps and embed-eps must be positive")
+    if args.eps == 0:
+        p.error("eps must be positive")
     if not 0 <= args.download_shards <= 103:
         p.error("download-shards must be between 0 and 103")
     if args.download_only and not args.download_shards:
@@ -153,17 +150,8 @@ def build_optimizers(model, args, device):
     common = dict(lr=args.lr, weight_decay=args.weight_decay,
                   betas=(args.beta1, args.beta2), eps=args.eps)
     if args.optimizer.startswith("gnome"):
-        parameters = model.parameters()
-        if args.embedding_optimizer == "adamw":
-            parameters = [
-                dict(params=[p for p in model.parameters() if p is not model.embed.weight],
-                     update_rule="gnome"),
-                dict(params=[model.embed.weight], update_rule="adamw", lr=args.embed_lr,
-                     betas=(args.embed_beta1, args.embed_beta2), eps=args.embed_eps,
-                     weight_decay=args.embed_weight_decay),
-            ]
         optimizers = [Gnome(
-            parameters, **common,
+            model.parameters(), **common,
             use_soap_basis=args.use_soap_basis,
             loss="cce_hutchinson" if args.optimizer == "gnome_hutchinson" else "cce",
             shampoo_beta=args.shampoo_beta, precondition_frequency=args.precondition_frequency,
@@ -330,10 +318,6 @@ def run(args):
     print(f"  initialization=reference; head_init_std={args.head_init_std:g}; "
           f"residual_init_std={model.residual_init_std:.6g}; "
           f"embedding_weights={model.embed.weight.dtype}", flush=True)
-    if args.embedding_optimizer == "adamw":
-        print(f"  input embedding optimizer=adamw; lr={args.embed_lr:g}; "
-              f"betas=({args.embed_beta1:g}, {args.embed_beta2:g}); "
-              f"eps={args.embed_eps:g}; weight_decay={args.embed_weight_decay:g}", flush=True)
     with RunLogger(EXPERIMENT, args.optimizer, args.seed, config,
                    runs_dir=str(args.runs_dir), run_id=run_id) as log:
         training_seconds = 0.0
@@ -371,8 +355,6 @@ def run(args):
             training_seconds += elapsed
             completed_steps = step + 1
             log.log_train(completed_steps, loss=loss, lr=args.lr * multiplier,
-                          **({"embedding_lr": args.embed_lr * multiplier}
-                             if args.embedding_optimizer == "adamw" else {}),
                           tokens_seen=completed_steps * args.batch_tokens, step_seconds=elapsed,
                           training_seconds=training_seconds, tokens_per_second=args.batch_tokens / elapsed,
                           auxiliary_tokens_seen=completed_steps * args.aux_batch_size * args.seq_len if extra_pass else 0)

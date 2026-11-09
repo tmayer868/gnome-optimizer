@@ -22,7 +22,8 @@ CONFIG = {
     # Network: plain tanh MLP or the gated modified MLP. Choices: 'mlp', 'modified', 'fused',
     # 'fused-modified'.
     'arch': 'modified',
-    # Input embedding. 'fourier' = trainable Fourier features (the spectral aid wave wants).
+    # 'fourier' applies trainable Fourier features after [t, cos(pi x), sin(pi x)].
+    # Period-2 features do not enforce Dirichlet BCs; use hard_bc or the soft BC loss.
     # Choices: 'none', 'periodic', 'fourier'.
     'embed': 'fourier',
     # Fourier embedding output dim (even). embed fourier.
@@ -38,29 +39,11 @@ CONFIG = {
     # IC points (shared by the displacement and velocity IC blocks).
     'n_ic': 200,
     'n_bc': 200,
-    # Aux batch sizes for Gnome are max(K_min, int(N * aux_frac)) per block. Each aux pass is a
-    # full higher-order residual eval, so keep small.
-    'aux_frac': 0.1,
-    'lr': 0.001,
-    # Gnome per-coordinate update bound: lambda is set to the smallest value with
-    # max|m̂/(v̂+lambda)| <= this, so no coordinate moves more than lr*trust_region in a step.
-    # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain m̂/(v̂+eps)
-    # damping.
-    'trust_region': 1.0,
-    # Gnome curvature-damping epsilon in m̂/(v̂+eps). Gnome only; SOAP/AdamW keep eps=1e-8.
-    'eps': 1e-6,
-    'beta1': 0.9,
-    'beta2': 0.99,
-    'weight_decay': 1e-8,
     # Network width.
     'hidden': 256,
     # Network depth: Linear-layer count for arch mlp, number of gated hidden layers for arch
     # modified.
     'depth': 4,
-    'warmup_steps': 200,
-    # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero, 1.0 disables. Gnome
-    # never decays.
-    'cosine_decay': 0.0,
     # Log Gnome's internal state — curvature spectrum, LM damping, trust-region usage — every N
     # steps to a sibling runs/.../{run_id}.diag.jsonl. 0 (default) disables it entirely. Gnome
     # only: SOAP and AdamW expose no such hook.
@@ -71,4 +54,45 @@ CONFIG = {
     'log_every': 200,
     'runs_dir': 'runs',
     'quiet': False,
+    # Each optimizer keeps its own hyperparameters and learning-rate schedule.
+    'optimizers': {
+        'gnome': {
+            # Aux batch sizes for Gnome are max(K_min, int(N * aux_frac)) per block. Each aux pass is a
+            # full higher-order residual eval, so keep small.
+            'aux_frac': 0.1,
+            'lr': 0.001,
+            # Gnome per-coordinate update bound: lambda is set to the smallest value with
+            # max|m̂/(v̂+lambda)| <= this, so no coordinate moves more than lr*trust_region in a step.
+            # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain m̂/(v̂+eps)
+            # damping.
+            'trust_region': 1.0,
+            # Gnome curvature-damping epsilon in m̂/(v̂+eps). Gnome only; SOAP/AdamW keep eps=1e-8.
+            'eps': 1e-6,
+            'beta1': 0.9,
+            'beta2': 0.99,
+            'weight_decay': 1e-8,
+            'warmup_steps': 200,
+            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero, 1.0 disables. Gnome
+            # never decays.
+            'cosine_decay': 0.0,
+        },
+        'soap': {
+            'lr': 0.001,
+            'beta1': 0.9,
+            'beta2': 0.99,
+            'weight_decay': 1e-8,
+            'warmup_steps': 200,
+            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero, 1.0 disables. Gnome
+            # never decays.
+            'cosine_decay': 0.0,
+        },
+        'adamw': {
+            'lr': 0.001,
+            'weight_decay': 1e-8,
+            'warmup_steps': 200,
+            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero, 1.0 disables. Gnome
+            # never decays.
+            'cosine_decay': 0.0,
+        },
+    },
 }

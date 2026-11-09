@@ -48,19 +48,8 @@ CONFIG = {
     # 0 disables clipping (reference default)
     'max_grad_norm': 0,
     'muon_momentum': 0.95,
-    # For Gnome runs, optionally update input embeddings with AdamW inside Gnome Choices: 'same',
-    # 'adamw'.
-    'embedding_optimizer': 'same',
-    # Embedding AdamW LR (default: 0.7 for Muon, 0.001 for Gnome)
+    # Muon auxiliary AdamW embedding LR (default: 0.7)
     'embed_lr': None,
-    # Gnome embedding AdamW only
-    'embed_beta1': 0.9,
-    # Gnome embedding AdamW only
-    'embed_beta2': 0.999,
-    # Gnome embedding AdamW only
-    'embed_eps': 1e-8,
-    # Gnome embedding AdamW only
-    'embed_weight_decay': 0.0,
     # Muon auxiliary AdamW only
     'head_lr': 0.004,
     # Muon auxiliary AdamW only

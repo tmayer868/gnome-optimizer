@@ -37,8 +37,11 @@ weight`` switches the BC block from equal weighting (the paper's Methods-section
 residual, and Gnome's natural stacking) to the ``|∂Ω| = 2d`` weighting of the
 paper's Background-section loss.
 
-All three optimizers share one plain tanh MLP so the only variable is the
-optimizer. Every optimizer gets the same linear-warmup + cosine-decay schedule
+All optimizers support a plain tanh MLP (``arch='mlp'``, the default) or the
+shared fused MLP (``arch='fused'``). ``fuse_every`` groups consecutive hidden
+layers into parameter tensors: 1 keeps one tensor per layer, 2 groups pairs,
+and 0 groups all hidden layers. Width and depth retain the same meanings.
+Gnome, SOAP, and AdamW get the same linear-warmup + cosine-decay schedule
 (``--cosine-decay`` sets the final-lr fraction; 1.0 gives warmup then constant,
 which suits Gnome on MSE since its step self-anneals as the residual shrinks).
 
@@ -55,14 +58,19 @@ memory), so at the paper's N=3500 it is a Thunder/CUDA job, not a laptop one.
 
 Usage::
 
-    # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='gnome', seed=0, lr=0.01
+    # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='gnome', seed=0
+
+    # In CONFIG["optimizers"]['gnome']: lr=0.01
+    uv run -m experiments.pinns.poisson5d_pinn
+    # Edit experiments/configs/pinns/poisson5d_pinn.py: arch='fused', fuse_every=2
     uv run -m experiments.pinns.poisson5d_pinn
     # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='soap', seed=0
     uv run -m experiments.pinns.poisson5d_pinn
     # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='adamw', seed=0
     uv run -m experiments.pinns.poisson5d_pinn
     # reference natural-gradient line (GPU/float64):
-    # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='engdw', lr=0.052289
+    # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='engdw'
+    # In CONFIG["optimizers"]['engdw']: lr=0.052289
     uv run -m experiments.pinns.poisson5d_pinn
 """
 
@@ -80,7 +88,7 @@ from torch.func import functional_call, jacfwd, jacrev, vmap
 
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
 from experiments.common import FusedLinear
-from experiments.common import MLP as _SharedMLP, ConcatEmbedding
+from experiments.common import MLP as _SharedMLP, ConcatEmbedding, FusedMLP
 from experiments.baselines import ENGDW, SOAP
 from experiments.common import (
     DIVERGED_EXIT,
@@ -114,6 +122,26 @@ class PINN(_SharedMLP):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return super().forward(*x.split(1, dim=-1))
+
+
+class FusedPINN(FusedMLP):
+    """Shared fused MLP accepting the benchmark's single ``(batch, d)`` input."""
+
+    def __init__(self, d_in: int, hidden: int = 64, depth: int = 5, fuse_every: int = 0):
+        super().__init__(ConcatEmbedding(d_in), hidden=hidden, depth=depth,
+                         fuse_every=fuse_every)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(*x.split(1, dim=-1))
+
+
+def build_model(arch: str, d_in: int, hidden: int = 64, depth: int = 5,
+                fuse_every: int = 0) -> nn.Module:
+    if arch == "mlp":
+        return PINN(d_in, hidden=hidden, depth=depth)
+    if arch == "fused":
+        return FusedPINN(d_in, hidden=hidden, depth=depth, fuse_every=fuse_every)
+    raise ValueError(f"unknown arch: {arch}")
 
 
 # ========================= Exact solution + forcing =========================
@@ -329,7 +357,12 @@ def build_optimizer(
 def parse_args(argv=None) -> argparse.Namespace:
     from experiments.common.config import ConfigParser
     p = ConfigParser(__file__)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.d < 1 or args.hidden < 1 or args.depth < 2:
+        p.error("d and hidden must be positive; depth must be at least 2")
+    if args.fuse_every < 0:
+        p.error("fuse_every must be nonnegative (0 fuses all hidden layers)")
+    return args
 
 
 def train(args: argparse.Namespace) -> str:
@@ -355,7 +388,8 @@ def train(args: argparse.Namespace) -> str:
         if not args.quiet:
             print(f"[{EXPERIMENT}] float64 requested; MPS has no float64 "
                   f"— falling back to CPU.", flush=True)
-    model = PINN(args.d, hidden=args.hidden, depth=args.depth).to(device=device, dtype=dtype)
+    model = build_model(args.arch, args.d, hidden=args.hidden, depth=args.depth,
+                        fuse_every=args.fuse_every).to(device=device, dtype=dtype)
 
     if args.optimizer == "engdw":
         residual_fn = make_functional_residual(model, args.d, bcw)
@@ -371,7 +405,7 @@ def train(args: argparse.Namespace) -> str:
             warmup=args.warmup_steps, total_steps=args.steps,
             cosine_decay=args.cosine_decay, eps=args.eps,
             beta1=args.beta1, beta2=args.beta2,
-        trust_region=args.trust_region,
+            trust_region=args.trust_region,
         )
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -380,6 +414,8 @@ def train(args: argparse.Namespace) -> str:
         # Non-zero means a sibling {run_id}.diag.jsonl exists.
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
+        "arch": args.arch,
+        "fuse_every": getattr(model, "chunks", None),
         "steps": args.steps,
         "dtype": args.dtype,
         "d": args.d,
@@ -422,14 +458,10 @@ def train(args: argparse.Namespace) -> str:
             os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
         )
         diag = JsonlDiagnostics(diag_path, params=diag_params)
-        # Plain attributes, so this attaches to the already-built optimizer —
-        # which is what lets the file be named after the run id.
-        opt.diagnostics = diag
-        opt.diagnostics_every = args.diagnostics_every
 
     if not args.quiet:
         print(
-            f"[{EXPERIMENT}] {args.optimizer} | d={args.d} | params={n_params:,} | "
+            f"[{EXPERIMENT}] {args.optimizer} | arch={args.arch} | d={args.d} | params={n_params:,} | "
             f"dtype={args.dtype} | device={device}\n"
             f"  N_int={args.n_int} N_bc={args.n_bc} | "
             f"aux={args.aux_n_int}/{args.aux_n_bc} | "
@@ -473,6 +505,11 @@ def train(args: argparse.Namespace) -> str:
             loss = (r ** 2).sum() / r.shape[0]
             loss.backward()
             opt.step()
+
+        if (diag is not None and args.optimizer == "gnome"
+                and (step + 1) % args.diagnostics_every == 0):
+            for record in opt.get_diagnostics(params=diag.params):
+                diag(record)
 
         if scheduler is not None:
             scheduler.step()

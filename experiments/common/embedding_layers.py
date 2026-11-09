@@ -133,12 +133,16 @@ class PeriodicEmbedding(nn.Module):
 
 
 class TrainableFourierEmbedding(nn.Module):
-    """Trainable random Fourier features over concatenated coordinates.
+    """Trainable Fourier features over fixed periodic coordinate features.
 
-    For raw coordinates ``z``, returns ``[sin(zB), cos(zB)]`` with
+    First apply :class:`PeriodicEmbedding` (by default, ``(t, x)`` becomes
+    ``z = [t, cos(pi*x), sin(pi*x)]``), then return ``[sin(zB), cos(zB)]`` with
     ``B ~ N(0, scale^2)`` at initialization. ``B`` is an ``nn.Parameter`` and
-    therefore trains with the rest of the model. Set ``include_input=True``
-    to prepend the raw coordinates to the Fourier features.
+    trains with the model, while periodicity is preserved for any value of B.
+    Set ``include_input=True`` to prepend the *periodic features* z, never
+    the raw periodic coordinates. ``embed_dim`` counts only Fourier features.
+    Periodic coordinates and all their derivatives repeat with period
+    ``2*pi/wavenumber`` (up to floating-point roundoff).
     """
 
     def __init__(
@@ -148,6 +152,9 @@ class TrainableFourierEmbedding(nn.Module):
         scale: float = 10.0,
         *,
         include_input: bool = False,
+        n_harmonics: int = 1,
+        wavenumber: float = math.pi,
+        periodic_dims: Sequence[int] = (1,),
     ):
         super().__init__()
         if n_inputs < 1:
@@ -163,21 +170,21 @@ class TrainableFourierEmbedding(nn.Module):
         self.embed_dim = embed_dim
         self.scale = float(scale)
         self.include_input = include_input
-        self.out_dim = embed_dim + (n_inputs if include_input else 0)
-        self.B = nn.Parameter(torch.randn(n_inputs, embed_dim // 2) * scale)
+        self.periodic = PeriodicEmbedding(
+            n_inputs, n_harmonics=n_harmonics, wavenumber=wavenumber,
+            periodic_dims=periodic_dims,
+        )
+        self.out_dim = embed_dim + (self.periodic.out_dim if include_input else 0)
+        self.B = nn.Parameter(torch.randn(self.periodic.out_dim, embed_dim // 2) * scale, requires_grad=False)
 
     def forward(self, *coords: torch.Tensor) -> torch.Tensor:
-        if len(coords) != self.n_inputs:
-            raise ValueError(
-                f"expected {self.n_inputs} coordinate tensors, got {len(coords)}"
-            )
-        raw = torch.cat(coords, dim=1)
-        projection = raw @ self.B
+        periodic = self.periodic(*coords)
+        projection = periodic @ self.B
         fourier = torch.cat(
             [torch.sin(projection), torch.cos(projection)], dim=1
         )
         if self.include_input:
-            return torch.cat([raw, fourier], dim=1)
+            return torch.cat([periodic, fourier], dim=1)
         return fourier
 
 

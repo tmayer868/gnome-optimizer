@@ -1,4 +1,4 @@
-"""(2+1)D viscous Burgers PINN: AdamW vs SOAP vs Gnome.
+"""(2+1)D viscous Burgers PINN: AdamW vs SOAP vs Gnome vs ENGD-W.
 
 PDE:  u_t + f(u)_x + g(u)_y = ν·(u_xx + u_yy),   f(u) = g(u) = u²/2
       ⇔  u_t + u·u_x + u·u_y = ν·(u_xx + u_yy)
@@ -31,10 +31,16 @@ block weights, so the multi-block MSE ``L = mse(pde) + mse(ic) + mse(bc)``
 rides Gnome's single-MSE surrogate and the resulting probe is the per-block
 independent Rademacher GGN estimator.
 
-All three optimizers share one plain tanh MLP so the only variable is the
-optimizer. Every optimizer gets the same linear-warmup + cosine-decay schedule
+All optimizers share one plain tanh MLP. AdamW, SOAP, and Gnome use a
+linear-warmup + cosine-decay schedule
 (``--cosine-decay`` sets the final-lr fraction; 1.0 gives warmup then constant,
 which suits Gnome on MSE since its step self-anneals as the residual shrinks).
+
+ENGD-W uses float64, fixed damping, and no weight decay or LR schedule.
+Its residual blocks are scaled by 1/sqrt(N_block). Optional momentum,
+same-batch grid line search, and fixed collocation are configured in the
+``optimizers['engdw']`` block. The dense solve uses all residual rows;
+``engdw_chunk`` limits Jacobian evaluation chunks, not the solve size.
 
 **Reference architecture.** The paper gives "10 hidden layers, tanh" and a
 parameter count of 3881, which pins the width exactly: with 3 inputs and 1
@@ -72,6 +78,9 @@ Usage::
     uv run -m experiments.pinns.burgers2d_pinn
     # Edit experiments/configs/pinns/burgers2d_pinn.py: optimizer='adamw', seed=0
     uv run -m experiments.pinns.burgers2d_pinn
+    # ENGD-W: start with small batches for the dense solve.
+    # Edit CONFIG: optimizer='engdw', n_pde=128, n_ic=32, n_bc=32, steps=1000
+    uv run -m experiments.pinns.burgers2d_pinn
     # paper protocol (20k iters, float64):
     # Edit experiments/configs/pinns/burgers2d_pinn.py: optimizer='gnome', dtype='float64'
     uv run -m experiments.pinns.burgers2d_pinn
@@ -80,15 +89,17 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import time
 
 import torch
 import torch.autograd as autograd
 import torch.nn as nn
+from torch.func import functional_call, jacrev, vmap
 
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
-from experiments.baselines import SOAP
+from experiments.baselines import ENGDW, SOAP
 from experiments.common import (
     DIVERGED_EXIT,
     diverged,
@@ -211,6 +222,11 @@ def sample_batch(
     return (t_pde, x_pde, y_pde), (x_ic, y_ic), (t_bc, x_bc, y_bc)
 
 
+def residual_partition_sizes(batch) -> list[int]:
+    """One scalar residual per point in each actual auxiliary block."""
+    return [coords[0].numel() for coords in batch]
+
+
 def stacked_residuals(model: nn.Module, batch) -> torch.Tensor:
     """Per-block residuals stacked via ``stack_residuals`` (equal weights)."""
     pde, ic, bc = batch
@@ -219,6 +235,53 @@ def stacked_residuals(model: nn.Module, batch) -> torch.Tensor:
         ic_residual(model, *ic),
         bc_residual(model, *bc),
     ])
+
+
+def make_engdw_functions(model: nn.Module, chunk_size: int = 32):
+    """Functional residual/Jacobian with ||r||² equal to sum of block MSEs.
+
+    Parameter derivatives include both factors of u * (u_x + u_y) and both
+    spatial second derivatives. IC and all four boundary faces use the same
+    exact solution as the autograd training path.
+    """
+    def u_single(params, txy):
+        return functional_call(
+            model, params, tuple(txy[i:i + 1].reshape(1, 1) for i in range(3))
+        ).squeeze()
+
+    gradient = jacrev(u_single, argnums=1)
+    hessian = jacrev(gradient, argnums=1)
+
+    def pde_single(params, txy):
+        du = gradient(params, txy)
+        d2u = hessian(params, txy)
+        return (du[0] + u_single(params, txy) * (du[1] + du[2])
+                - NU * (d2u[1, 1] + d2u[2, 2]))
+
+    def data_single(params, txy):
+        return u_single(params, txy) - exact_solution(*txy.unbind())
+
+    def points(batch):
+        pde, (x_ic, y_ic), bc = batch
+        return (torch.cat(pde, 1),
+                torch.cat((torch.zeros_like(x_ic), x_ic, y_ic), 1),
+                torch.cat(bc, 1))
+
+    functions = (pde_single, data_single, data_single)
+
+    def residual(params, batch):
+        blocks = [vmap(fn, in_dims=(None, 0), chunk_size=chunk_size)(params, pts)
+                  / math.sqrt(len(pts)) for fn, pts in zip(functions, points(batch))]
+        return torch.cat(blocks).unsqueeze(1)
+
+    def jacobian(params, batch):
+        blocks = []
+        for fn, pts in zip(functions, points(batch)):
+            j = vmap(jacrev(fn), in_dims=(None, 0), chunk_size=chunk_size)(params, pts)
+            blocks.append({k: v / math.sqrt(len(pts)) for k, v in j.items()})
+        return {k: torch.cat([block[k] for block in blocks]) for k in params}
+
+    return residual, jacobian
 
 
 def term_losses(model: nn.Module, batch) -> dict[str, float]:
@@ -326,13 +389,30 @@ def build_optimizer(
 def parse_args(argv=None) -> argparse.Namespace:
     from experiments.common.config import ConfigParser
     p = ConfigParser(__file__)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    for name in ("steps", "n_pde", "n_ic", "n_bc", "hidden", "depth", "n_eval_t", "n_eval_x"):
+        if getattr(args, name) <= 0:
+            p.error(f"{name} must be positive")
+    if args.engdw_fixed and args.optimizer != "engdw":
+        p.error("engdw_fixed requires optimizer='engdw'")
+    if args.diagnostics_every > 0 and args.optimizer != "gnome":
+        p.error("diagnostics_every is Gnome-only")
+    if args.optimizer == "engdw":
+        if not math.isfinite(args.engdw_damping) or args.engdw_damping <= 0:
+            p.error("engdw_damping must be finite and positive")
+        if not 0 <= args.engdw_momentum < 1:
+            p.error("engdw_momentum must be in [0, 1)")
+        if args.engdw_chunk < 1:
+            p.error("engdw_chunk must be positive")
+        if not math.isfinite(args.lr) or args.lr < 0:
+            p.error("lr must be finite and nonnegative")
+    return args
 
 
 def train(args: argparse.Namespace) -> str:
     torch.manual_seed(args.seed)
     device = pick_device()
-    dtype = getattr(torch, args.dtype)
+    dtype = torch.float64 if args.optimizer == "engdw" else getattr(torch, args.dtype)
     if device.type == "mps" and dtype is torch.float64:
         device = torch.device("cpu")            # MPS has no float64
         if not args.quiet:
@@ -340,25 +420,41 @@ def train(args: argparse.Namespace) -> str:
                   f"— falling back to CPU.", flush=True)
 
     model = PINN(hidden=args.hidden, depth=args.depth).to(device=device, dtype=dtype)
-    opt, opt_cfg, scheduler = build_optimizer(
-        args.optimizer, model.parameters(), args.lr, args.weight_decay,
-        warmup=args.warmup_steps, total_steps=args.steps,
-        cosine_decay=args.cosine_decay, eps=args.eps,
-        beta1=args.beta1, beta2=args.beta2,
-        trust_region=args.trust_region,
-    )
+    if args.optimizer == "engdw":
+        residual, jacobian = make_engdw_functions(model, args.engdw_chunk)
+        opt = ENGDW(model, residual, jacobian_fn=jacobian, lr=args.lr,
+                    damping=args.engdw_damping, momentum=args.engdw_momentum,
+                    line_search=args.engdw_line_search, chunk_size=args.engdw_chunk)
+        opt_cfg = dict(lr=args.lr, damping=args.engdw_damping, momentum=args.engdw_momentum,
+                       line_search=args.engdw_line_search,
+                       ls_grid=opt.ls_grid if args.engdw_line_search else None,
+                       chunk_size=args.engdw_chunk, schedule="none", weight_decay=0.0,
+                       energy="0.5 * sum(block MSEs)", residual_scaling="1/sqrt(N_block)",
+                       jacobian="vmap(jacrev(single_residual))")
+        scheduler = None
+    else:
+        opt, opt_cfg, scheduler = build_optimizer(
+            args.optimizer, model.parameters(), args.lr, args.weight_decay,
+            warmup=args.warmup_steps, total_steps=args.steps,
+            cosine_decay=args.cosine_decay, eps=args.eps,
+            beta1=args.beta1, beta2=args.beta2,
+            trust_region=args.trust_region,
+        )
 
-    n_pde_aux = max(8, int(args.n_pde * args.aux_frac))
-    n_ic_aux = max(2, int(args.n_ic * args.aux_frac))
-    n_bc_aux = max(2, int(args.n_bc * args.aux_frac))
+    n_pde_aux = max(8, int(args.n_pde * args.aux_frac)) if args.optimizer == "gnome" else 0
+    n_ic_aux = max(2, int(args.n_ic * args.aux_frac)) if args.optimizer == "gnome" else 0
+    n_bc_aux = max(2, int(args.n_bc * args.aux_frac)) if args.optimizer == "gnome" else 0
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
         # Non-zero means a sibling {run_id}.diag.jsonl exists.
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
+        "partition_residuals": args.optimizer == "gnome" and args.partition_residuals,
         "steps": args.steps,
-        "dtype": args.dtype,
+        "dtype": str(dtype).removeprefix("torch."),
+        "sampling": "fixed" if args.engdw_fixed else "resample_each_step",
+        "fixed_dataset": args.engdw_fixed,
         "hidden": args.hidden,
         "depth": args.depth,
         "n_pde": args.n_pde,
@@ -401,15 +497,11 @@ def train(args: argparse.Namespace) -> str:
             os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
         )
         diag = JsonlDiagnostics(diag_path, params=diag_params)
-        # Plain attributes, so this attaches to the already-built optimizer —
-        # which is what lets the file be named after the run id.
-        opt.diagnostics = diag
-        opt.diagnostics_every = args.diagnostics_every
 
     if not args.quiet:
         print(
             f"[{EXPERIMENT}] {args.optimizer} | params={n_params:,} | "
-            f"nu={NU} | dtype={args.dtype} | device={device}\n"
+            f"nu={NU} | dtype={dtype} | device={device}\n"
             f"  N_pde={args.n_pde} N_ic={args.n_ic} N_bc={args.n_bc} | "
             f"aux={n_pde_aux}/{n_ic_aux}/{n_bc_aux} | steps={args.steps}",
             flush=True,
@@ -426,8 +518,10 @@ def train(args: argparse.Namespace) -> str:
     last_pde = last_ic = last_bc = float("nan")
     best_avg = best_rel_l2 = float("inf")
 
+    fixed_batch = (sample_batch(args.n_pde, args.n_ic, args.n_bc, device, dtype)
+                   if args.engdw_fixed else None)
     for step in range(args.steps):
-        main_batch = sample_batch(
+        main_batch = fixed_batch if fixed_batch is not None else sample_batch(
             args.n_pde, args.n_ic, args.n_bc, device, dtype)
         if args.optimizer == "gnome":
             aux_batch = sample_batch(
@@ -441,7 +535,14 @@ def train(args: argparse.Namespace) -> str:
                 r = stacked_residuals(model, aux_batch)
                 return r, torch.zeros_like(r)
 
-            loss = opt.step(main_closure, aux_closure)
+            loss = opt.step(
+                main_closure, aux_closure,
+                surrogate_partition_sizes=(
+                    residual_partition_sizes(aux_batch) if args.partition_residuals else None
+                ),
+            )
+        elif args.optimizer == "engdw":
+            loss = opt.step(main_batch)
         else:
             opt.zero_grad()
             r = stacked_residuals(model, main_batch)
@@ -450,20 +551,26 @@ def train(args: argparse.Namespace) -> str:
             loss.backward()
             opt.step()
 
+        if (diag is not None and args.optimizer == "gnome"
+                and (step + 1) % args.diagnostics_every == 0):
+            for record in opt.get_diagnostics(params=diag.params):
+                diag(record)
+
+        applied_lr = current_lr(opt)
         if scheduler is not None:
             scheduler.step()
 
-        loss_val = float(loss.detach().item())
+        loss_val = float(loss.detach().item()) if torch.is_tensor(loss) else float(loss)
         if diverged(loss_val):
             if diag is not None:
                 diag.close()
             run.finish(completed=False, diverged=True, diverged_step=step)
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
             raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=loss_val)
+        run.log_train(step, loss=loss_val, lr=applied_lr)
         window.append(loss_val)
 
-        if args.log_every and (step + 1) % args.log_every == 0:
+        if (args.log_every and (step + 1) % args.log_every == 0) or step + 1 == args.steps:
             tl = term_losses(model, sample_batch(
                 args.n_pde, args.n_ic, args.n_bc, device, dtype))
             rl2 = eval_rel_l2(model, eval_coords, u_ref)

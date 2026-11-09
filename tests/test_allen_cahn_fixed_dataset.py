@@ -33,9 +33,12 @@ def test_auxiliary_subsets_preserve_pairs_and_sample_without_replacement():
 
 
 @pytest.mark.parametrize("optimizer", ["gnome", "soap", "adamw"])
-@pytest.mark.parametrize("embed", ["none", "periodic"])
-@pytest.mark.parametrize("fixed", [False, True])
-def test_training_sampling_and_precision_switch(tmp_path, monkeypatch, optimizer, embed, fixed):
+@pytest.mark.parametrize("embed", ["none", "periodic", "fourier"])
+@pytest.mark.parametrize("fixed,fix_after", [
+    (False, None), (True, None), (False, 0), (False, 1),
+    (False, 2), (False, 3), (True, 2),
+])
+def test_training_sampling_and_precision_switch(tmp_path, monkeypatch, optimizer, embed, fixed, fix_after):
     monkeypatch.setattr(ac, "pick_device", lambda: torch.device("cpu"))
     monkeypatch.setattr(ac, "allen_cahn_reference", lambda **kw: (
         torch.linspace(0, 1, 3), torch.linspace(-1, 1, 3), torch.ones(3, 3),
@@ -45,7 +48,7 @@ def test_training_sampling_and_precision_switch(tmp_path, monkeypatch, optimizer
 
     def capture_residuals(model, batch, use_bc):
         training.append(tuple(t.clone() for t in batch))
-        assert use_bc == (embed != "periodic")
+        assert use_bc == (embed not in ("periodic", "fourier"))
         return residuals(model, batch, use_bc)
 
     def capture_terms(model, batch):
@@ -54,42 +57,63 @@ def test_training_sampling_and_precision_switch(tmp_path, monkeypatch, optimizer
 
     monkeypatch.setattr(ac, "stacked_residuals", capture_residuals)
     monkeypatch.setattr(ac, "term_losses", capture_terms)
-    args = ac.parse_args(config_overrides(ac, [
+    overrides = config_overrides(ac, [
         "--optimizer", optimizer, "--embed", embed, "--hidden", "4", "--depth", "3",
-        "--steps", "3", "--float64-after", "1", "--log-every", "1",
+        "--steps", "4", "--float64-after", "2", "--log-every", "1",
         "--n-pde", "5", "--n-ic", "3", "--n-bc", "1",
         "--runs-dir", str(tmp_path), "--quiet",
-    ] + (["--fixed-dataset"] if fixed else [])))
+    ])
+    overrides.update(fixed_dataset=fixed, fix_after=fix_after, float64=False,
+                     embed_dim=4, embed_scale=1.0,
+                     aux_frac=0.25, reference="jaxpi")
+    args = ac.parse_args(overrides)
     with open(ac.train(args)) as stream:
         records = [json.loads(line) for line in stream]
 
     main_batches = training[::2] if optimizer == "gnome" else training
-    assert len(main_batches) == 3
+    fixed_from = 0 if fixed else fix_after
+    assert len(main_batches) == 4
     assert [batch[0].dtype for batch in main_batches] == [
-        torch.float32, torch.float64, torch.float64,
+        torch.float32, torch.float32, torch.float64, torch.float64,
     ]
-    for batch in main_batches[1:]:
-        for original, current in zip(main_batches[0], batch):
-            assert torch.equal(original.double(), current) == fixed
-    assert len(validation) == 3
-    assert not torch.equal(validation[0][0], validation[1][0])
+    for step in range(1, len(main_batches)):
+        for previous, current in zip(main_batches[step - 1], main_batches[step]):
+            assert torch.equal(previous.double(), current.double()) == (
+                fixed_from is not None and step > fixed_from
+            )
+    assert len(validation) == 4
+    assert all(not torch.equal(previous[0], current[0])
+               for previous, current in zip(validation, validation[1:]))
     for main, val in zip(main_batches, validation):
         assert not torch.equal(main[0], val[0])
-    if fixed and optimizer == "gnome":
-        for main, aux in zip(main_batches, training[1::2]):
-            for points, subset in zip(main, aux):
-                assert torch.isin(subset, points).all()
-                assert len(subset.unique()) == len(subset)
+    if optimizer == "gnome":
+        for step, (main, aux) in enumerate(zip(main_batches, training[1::2])):
+            is_fixed = fixed_from is not None and step >= fixed_from
+            assert tuple(len(t) for t in aux) == ((5, 5, 2, 1) if is_fixed else (8, 8, 2, 2))
+            if is_fixed:
+                for points, subset in zip(main, aux):
+                    assert torch.isin(subset, points).all()
+                    assert len(subset.unique()) == len(subset)
+            else:
+                assert not torch.isin(aux[0], main[0]).all()
 
     config = records[0]["hyperparameters"]
     assert config["fixed_dataset"] == fixed
-    assert config["sampling"] == ("fixed" if fixed else "resample_each_step")
+    assert config["fix_after"] == fix_after
+    assert config["fixed_from_step"] == fixed_from
+    assert config["sampling"] == (
+        "fixed" if fixed_from == 0 else "resample_then_fixed"
+        if fixed_from is not None else "resample_each_step"
+    )
     assert config["aux_sampling"] == (
-        ("subsample_fixed_main_each_step" if fixed else "resample_each_step")
+        ("subsample_fixed_main_each_step" if fixed_from == 0 else
+         "resample_then_subsample_fixed_main" if fixed_from is not None else "resample_each_step")
         if optimizer == "gnome" else None
     )
-    if fixed:
+    if fixed_from == 0:
         assert (config["n_pde_aux"], config["n_ic_aux"], config["n_bc_aux"]) == (5, 2, 1)
+    events = [r for r in records if r["type"] == "sampling"]
+    assert [r["step"] for r in events] == ([] if fixed_from is None else [fixed_from])
     assert records[-1]["completed"]
     assert math.isfinite(records[-1]["final_rel_l2"])
 
@@ -102,3 +126,15 @@ def test_training_sampling_and_precision_switch(tmp_path, monkeypatch, optimizer
 def test_invalid_fixed_dataset_options(option, value):
     with pytest.raises(SystemExit):
         ac.parse_args(config_overrides(ac, ["--optimizer", "gnome", "--fixed-dataset", option, value]))
+
+
+@pytest.mark.parametrize("fix_after", [-1, 4, 5, 1.5, True, "2"])
+def test_invalid_fix_after(fix_after):
+    with pytest.raises(SystemExit):
+        ac.parse_args({"steps": 4, "fix_after": fix_after})
+
+
+def test_delayed_fixed_dataset_validates_auxiliary_fraction():
+    with pytest.raises(SystemExit):
+        ac.parse_args({"optimizer": "gnome", "steps": 4, "fix_after": 2,
+                       "fixed_dataset": False, "optimizers": {"gnome": {"aux_frac": 1.1}}})

@@ -27,7 +27,7 @@ installed as optional-dependency groups:
 | Extra | Command | For |
 |---|---|---|
 | *(base)* | `uv sync` | the `gnome` optimizer package |
-| `experiments` | `uv sync --extra experiments` | the regression + PINN benchmarks (scipy, matplotlib) |
+| `experiments` | `uv sync --extra experiments` | the PINN benchmarks (scipy, matplotlib) |
 | `llm` | `uv sync --extra llm` | the WikiText GPT benchmark (datasets, transformers) |
 | `nanogpt` | `uv sync --extra nanogpt` | the Modded-NanoGPT FineWeb benchmark (huggingface-hub) |
 | `vision` | `uv sync --extra vision` | image classification, including CUB-200-2011 (torchvision, Pillow) |
@@ -113,62 +113,93 @@ For multi-block losses (e.g. PINNs — a PDE residual plus boundary/initial term
 whose `mean(·²)` is the weighted loss, and hands the MSE surrogate the right per-block GGN.
 See the PINN experiments and [`docs/method.md`](docs/method.md) §8 for details.
 
-### AdamW parameter groups inside Gnome
+### Partitioned curvature surrogates
 
-Set `update_rule="adamw"` on a group to update it with AdamW directly inside
-Gnome. For example, to use AdamW for a model's input embedding:
+Pass a list of auxiliary partition sizes to trade additional backward work for
+less curvature noise:
 
 ```python
-embedding = model.embed.weight
-opt = Gnome([
-    {"params": [p for p in model.parameters() if p is not embedding],
-     "update_rule": "gnome"},
-    {"params": [embedding], "update_rule": "adamw", "lr": 1e-3,
-     "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": 0.0},
-], lr=1e-3, loss="cce_hutchinson")
+loss = opt.step(
+    main_closure,
+    aux_closure,
+    surrogate_partition_sizes=[n_pde_aux, n_ic_aux, n_bc_aux],
+)
 ```
 
-The existing `opt.step(main_closure, aux_closure)` API stays the same, including
-microbatch accumulation. Both groups receive the main gradients; only Gnome
-groups receive curvature gradients and preconditioner state. AdamW groups use
-bias-corrected gradient and squared-gradient EMAs, decoupled weight decay, and
-update immediately on the first step. Gnome's trust radius, curvature damping,
-coordinate clipping, and curvature diagnostics apply only to Gnome groups.
-Optional global main-gradient clipping covers both rules.
+The sizes describe consecutive slices along the auxiliary output's first axis.
+They must be positive integers summing to its length. For `stack_residuals`, use
+each block's **element count**, in stacking order, including all boundary
+components. For other problems, `[32, 32, 32, 32]` would partition an auxiliary
+batch of 128 samples equally. Sizes can change between steps.
 
-AdamW moments are FP32 (FP64 for double parameters), including after checkpoint
-loading. Keep parameters in FP32 too if small updates would round away in BF16.
-All groups share one optimizer checkpoint and work with standard LR schedulers.
-Each group inherits constructor settings unless overridden, so specify AdamW's
-`betas` and `eps` explicitly when they should differ from Gnome's. Parameters,
-including tied weights, must appear only once. Choose each group's update rule
-at construction. An AdamW-only Gnome optimizer does not need an auxiliary closure.
+The auxiliary closure runs once. For multiple partitions, Gnome stacks their
+scalar surrogates and computes all partition gradients in one
+`torch.autograd.grad(..., is_grads_batched=True)` call, using PyTorch's vmap
+backend with identity seeds. Gnome
+sums the separate factor outer products and separate squared rotated gradients,
+removing the random cross-partition terms while keeping the same expected GGN.
+All partitions retain the full auxiliary batch's `1/sqrt(K)` normalization;
+`stack_residuals` already supplies the per-block loss weights. Each EMA and the
+parameter update still advance once per step. Omitting the argument, or passing
+`[K]`, uses the original single-surrogate estimate.
+
+The auxiliary graph is released by the batched backward, and partition
+gradients are stored until the update. More partitions therefore cost both
+backward compute and gradient storage. `use_soap_basis=True` keeps its basis
+factors based on the main gradient; only the curvature estimate is partitioned.
+`norm_free=True` normalizes the summed squared contribution once. This is a per-step input and is not stored in checkpoints.
+
+### Optimizer diagnostics
+
+Experiments own the reporting cadence and logging. Read the optimizer's
+persistent state explicitly after an update:
+
+```python
+if (step + 1) % 100 == 0:
+    for record in opt.get_diagnostics():
+        diagnostics_logger(record)
+```
+
+Each record identifies a parameter and reports its stored damping as
+`lam`, the actual lambda used on its last update. It is `None`
+during basis initialization; with the trust region disabled, it equals epsilon.
+Parameters without initialized optimizer state are omitted.
+
+Supply a list of read-only callables to request other state measurements.
+Each receives a context containing `p`, `state`, `group`,
+`step`, and `param`, and returns named scalar values:
+
+```python
+from gnome.diagnostics import lm_damping
+
+records = opt.get_diagnostics([
+    lm_damping,
+    lambda c: {"curvature_ema_max": c["state"]["gnd_m"].max()},
+], params=[0])
+```
+
+The method converts scalar tensors to Python values and does not retain
+temporary update tensors. PINN experiments use `diagnostics_every` and
+`diagnostics_params` to schedule JSONL sidecar records.
 
 ## Running the experiments
 
 Edit the experiment's Python `CONFIG` dictionary under
 [`experiments/configs/`](experiments/configs/README.md), then run its module.
 The config directory mirrors the runners: `pinns/`, `resnets/`, `transformers/`,
-and `tabular/`, with root-level experiments at the config root. Scientific
+and `tabular/`, with the run viewer at the config root. Scientific
 notation and Python expressions are supported. Commands now accept only
 `--config path/to/custom.py` and `--help`; settings formerly passed as flags
 are dictionary keys with underscores. The examples below indicate which
 entries to edit before running.
 
+PINN configs keep experiment settings at the top level and optimizer settings
+under `CONFIG["optimizers"]["gnome"]`, `CONFIG["optimizers"]["soap"]`, etc.
+The top-level `optimizer` selects the block, including its learning-rate schedule.
+
 Each experiment is a module under `experiments/`, grouped into `pinns`, `resnets`, and
 `transformers` where applicable, and run from the repo root. Every run streams an
 append-only JSONL log to `runs/<experiment>/<run_id>.jsonl` (see below).
-
-**Regression** (runs on CPU/MPS/GPU; needs the `experiments` extra for plots):
-
-```bash
-# Edit experiments/configs/ols_regression.py: optimizer='gnome', lr=0.1
-uv run python -m experiments.ols_regression
-```
-
-`optimizer` is `gnome`, `soap`, or `adamw`. This is the pedagogical example: Gnome reaches
-the closed-form least-squares solution at a fixed LR, while the baselines stall unless given
-a decay schedule.
 
 **PINNs** (need the `experiments` extra; references are generated or downloaded
 automatically on first run):
@@ -178,11 +209,40 @@ automatically on first run):
 uv run python -m experiments.pinns.poisson_pinn
 # Edit experiments/configs/pinns/burgers_pinn.py: optimizer='gnome', steps=75000
 uv run python -m experiments.pinns.burgers_pinn
-# Edit experiments/configs/pinns/kuramoto_sivashinsky_pinn.py: optimizer='gnome', steps=100000
-uv run python -m experiments.pinns.kuramoto_sivashinsky_pinn
+# Edit experiments/configs/pinns/heat2d_pinn.py: optimizer='gnome', dtype='float64'
+uv run python -m experiments.pinns.heat2d_pinn
+# Edit experiments/configs/pinns/heat5d_pinn.py: optimizer='gnome', dtype='float64'
+uv run python -m experiments.pinns.heat5d_pinn
 # Edit experiments/configs/pinns/navier_stokes_pinn.py: optimizer='gnome', steps=200000
 uv run python -m experiments.pinns.navier_stokes_pinn
 ```
+
+Heat 2D implements the benchmark from [Wang et al., Table 2](https://arxiv.org/html/2502.00604v2#S5.T2).
+Here "2D" counts time and one spatial coordinate: `u_t = 0.25 u_xx` on
+`(t, x) ∈ [0, 1]²`, with initial value `sin(πx)` and zero spatial boundary values.
+The exact reference is `exp(-π²t/4) sin(πx)`, as specified in
+[Müller & Zeinhofer, §4.3](https://proceedings.mlr.press/v202/muller23b/muller23b.pdf).
+It supports Gnome, SOAP, AdamW, and ENGD-W with the Burgers training/logging workflow.
+For ENGD-W, select `optimizer='engdw'` and edit `CONFIG['optimizers']['engdw']`
+for damping, momentum, line search, and fixed-batch sampling. It uses float64
+with no weight decay or LR schedule. Start with `n_pde=128, n_ic=32, n_bc=32`
+for its dense sample-space solve.
+The default MLP is `[2, 256, 256, 256, 1]`; sampling counts, schedules, and training
+budget are local defaults rather than a reproduction of the full paper protocol.
+
+`heat5d_pinn.py` implements the **four-spatial-dimensional heat equation** from
+[Dangel et al., NeurIPS 2024](https://proceedings.neurips.cc/paper_files/paper/2024/hash/3d27d607586984908900eaa8ce19c96c-Abstract-Conference.html).
+Its five inputs are `(t, x1, x2, x3, x4)`, all in `[0, 1]`, and the PDE is
+`u_t = 0.25 Σ_i u_xixi`. The initial value is `Σ_i sin(2x_i)`, with
+nonhomogeneous Dirichlet values `exp(-t) Σ_i sin(2x_i)` on all eight spatial
+faces. Relative L2 uses that analytic reference over the full space-time domain.
+Evaluation uses `n_eval=30000` fixed, uniformly random space-time points,
+with a separate `eval_seed=1234`. The same points are reused throughout
+training and across runs, without consuming the training random stream.
+The sample count, seed, and `eval_sampling="fixed_uniform"` are recorded in logs.
+It supports Gnome, SOAP, AdamW, and ENGD-W using the existing heat workflow.
+Architecture, training budgets, and equal PDE/IC/BC loss weights are local
+choices; the K-FAC paper supplies the benchmark problem.
 
 Burgers uses a float64 Cole–Hopf reference for `rel_l2`. Pass `float64` for
 double-precision training and inference as well. The additional `rel_l2_jaxpi`
@@ -214,6 +274,14 @@ Gnome draws fresh auxiliary subsets without replacement within each block;
 `aux_frac` must be in `(0,1]`, and auxiliary sizes are capped at the main
 block sizes. Validation residual points still resample. Fixed coordinates
 are preserved when switching precision with `float64_after`.
+
+To resample early and freeze the training dataset near the end, set the top-level
+`fix_after` option instead. For example, `fixed_dataset=False, fix_after=80_000`
+resamples for 80,000 updates, then samples one dataset for all remaining updates.
+Gnome switches to fresh auxiliary subsets of that fixed dataset; validation
+continues resampling. `fix_after=None` keeps the current behavior, `0` fixes from
+the start, and `fixed_dataset=True` always fixes from the start. A non-`None`
+value must satisfy `0 <= fix_after < steps`. The switch is recorded in the run log.
 
 Each takes `optimizer=gnome|soap|adamw`. **Schedule protocol:** every optimizer, Gnome
 included, gets the same linear-warmup + cosine-decay schedule, so the comparison is over the
@@ -249,7 +317,8 @@ reference grid. Omitting the flag retains per-step training resampling.
 sample-space Gauss–Newton baseline:
 
 ```bash
-# Edit experiments/configs/pinns/poisson_pinn.py: optimizer='engdw', n_pde=128, n_bc_per_edge=16, engdw_line_search=True, steps=1000
+# Edit experiments/configs/pinns/poisson_pinn.py: optimizer='engdw', n_pde=128, n_bc_per_edge=16, steps=1000
+# In CONFIG["optimizers"]['engdw']: engdw_line_search=True
 uv run -m experiments.pinns.poisson_pinn
 ```
 
@@ -266,7 +335,8 @@ collocation batches: the dense sample Gram has `n_pde + 4*n_bc_per_edge` rows.
 nonlinear Burgers PDE, with equal-weight PDE, initial-condition, and boundary MSEs:
 
 ```bash
-# Edit experiments/configs/pinns/burgers_pinn.py: optimizer='engdw', n_pde=128, n_ic=32, n_bc=16, engdw_line_search=True, steps=1000
+# Edit experiments/configs/pinns/burgers_pinn.py: optimizer='engdw', n_pde=128, n_ic=32, n_bc=16, steps=1000
+# In CONFIG["optimizers"]['engdw']: engdw_line_search=True
 uv run --extra experiments -m experiments.pinns.burgers_pinn
 ```
 
@@ -285,7 +355,8 @@ existing Gnome surrogate with a finite EMA history of raw matrix gradients
 and an exact damped Woodbury solve per parameter tensor:
 
 ```bash
-# Edit experiments/configs/pinns/poisson_pinn.py: optimizer='woodbury', fixed_dataset=True, hidden=8, depth=3, n_pde=32, n_bc_per_edge=4, aux_frac=0.5, steps=300, lr=0.001, woodbury_damping=0.1, beta2=0.9, warmup_steps=0, cosine_decay=1.0, float64=True, diagnostics_every=50, log_every=50
+# Edit experiments/configs/pinns/poisson_pinn.py: optimizer='woodbury', fixed_dataset=True, hidden=8, depth=3, n_pde=32, n_bc_per_edge=4, steps=300, float64=True, diagnostics_every=50, log_every=50
+# In CONFIG["optimizers"]['woodbury']: aux_frac=0.5, lr=0.001, woodbury_damping=0.1, beta2=0.9, warmup_steps=0, cosine_decay=1.0
 uv run -m experiments.pinns.poisson_pinn
 ```
 
@@ -306,7 +377,8 @@ before scaling up the initial stability run.
 `optimizer=engdw`, using an exact damped Gauss–Newton solve in sample space:
 
 ```bash
-# Edit experiments/configs/pinns/reaction_pinn.py: optimizer='engdw', rho=5.0, engdw_line_search=True, engdw_damping=1e-06, engdw_chunk=128, steps=1000
+# Edit experiments/configs/pinns/reaction_pinn.py: optimizer='engdw', rho=5.0, steps=1000
+# In CONFIG["optimizers"]['engdw']: engdw_line_search=True, engdw_damping=1e-06, engdw_chunk=128
 uv run -m experiments.pinns.reaction_pinn
 ```
 

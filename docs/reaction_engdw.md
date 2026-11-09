@@ -54,7 +54,8 @@ The supplied local run
 An ENGD-W starting command with those model and sampling settings is:
 
 ```bash
-# Edit experiments/configs/pinns/reaction_pinn.py: optimizer='engdw', rho=5.0, seed=0, arch='mlp', hidden=50, depth=5, embed='none', n_pde=4000, n_ic=256, n_bc=256, engdw_damping=1e-06, engdw_line_search=True, engdw_chunk=128, steps=1000, log_every=20
+# Edit experiments/configs/pinns/reaction_pinn.py: optimizer='engdw', rho=5.0, seed=0, arch='mlp', hidden=50, depth=5, embed='none', n_pde=4000, n_ic=256, n_bc=256, steps=1000, log_every=20
+# In CONFIG["optimizers"]['engdw']: engdw_damping=1e-06, engdw_line_search=True, engdw_chunk=128
 uv run -m experiments.pinns.reaction_pinn
 ```
 

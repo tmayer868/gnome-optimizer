@@ -55,37 +55,12 @@ def grid(experiment: str, **params) -> list[dict]:
         runs.append({"experiment": experiment, **fixed, **dict(zip(keys, combo))})
     return runs
 
-
 # ----------------------------------------------------------------------
 # The sweep. Edit this.
 # ----------------------------------------------------------------------
-# lr × eps grid for Gnome on Poisson (3 × 3 = 9 runs):
+# Compare optimizers on Poisson and Burgers:
 
 RUNS = grid(
-    "ols_regression", optimizer="gnome", epochs=100, seed=0,
-    lr=1e-2,
-    eps=1e-6,
-    beta2=.99,
-    dim=128,
-)
-
-RUNS += grid(
-    "ols_regression", optimizer="soap", epochs=100, seed=0,
-    lr=1e-2,
-    beta2=.99,
-    dim=128,
-    cosine_decay=1.0
-)
-
-RUNS += grid(
-    "ols_regression", optimizer="adamw", epochs=100, seed=0,
-    lr=1e-2,
-    dim=128,
-    cosine_decay=1.0
-)
-
-
-RUNS += grid(
     "poisson_pinn", optimizer="gnome", steps=STEPS, seed=0,
     lr=1e-2,
     eps=1e-6,
@@ -125,7 +100,6 @@ RUNS += grid(
     depth=8,
 )
 
-
 RUNS += grid(
     "burgers_pinn", optimizer="adamw", steps=STEPS, seed=0,
     lr=1e-3,
@@ -133,37 +107,7 @@ RUNS += grid(
     depth=8,
 )
 
-
-
-RUNS += grid(
-    "kuramoto_sivashinsky_pinn", optimizer="gnome", steps=STEPS, seed=0,
-    lr=1e-2,
-    eps=1e-6,
-    beta2=.99,
-    hidden=64,
-    depth=8,
-)
-
-RUNS += grid(
-    "kuramoto_sivashinsky_pinn", optimizer="soap", steps=STEPS, seed=0,
-    lr=1e-3,
-    beta2=.99,
-    hidden=64,
-    depth=8,
-)
-
-RUNS += grid(
-    "kuramoto_sivashinsky_pinn", optimizer="adamw", steps=STEPS, seed=0,
-    lr=1e-3,
-    hidden=64,
-    depth=8,
-)
-
 print(f"NUMBER OF RUNS: {len(RUNS)}")
-
-
-
-
 
 # Concatenate grids to sweep several experiments / optimizers in one batch:
 # RUNS = (
@@ -171,13 +115,12 @@ print(f"NUMBER OF RUNS: {len(RUNS)}")
 #          lr=[1e-3, 1e-2], eps=[1e-5, 1e-6], beta2=[0.9, 0.95])
 #     + grid("poisson_pinn", optimizer="soap", steps=STEPS, cosine_decay=0.0,
 #            lr=[5e-4, 1e-3])
-#     + [{"experiment": "ols_regression", "optimizer": "gnome", "lr": 0.1}]  # or hand-write
+#     + [{"experiment": "poisson_pinn", "optimizer": "gnome", "lr": 0.1}]  # or hand-write
 # )
 
 # Stop the whole sweep on the first failing run? Default False: log it and
 # keep going (a bad config shouldn't abort the rest of an overnight sweep).
 STOP_ON_ERROR = False
-
 
 # ----------------------------------------------------------------------
 # Runner
@@ -200,11 +143,10 @@ EXPERIMENT_PACKAGES = {
         "convection_family_pinn",
         "generate_allen_cahn_reference",
         "ginzburg_landau",
+        "heat2d_pinn",
         "helmholtz_pinn",
         "inviscid_burgers_pinn",
         "kdv_pinn",
-        "kuramoto_sivashinsky_pinn",
-        "ldc_pinn",
         "navier_stokes_pinn",
         "poisson5d_pinn",
         "poisson_pinn",
@@ -216,7 +158,6 @@ EXPERIMENT_PACKAGES = {
     "tabular": {"covertype", "otto"},
 }
 
-
 def experiment_module(experiment: str) -> str:
     """Resolve a sweep experiment leaf name to its importable module path."""
     if "." in experiment:
@@ -226,15 +167,13 @@ def experiment_module(experiment: str) -> str:
             return f"experiments.{package}.{experiment}"
     return f"experiments.{experiment}"
 
-
 def build_cmd(run: dict, config_path: Path) -> list[str]:
     """Launch an experiment with its materialized Python config."""
     return [sys.executable, "-u", "-m", experiment_module(run["experiment"]),
             "--config", str(config_path)]
 
-
 def run_config(run: dict) -> dict:
-    from experiments.common.config import load_config_dict
+    from experiments.common.config import load_config_dict, merge_config_overrides
 
     if "experiment" not in run:
         raise ValueError(f"run is missing the required 'experiment' key: {run}")
@@ -242,18 +181,10 @@ def run_config(run: dict) -> dict:
     default = Path(REPO) / "experiments" / "configs" / Path(*module.split(".")[1:]).with_suffix(".py")
     config = load_config_dict(run.get("config", default))
 
-    def merge(target, overrides):
-        for key, value in overrides.items():
-            if key not in target:
-                raise ValueError(f"Unknown config key {key!r} in {module}")
-            if isinstance(value, dict) and isinstance(target[key], dict):
-                merge(target[key], value)
-            else:
-                target[key] = value
-
-    merge(config, {key: value for key, value in run.items() if key not in ("experiment", "config")})
-    return config
-
+    return merge_config_overrides(
+        config, {key: value for key, value in run.items() if key not in ("experiment", "config")},
+        flat_optimizer_overrides=module.startswith("experiments.pinns."),
+    )
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -316,11 +247,9 @@ def main() -> None:
     if failed:   # divergence is an expected outcome; only real crashes fail the batch
         sys.exit(1)
 
-
 def _run_summary(run: dict) -> str:
     """Compact one-line view of a run's key hyperparameters (sans experiment)."""
     return " ".join(f"{k}={v}" for k, v in run.items() if k != "experiment")
-
 
 if __name__ == "__main__":
     main()

@@ -15,8 +15,8 @@ Usage:
 
     uv run -m experiments.pinns.generate_allen_cahn_reference
 
-The default solve uses 4095 modes and also solves at 2047 modes to report a
-spatial convergence delta.
+The default solve uses 8191 modes with rtol=2e-13 and atol=2e-15, and also
+solves at 4095 modes to report a spatial convergence delta.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ import numpy as np
 from experiments.reference_solutions import reference_path
 
 
-DEFAULT_OUTPUT = reference_path("allen_cahn_highres.mat")
+DEFAULT_OUTPUT = reference_path("allen_cahn_highres_8191_tight.mat")
 
 
 @dataclass(frozen=True)
@@ -164,11 +164,11 @@ def save_reference(
 def generate_allen_cahn_reference(
     output: str = DEFAULT_OUTPUT,
     *,
-    modes: int = 4095,
-    check_modes: int = 2047,
+    modes: int = 8191,
+    check_modes: int = 4095,
     time_steps: int = 200,
-    rtol: float = 2e-11,
-    atol: float = 2e-13,
+    rtol: float = 2e-13,
+    atol: float = 2e-15,
     force: bool = False,
 ) -> str:
     """Generate the high-resolution reference, or reuse a matching cache."""

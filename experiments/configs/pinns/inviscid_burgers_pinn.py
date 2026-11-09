@@ -29,19 +29,6 @@ CONFIG = {
     # is then not enforced at all and there is no BC block, so expect drift at the domain edges.
     # Choices: 'periodic', 'raw'.
     'embedding': 'periodic',
-    # Aux batch sizes for Gnome are max(K_min, int(N * aux_frac)) per block. Each aux pass is a
-    # full residual eval, so this is not free — keep small.
-    'aux_frac': 0.03,
-    'lr': 0.001,
-    # Gnome l2 trust radius: lambda is the smallest value >= eps with ||m_hat/(v_hat+lambda)||_2
-    # <= this * sqrt(P), i.e. a bound on the RMS per-coordinate step. 0 disables it.
-    'trust_region': 1.0,
-    # Gnome curvature-damping epsilon in m_hat/(v_hat+eps). Gnome only; SOAP/AdamW keep their
-    # fixed eps=1e-8.
-    'eps': 1e-6,
-    'beta1': 0.9,
-    'beta2': 0.99,
-    'weight_decay': 1e-8,
     # MLP width.
     'hidden': 30,
     # Total linear layers (paper: 6 hidden + output = 7, giving 4801 params at hidden 30).
@@ -49,10 +36,6 @@ CONFIG = {
     # float32 suffices here — the paper's accuracies are ~1e-2/1e-3, set by the shock, not by
     # precision. Choices: 'float32', 'float64'.
     'dtype': 'float32',
-    'warmup_steps': 200,
-    # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero, 1.0 disables decay.
-    # Gnome never decays regardless.
-    'cosine_decay': 0.0,
     # Spatial points at t=1 (paper's WENO reference: 1000).
     'n_eval_x': 1000,
     # Time slices in the space-time eval grid.
@@ -67,4 +50,44 @@ CONFIG = {
     'log_every': 100,
     'runs_dir': 'runs',
     'quiet': False,
+    # Each optimizer keeps its own hyperparameters and learning-rate schedule.
+    'optimizers': {
+        'gnome': {
+            # Aux batch sizes for Gnome are max(K_min, int(N * aux_frac)) per block. Each aux pass is a
+            # full residual eval, so this is not free — keep small.
+            'aux_frac': 0.03,
+            'lr': 0.001,
+            # Gnome l2 trust radius: lambda is the smallest value >= eps with ||m_hat/(v_hat+lambda)||_2
+            # <= this * sqrt(P), i.e. a bound on the RMS per-coordinate step. 0 disables it.
+            'trust_region': 1.0,
+            # Gnome curvature-damping epsilon in m_hat/(v_hat+eps). Gnome only; SOAP/AdamW keep their
+            # fixed eps=1e-8.
+            'eps': 1e-6,
+            'beta1': 0.9,
+            'beta2': 0.99,
+            'weight_decay': 1e-8,
+            'warmup_steps': 200,
+            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero, 1.0 disables decay.
+            # Gnome never decays regardless.
+            'cosine_decay': 0.0,
+        },
+        'soap': {
+            'lr': 0.001,
+            'beta1': 0.9,
+            'beta2': 0.99,
+            'weight_decay': 1e-8,
+            'warmup_steps': 200,
+            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero, 1.0 disables decay.
+            # Gnome never decays regardless.
+            'cosine_decay': 0.0,
+        },
+        'adamw': {
+            'lr': 0.001,
+            'weight_decay': 1e-8,
+            'warmup_steps': 200,
+            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero, 1.0 disables decay.
+            # Gnome never decays regardless.
+            'cosine_decay': 0.0,
+        },
+    },
 }

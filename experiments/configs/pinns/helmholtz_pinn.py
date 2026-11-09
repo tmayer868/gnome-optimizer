@@ -18,23 +18,6 @@ CONFIG = {
     # Interior collocation points per step. Paper uses 15,000-25,000 with RAD refresh; Table 4
     # shows 10,000 already reaches rel_Linf 1.5e-8, so that is the default here.
     'n_pde': 10000,
-    # Aux batch size for Gnome is max(8, int(n_pde * aux_frac)). Each aux pass is a full second-
-    # order residual eval, so this is not free — keep small.
-    'aux_frac': 0.03,
-    'lr': 0.001,
-    # Gnome l2 trust radius: lambda is set to the smallest value >= eps with
-    # ||m_hat/(v_hat+lambda)||_2 <= this * sqrt(P), i.e. a bound on the RMS per-coordinate step.
-    # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain
-    # m_hat/(v_hat+eps) damping.
-    'trust_region': 1.0,
-    # Gnome curvature-damping epsilon in m_hat/(v_hat+eps): larger -> more gradient-descent-like,
-    # smaller -> fuller Newton step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.
-    'eps': 1e-6,
-    # First-moment (momentum) EMA for Gnome and SOAP.
-    'beta1': 0.9,
-    # Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.
-    'beta2': 0.99,
-    'weight_decay': 1e-8,
     # MLP width.
     'hidden': 30,
     # Total linear layers (paper: 4 hidden + output = 5). Ladder: 5 / 7 / 9 -> 2971 / 4831 / 6691
@@ -61,24 +44,8 @@ CONFIG = {
     # float64 by default: the target here is 1e-9, which float32 cannot represent in the
     # residual. MPS has no float64 and falls back to CPU. Choices: 'float32', 'float64'.
     'dtype': 'float64',
-    # Linear LR warmup steps, applied to every optimizer.
-    'warmup_steps': 200,
-    # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-    # 1.0 disables decay. Gnome (MSE) never decays regardless.
-    'cosine_decay': 0.0,
     # Points per axis in the fixed eval grid (401 -> 160k points). Raise it for high a1/a2.
     'n_eval': 401,
-    # Outer L-BFGS steps after the AdamW phase (optimizer adamw+lbfgs only). Each outer step runs
-    # up to lbfgs_max_iter inner iterations, so the total budget is lbfgs_steps * lbfgs_max_iter.
-    # Runs on a single fixed collocation batch. 0 skips the phase.
-    'lbfgs_steps': 500,
-    # Inner iterations per L-BFGS outer step. Must be >1: the strong-Wolfe line search cannot
-    # recover from a cold identity Hessian in one iteration and stalls. adamw+lbfgs only.
-    'lbfgs_max_iter': 20,
-    # L-BFGS history size (stored curvature pairs). adamw+lbfgs only.
-    'lbfgs_history': 50,
-    # L-BFGS step scale; with a strong-Wolfe line search 1.0 is standard. adamw+lbfgs only.
-    'lbfgs_lr': 1.0,
     # Log Gnome's internal state — curvature spectrum, LM damping, trust-region usage — every N
     # steps to a sibling runs/.../{run_id}.diag.jsonl. 0 (default) disables it entirely. Gnome
     # only: SOAP and AdamW expose no such hook.
@@ -89,4 +56,73 @@ CONFIG = {
     'log_every': 100,
     'runs_dir': 'runs',
     'quiet': False,
+    # Each optimizer keeps its own hyperparameters and learning-rate schedule.
+    'optimizers': {
+        'gnome': {
+            # Aux batch size for Gnome is max(8, int(n_pde * aux_frac)). Each aux pass is a full second-
+            # order residual eval, so this is not free — keep small.
+            'aux_frac': 0.03,
+            'lr': 0.001,
+            # Gnome l2 trust radius: lambda is set to the smallest value >= eps with
+            # ||m_hat/(v_hat+lambda)||_2 <= this * sqrt(P), i.e. a bound on the RMS per-coordinate step.
+            # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain
+            # m_hat/(v_hat+eps) damping.
+            'trust_region': 1.0,
+            # Gnome curvature-damping epsilon in m_hat/(v_hat+eps): larger -> more gradient-descent-like,
+            # smaller -> fuller Newton step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.
+            'eps': 1e-6,
+            # First-moment (momentum) EMA for Gnome and SOAP.
+            'beta1': 0.9,
+            # Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.
+            'beta2': 0.99,
+            'weight_decay': 1e-8,
+            # Linear LR warmup steps, applied to every optimizer.
+            'warmup_steps': 200,
+            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
+            # 1.0 disables decay. Gnome (MSE) never decays regardless.
+            'cosine_decay': 0.0,
+        },
+        'soap': {
+            'lr': 0.001,
+            # First-moment (momentum) EMA for Gnome and SOAP.
+            'beta1': 0.9,
+            # Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.
+            'beta2': 0.99,
+            'weight_decay': 1e-8,
+            # Linear LR warmup steps, applied to every optimizer.
+            'warmup_steps': 200,
+            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
+            # 1.0 disables decay. Gnome (MSE) never decays regardless.
+            'cosine_decay': 0.0,
+        },
+        'adamw': {
+            'lr': 0.001,
+            'weight_decay': 1e-8,
+            # Linear LR warmup steps, applied to every optimizer.
+            'warmup_steps': 200,
+            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
+            # 1.0 disables decay. Gnome (MSE) never decays regardless.
+            'cosine_decay': 0.0,
+        },
+        'adamw+lbfgs': {
+            'lr': 0.001,
+            'weight_decay': 1e-8,
+            # Linear LR warmup steps, applied to every optimizer.
+            'warmup_steps': 200,
+            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
+            # 1.0 disables decay. Gnome (MSE) never decays regardless.
+            'cosine_decay': 0.0,
+            # Outer L-BFGS steps after the AdamW phase (optimizer adamw+lbfgs only). Each outer step runs
+            # up to lbfgs_max_iter inner iterations, so the total budget is lbfgs_steps * lbfgs_max_iter.
+            # Runs on a single fixed collocation batch. 0 skips the phase.
+            'lbfgs_steps': 500,
+            # Inner iterations per L-BFGS outer step. Must be >1: the strong-Wolfe line search cannot
+            # recover from a cold identity Hessian in one iteration and stalls. adamw+lbfgs only.
+            'lbfgs_max_iter': 20,
+            # L-BFGS history size (stored curvature pairs). adamw+lbfgs only.
+            'lbfgs_history': 50,
+            # L-BFGS step scale; with a strong-Wolfe line search 1.0 is standard. adamw+lbfgs only.
+            'lbfgs_lr': 1.0,
+        },
+    },
 }

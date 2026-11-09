@@ -1,7 +1,7 @@
 """Modified MLP (Wang, Teng & Perdikaris 2021) — shared by the PINN benchmarks.
 
 Single source of truth for the gated architecture used by ``allen_cahn``,
-``kdv``, ``kuramoto_sivashinsky``, ``ldc`` and ``wave``. Each of those files
+``kdv`` and ``wave``. Each of those files
 supplies its own input embedding and (where needed) an output transform; the
 trunk lives here so the encoder layout stays identical across benchmarks.
 

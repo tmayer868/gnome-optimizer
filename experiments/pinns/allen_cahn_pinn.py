@@ -37,15 +37,12 @@ Four input embeddings, selectable via ``--embed`` (all architectures):
 * ``polynomial`` feeds ``[t, 1-x², x(1-x²)]``. Endpoint values match
   exactly, but endpoint spatial derivatives need not, so it keeps the
   soft BC block (three blocks).
-* ``fourier`` feeds ``[sin(zB), cos(zB)]`` with ``z = [t, x]`` the raw
-  coordinates and ``B`` a *trainable* matrix initialized ``~ N(0, scale²)``,
-  sized by ``--embed-dim`` and ``--embed-scale``. The frequencies are
-  learned, so ``--embed-scale`` sets the starting bandwidth rather than the
-  final one. Projecting raw ``x`` means the frequencies are not multiples
-  of ``k``, so this is **not** exactly periodic and it keeps the soft BC
-  block (three blocks, like ``none``). Both departures from jaxpi — which
-  freezes ``B`` and applies it on top of the periodic features — are
-  deliberate.
+* ``fourier`` first maps to ``z = [t, cos(πx), sin(πx)]``, then feeds
+  ``[z, sin(zB), cos(zB)]`` to the network. ``B`` is a *trainable* matrix
+  initialized ``~ N(0, scale²)``, sized by ``embed_dim`` and ``embed_scale``.
+  Learned Fourier features retain exact period-2 spatial periodicity,
+  including derivatives, so the soft BC block is **dropped**. ``embed_dim``
+  counts the Fourier features; the three periodic input features are added.
 
 All optimizers share the chosen network so the only variable is the
 optimizer. Every optimizer gets the same linear-warmup + cosine-decay schedule
@@ -146,7 +143,8 @@ def build_embedding(embed: str, embed_dim: int = 256,
         )
     if embed == "fourier":
         return TrainableFourierEmbedding(
-            2, embed_dim, scale, include_input=True
+            2, embed_dim, scale, include_input=True,
+            wavenumber=2.0 * math.pi / (X_MAX - X_MIN),
         )
     raise ValueError(f"unknown embedding: {embed}")
 
@@ -212,8 +210,8 @@ def bc_residual(model: nn.Module, t: torch.Tensor) -> torch.Tensor:
     """Periodic BC residual: ``u(t, -1) - u(t, 1)`` and
     ``u_x(t, -1) - u_x(t, 1)``, stacked (C¹ periodicity).
 
-    Included in the loss for every embedding except ``periodic``, which
-    makes this identically zero. ``polynomial`` enforces matching values
+    Included in the loss except with ``periodic`` or ``fourier``, which
+    make this zero up to roundoff. ``polynomial`` enforces matching values
     but still needs the derivative residual.
     """
     x_l = torch.full_like(t, X_MIN, requires_grad=True)
@@ -250,6 +248,15 @@ def sample_aux_from_batch(batch, n_pde: int, n_ic: int, n_bc: int):
     return t_pde[interior], x_pde[interior], x_ic[initial], t_bc[boundary]
 
 
+def residual_partition_sizes(batch, use_bc: bool = True) -> list[int]:
+    """Element counts of the PDE, IC, and optional BC residual blocks."""
+    t_pde, _x_pde, x_ic, t_bc = batch
+    sizes = [t_pde.numel(), x_ic.numel()]
+    if use_bc:
+        sizes.append(2 * t_bc.numel())
+    return sizes
+
+
 def stacked_residuals(
     model: nn.Module, batch, use_bc: bool = True
 ) -> torch.Tensor:
@@ -272,7 +279,7 @@ def stacked_residuals(
 def term_losses(model: nn.Module, batch) -> dict[str, float]:
     """Per-term MSE for diagnostic logging.
 
-    ``bc`` is always reported, even under ``--embed periodic`` where it is
+    ``bc`` is always reported, even for periodic/Fourier embeddings where it is
     not part of the loss — there it is the check that the embedding is
     doing its job, and should sit at float32 round-off (~1e-14 as an MSE).
     This runs only every ``--log-every`` steps, so the two extra backward
@@ -289,7 +296,7 @@ def term_losses(model: nn.Module, batch) -> dict[str, float]:
 # ========================= Reference solution + eval =========================
 
 DEFAULT_REF_CACHE_DIR = str(REFERENCE_SOLUTIONS_DIR)
-HIGHRES_REFERENCE_NAME = "allen_cahn_highres.mat"
+HIGHRES_REFERENCE_NAME = "allen_cahn_highres_8191_tight.mat"
 REFERENCE_URL = (
     "https://raw.githubusercontent.com/PredictiveIntelligenceLab/jaxpi/"
     "pirate/examples/allen_cahn/data/allen_cahn.mat"
@@ -304,7 +311,8 @@ def allen_cahn_reference(
     """Load a jaxpi or independently generated Allen-Cahn reference.
 
     The jaxpi reference is downloaded on demand. The high-resolution spectral
-    reference is generated and cached on demand. Returns
+    reference uses 8191 periodic points with rtol=2e-13 and atol=2e-15,
+    and is generated and cached on demand. Returns
     ``(t, x, u)`` as CPU float64 tensors with shapes ``(nt,)``, ``(nx,)``,
     ``(nt, nx)`` and ``u[0]`` the initial condition.
     """
@@ -434,11 +442,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     args = p.parse_args(argv)
     if min(args.steps, args.n_pde, args.n_ic, args.n_bc) < 1:
         p.error("steps and collocation counts must be positive")
+    if args.fix_after is not None and not 0 <= args.fix_after < args.steps:
+        p.error("fix_after must satisfy 0 <= fix_after < steps, or be None")
     if args.optimizer == "gnome":
         if not math.isfinite(args.aux_frac) or args.aux_frac <= 0:
             p.error("--aux-frac must be finite and positive")
-        if args.fixed_dataset and args.aux_frac > 1:
-            p.error("--fixed-dataset requires --aux-frac in (0,1] for Gnome")
+        if (args.fixed_dataset or args.fix_after is not None) and args.aux_frac > 1:
+            p.error("fixed_dataset or fix_after requires aux_frac in (0,1] for Gnome")
     if args.float64_after is not None and not 0 <= args.float64_after < args.steps:
         p.error("--float64-after must satisfy 0 <= N < --steps")
     return args
@@ -505,11 +515,10 @@ def _train(args: argparse.Namespace) -> str:
                       f"— using CPU.", flush=True)
             device = torch.device("cpu")
     torch.manual_seed(args.seed)
-    # Only 'periodic' satisfies the BC block exactly, so it is the only one
-    # that drops it. 'fourier' projects raw (t, x) at frequencies that are not
-    # multiples of k, so it needs the soft BC block just as 'none' does.
+    # Both periodic embeddings satisfy the BC block by construction, including
+    # after training the Fourier projection.
     # 'polynomial' matches endpoint values but still needs derivative matching.
-    use_bc = args.embed != "periodic"
+    use_bc = args.embed not in ("periodic", "fourier")
     model = build_model(
         args.arch,
         build_embedding(args.embed, args.embed_dim, args.embed_scale),
@@ -523,10 +532,13 @@ def _train(args: argparse.Namespace) -> str:
         trust_region=args.trust_region,
     )
 
+    fixed_from_step = 0 if args.fixed_dataset else args.fix_after
+    sampling = ("fixed" if fixed_from_step == 0 else
+                "resample_then_fixed" if fixed_from_step is not None else "resample_each_step")
     n_pde_aux = max(8, int(args.n_pde * args.aux_frac))
     n_ic_aux = max(2, int(args.n_ic * args.aux_frac))
     n_bc_aux = max(2, int(args.n_bc * args.aux_frac))
-    if args.fixed_dataset:
+    if fixed_from_step == 0:
         n_pde_aux = min(args.n_pde, n_pde_aux)
         n_ic_aux = min(args.n_ic, n_ic_aux)
         n_bc_aux = min(args.n_bc, n_bc_aux)
@@ -534,6 +546,7 @@ def _train(args: argparse.Namespace) -> str:
 
     hyperparameters = {
         "optimizer": args.optimizer,
+        "partition_residuals": args.optimizer == "gnome" and args.partition_residuals,
         "arch": args.arch,
         # Realized chunk sizes, not the raw flag: 0 and any value >= depth-2
         # both mean "one chunk", and the sweep needs those runs to compare
@@ -555,9 +568,12 @@ def _train(args: argparse.Namespace) -> str:
         "n_ic_aux": n_ic_aux,
         "n_bc_aux": n_bc_aux,
         "fixed_dataset": args.fixed_dataset,
-        "sampling": "fixed" if args.fixed_dataset else "resample_each_step",
+        "fix_after": args.fix_after,
+        "fixed_from_step": fixed_from_step,
+        "sampling": sampling,
         "aux_sampling": (
-            "subsample_fixed_main_each_step" if args.fixed_dataset else "resample_each_step"
+            "subsample_fixed_main_each_step" if fixed_from_step == 0 else
+            "resample_then_subsample_fixed_main" if fixed_from_step is not None else "resample_each_step"
         ) if args.optimizer == "gnome" else None,
         "n_params": n_params,
         "x_domain": (X_MIN, X_MAX),
@@ -595,10 +611,6 @@ def _train(args: argparse.Namespace) -> str:
             os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
         )
         diag = JsonlDiagnostics(diag_path, params=diag_params)
-        # Plain attributes, so this attaches to the already-built optimizer —
-        # which is what lets the file be named after the run id.
-        opt.diagnostics = diag
-        opt.diagnostics_every = args.diagnostics_every
 
     if not args.quiet:
         blocks = "pde+ic+bc" if use_bc else "pde+ic (exact periodic BC)"
@@ -610,7 +622,7 @@ def _train(args: argparse.Namespace) -> str:
             f"  N_pde={args.n_pde} N_ic={args.n_ic} N_bc={args.n_bc} | "
             f"aux={n_pde_aux}/{n_ic_aux}/{n_bc_aux} | steps={args.steps} | "
             f"blocks={blocks} | "
-            f"sampling={'fixed' if args.fixed_dataset else 'resample_each_step'}",
+            f"sampling={sampling} | fix_after={fixed_from_step}",
             flush=True,
         )
         if diag is not None:
@@ -649,12 +661,21 @@ def _train(args: argparse.Namespace) -> str:
                       f"| device={previous_device} → {device}", flush=True)
         if fixed_batch is None:
             main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
-            if args.fixed_dataset:
+            if fixed_from_step is not None and step >= fixed_from_step:
                 fixed_batch = main_batch
+                # Preserve the original auxiliary sampling before the switch;
+                # subsets of the fixed dataset must fit its individual blocks.
+                n_pde_aux = min(args.n_pde, n_pde_aux)
+                n_ic_aux = min(args.n_ic, n_ic_aux)
+                n_bc_aux = min(args.n_bc, n_bc_aux)
+                run.log("sampling", step=step, sampling="fixed",
+                        n_pde_aux=n_pde_aux, n_ic_aux=n_ic_aux, n_bc_aux=n_bc_aux)
+                if not args.quiet and step > 0:
+                    print(f"[{EXPERIMENT}] after {step} steps: training dataset fixed", flush=True)
         else:
             main_batch = fixed_batch
         if args.optimizer == "gnome":
-            if args.fixed_dataset:
+            if fixed_batch is not None:
                 aux_batch = sample_aux_from_batch(main_batch, n_pde_aux, n_ic_aux, n_bc_aux)
             else:
                 aux_batch = sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device)
@@ -667,13 +688,23 @@ def _train(args: argparse.Namespace) -> str:
                 r = stacked_residuals(model, aux_batch, use_bc)
                 return r, torch.zeros_like(r)
 
-            loss = opt.step(main_closure, aux_closure)
+            loss = opt.step(
+                main_closure, aux_closure,
+                surrogate_partition_sizes=(
+                    residual_partition_sizes(aux_batch, use_bc) if args.partition_residuals else None
+                ),
+            )
         else:
             opt.zero_grad()
             r = stacked_residuals(model, main_batch, use_bc)
             loss = (r ** 2).sum() / r.shape[0]
             loss.backward()
             opt.step()
+
+        if (diag is not None and args.optimizer == "gnome"
+                and (step + 1) % args.diagnostics_every == 0):
+            for record in opt.get_diagnostics(params=diag.params):
+                diag(record)
 
         if scheduler is not None:
             scheduler.step()

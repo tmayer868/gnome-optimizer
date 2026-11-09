@@ -10,6 +10,7 @@ from experiments.common.config import (
     CONFIGS_DIR, EXPERIMENTS_DIR, SCHEMAS, ConfigParser,
     default_config_path, load_config_dict, write_config,
 )
+from experiments.common.config_schema import pinn_optimizer_fields
 
 
 @pytest.mark.parametrize("key", sorted(SCHEMAS))
@@ -28,7 +29,7 @@ def test_mirrored_default_and_custom_config_loads(key, tmp_path, monkeypatch):
         default = module.parse_args([])
         custom = module.parse_args(["--config", str(config_path)])
     assert vars(custom) == vars(default)
-    assert set(vars(custom)) == set(config)
+    assert set(vars(custom)) == set(SCHEMAS[key]["fields"])
     with pytest.raises(SystemExit) as error:
         ConfigParser(source).parse_args(["--unknown-setting", "1"])
     assert error.value.code == 2
@@ -74,18 +75,13 @@ def test_incomplete_file_and_exclusive_precision(tmp_path):
         allen_cahn_pinn.parse_args(["--config", str(path)])
 
 
-def test_lists_and_optimizer_dependent_defaults():
-    from experiments.pinns import ldc_pinn, poisson_pinn
+def test_optimizer_dependent_defaults():
+    from experiments.pinns import poisson_pinn
     from experiments.transformers import modded_nanogpt
 
-    args = ldc_pinn.parse_args({"re_stages": [100, 400], "stage_steps": [10, 20],
-                               "block_weights": [1, 1, 10, 100, 100]})
-    assert args.re_stages == [100, 400] and args.stage_steps == [10, 20]
-    assert args.block_weights == [1, 1, 10, 100, 100]
-    with pytest.raises(SystemExit):
-        ldc_pinn.parse_args({"re_stages": "100,400"})
     assert poisson_pinn.parse_args({"optimizer": "woodbury", "beta1": None}).beta1 == 0
-    args = modded_nanogpt.parse_args({"preset": "dev", "synthetic": True, "optimizer": "muon"})
+    args = modded_nanogpt.parse_args({"preset": "dev", "synthetic": True, "optimizer": "muon",
+                                     "steps": None, "lr": None})
     assert args.vocab_size == 256 and args.steps == 5 and args.lr == 0.025
 
 
@@ -96,6 +92,85 @@ def test_vit_config_moved_without_flattening():
     config = cub200_vit.load_config()
     assert {"model", "training", "data", "optimizers"} <= config.keys()
     assert not (CONFIGS_DIR / "cub200_vit.py").exists()
+
+
+PINN_SELECTIONS = [
+    (key, optimizer)
+    for key in SCHEMAS if pinn_optimizer_fields(key)
+    for optimizer in pinn_optimizer_fields(key)
+]
+
+
+@pytest.mark.parametrize("key,optimizer", PINN_SELECTIONS)
+def test_pinn_optimizer_selection_from_file(key, optimizer, tmp_path):
+    config = load_config_dict(CONFIGS_DIR / (key + ".py"))
+    config["optimizer"] = optimizer
+    # Distinct LRs ensure the selected block wins, regardless of dict order.
+    for i, (name, block) in enumerate(config["optimizers"].items(), 1):
+        block["engd_lr" if name == "engd" else "lr"] = i * 1e-4
+    path = write_config(tmp_path / "pinn.py", config)
+    parser = ConfigParser(EXPERIMENTS_DIR / (key + ".py"))
+    args = vars(parser.parse_args(["--config", str(path)]))
+    for name, value in config["optimizers"][optimizer].items():
+        assert args[name] == value
+    assert args["hidden"] == config["hidden"]
+    assert args["depth"] == config["depth"]
+    assert "lr" not in config and "warmup_steps" not in config
+
+
+@pytest.mark.parametrize("case", ["missing_block", "missing_field", "extra_block",
+                                  "misplaced_field", "wrong_type", "not_dict", "flat_lr"])
+def test_pinn_nested_config_validation(case, tmp_path):
+    from experiments.pinns import poisson_pinn
+
+    config = load_config_dict(default_config_path(poisson_pinn.__file__))
+    blocks = config["optimizers"]
+    if case == "missing_block":
+        del blocks["soap"]
+    elif case == "missing_field":
+        del blocks["gnome"]["lr"]
+    elif case == "extra_block":
+        blocks["sgd"] = {"lr": 1e-3}
+    elif case == "misplaced_field":
+        blocks["adamw"]["trust_region"] = 1.0
+    elif case == "wrong_type":
+        blocks["soap"]["lr"] = "1e-3"  # Inactive blocks are validated too.
+    elif case == "not_dict":
+        blocks["soap"] = None
+    else:
+        config["lr"] = 1e-3
+    path = write_config(tmp_path / "invalid.py", config)
+    with pytest.raises(SystemExit):
+        poisson_pinn.parse_args(["--config", str(path)])
+
+
+def test_pinn_nested_overrides_and_inactive_fixed_dataset():
+    from experiments.pinns import poisson_pinn
+
+    args = poisson_pinn.parse_args({
+        "optimizer": "soap",
+        "optimizers": {"soap": {"lr": 2e-4, "warmup_steps": 7},
+                       "gnome": {"lr": 9e-2}, "engdw": {"engdw_fixed": True}},
+    })
+    assert args.lr == 2e-4 and args.warmup_steps == 7
+    assert not args.engdw_fixed and not args.fixed_dataset
+
+
+def test_pinn_sweep_overrides_selected_optimizer(tmp_path):
+    from scripts import sweep
+    from experiments.pinns import poisson_pinn
+
+    defaults = load_config_dict(default_config_path(poisson_pinn.__file__))
+    config = sweep.run_config(dict(experiment="poisson_pinn", optimizer="soap", lr=3e-4,
+                                   optimizers={"soap": {"warmup_steps": 9}}))
+    assert config["optimizers"]["gnome"] == defaults["optimizers"]["gnome"]
+    assert config["optimizers"]["soap"]["lr"] == 3e-4
+    path = write_config(tmp_path / "sweep.py", config)
+    args = poisson_pinn.parse_args(["--config", str(path)])
+    assert args.optimizer == "soap" and args.lr == 3e-4 and args.warmup_steps == 9
+    with pytest.raises(ValueError, match="Duplicate"):
+        sweep.run_config(dict(experiment="poisson_pinn", lr=1e-3,
+                              optimizers={"gnome": {"lr": 1e-2}}))
 
 
 def test_sweep_materializes_complete_nested_config(tmp_path):
@@ -123,14 +198,20 @@ def test_kaggle_config_loads():
     assert args.fp32_embedding and args.save_checkpoint
 
 
-@pytest.mark.parametrize("key,updates", [
-    ("ols_regression", dict(epochs=1, n_train=8, n_val=8, dim=2, batch_size=4, warmup_steps=0)),
-    ("pinns/poisson_pinn", dict(steps=2, hidden=3, depth=2, n_pde=4, n_bc_per_edge=2,
-                               warmup_steps=0, log_every=0, float64=True)),
+@pytest.mark.parametrize("key,optimizer,updates", [
+    *[("pinns/poisson_pinn", optimizer,
+       dict(steps=2, hidden=3, depth=2, n_pde=4, n_bc_per_edge=2,
+            log_every=0, float64=True))
+      for optimizer in ("gnome", "soap", "adamw", "engdw", "woodbury")],
 ])
-def test_entrypoint_trains_from_custom_config(key, updates, tmp_path):
+def test_entrypoint_trains_from_custom_config(key, optimizer, updates, tmp_path):
     config = load_config_dict(CONFIGS_DIR / (key + ".py"))
-    config.update(updates, optimizer="adamw", quiet=True, runs_dir=str(tmp_path / "runs"))
+    if "optimizers" in config:
+        block = config["optimizers"][optimizer]
+        if "warmup_steps" in block:
+            block["warmup_steps"] = 0
+        block["lr"] = 2e-4
+    config.update(updates, optimizer=optimizer, quiet=True, runs_dir=str(tmp_path / "runs"))
     path = write_config(tmp_path / "smoke.py", config)
     result = subprocess.run([sys.executable, "-m", "experiments." + key.replace("/", "."),
                              "--config", str(path)], cwd=EXPERIMENTS_DIR.parent,
@@ -139,5 +220,5 @@ def test_entrypoint_trains_from_custom_config(key, updates, tmp_path):
     logs = list((tmp_path / "runs").rglob("*.jsonl"))
     assert len(logs) == 1
     records = [json.loads(line) for line in logs[0].read_text().splitlines()]
-    assert records[0]["optimizer"] == "adamw"
+    assert records[0]["optimizer"] == optimizer
     assert records[-1]["type"] == "end" and records[-1]["completed"]

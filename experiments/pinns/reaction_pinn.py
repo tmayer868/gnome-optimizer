@@ -26,8 +26,9 @@ By default this repo resamples collocation points everyƒ optimizer step, wherea
 paper's released implementation samples a fixed set, so the numbers are an
 order-of-magnitude anchor rather than a bit-for-bit reproduction.
 
-``--engdw-fixed`` samples ENGD-W's training points once and reuses them for
-all steps; validation remains independent.
+Set ``fixed_dataset=True`` in the config to sample training points once for
+any optimizer. Gnome draws fresh auxiliary subsets of those points; validation
+remains independent. ``engdw_fixed`` remains an ENGD-W-only compatibility alias.
 
 ``--embed periodic`` is an ablation that feeds [t, cos(x), sin(x)]. It makes
 the BC exact and drops that residual block. It is not the published setup and
@@ -43,7 +44,8 @@ Usage:
     uv run -m experiments.pinns.reaction_pinn
     # Edit experiments/configs/pinns/reaction_pinn.py: optimizer='soap', rho=10.0
     uv run -m experiments.pinns.reaction_pinn
-    # Edit experiments/configs/pinns/reaction_pinn.py: optimizer='engdw', rho=5.0, engdw_line_search=True, engdw_damping=1e-06, engdw_chunk=128, steps=1000
+    # Edit experiments/configs/pinns/reaction_pinn.py: optimizer='engdw', rho=5.0, steps=1000
+    # In CONFIG["optimizers"]['engdw']: engdw_line_search=True, engdw_damping=1e-06, engdw_chunk=128
     uv run -m experiments.pinns.reaction_pinn
     # Edit experiments/configs/pinns/reaction_pinn.py: optimizer='gnome', rho=5.0, arch='fused-modified', fuse_every=2, depth=6
     uv run -m experiments.pinns.reaction_pinn
@@ -76,6 +78,7 @@ from experiments.common import (
     ConcatEmbedding,
     PeriodicEmbedding,
 )
+from experiments.common.sampling import sample_aux_from_batch
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
 
 
@@ -167,6 +170,15 @@ def bc_residual(model: nn.Module, t: torch.Tensor) -> torch.Tensor:
     x_l = torch.full_like(t, X_MIN)
     x_r = torch.full_like(t, X_MAX)
     return model(t, x_l) - model(t, x_r)
+
+
+def residual_partition_sizes(batch, use_bc: bool = True) -> list[int]:
+    """Element counts of the PDE, IC, and optional BC residual blocks."""
+    t_pde, _x_pde, x_ic, t_bc = batch
+    sizes = [t_pde.numel(), x_ic.numel()]
+    if use_bc:
+        sizes.append(t_bc.numel())
+    return sizes
 
 
 def stacked_residuals(
@@ -383,7 +395,12 @@ def build_optimizer(
 def parse_args(argv=None) -> argparse.Namespace:
     from experiments.common.config import ConfigParser
     p = ConfigParser(__file__)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if min(args.n_pde, args.n_ic, args.n_bc, args.steps) < 1:
+        p.error("sample counts and steps must be positive")
+    if args.optimizer == "gnome" and args.fixed_dataset and not 0 < args.aux_frac <= 1:
+        p.error("fixed_dataset requires aux_frac in (0,1] for Gnome")
+    return args
 
 
 def train(args: argparse.Namespace) -> str:
@@ -397,6 +414,7 @@ def train(args: argparse.Namespace) -> str:
         raise SystemExit("sample counts and --steps must be positive")
     if args.diagnostics_every > 0 and args.optimizer != "gnome":
         raise SystemExit("--diagnostics-every is Gnome-only")
+    fixed_dataset = args.fixed_dataset or args.engdw_fixed
     if args.optimizer == "engdw":
         if not math.isfinite(args.engdw_momentum) or not 0 <= args.engdw_momentum < 1:
             raise SystemExit("--engdw-momentum must be finite and in [0, 1)")
@@ -469,6 +487,7 @@ def train(args: argparse.Namespace) -> str:
 
     hyperparameters = {
         "optimizer": args.optimizer,
+        "partition_residuals": args.optimizer == "gnome" and args.partition_residuals,
         "steps": args.steps,
         "rho": args.rho,
         "arch": args.arch,
@@ -485,7 +504,11 @@ def train(args: argparse.Namespace) -> str:
         "n_pde_aux": n_pde_aux,
         "n_ic_aux": n_ic_aux,
         "n_bc_aux": n_bc_aux,
-        "sampling": "fixed" if args.engdw_fixed else "resample_each_step",
+        "fixed_dataset": fixed_dataset,
+        "sampling": "fixed" if fixed_dataset else "resample_each_step",
+        "aux_sampling": (
+            "subsample_fixed_main_each_step" if fixed_dataset else "resample_each_step"
+        ) if args.optimizer == "gnome" else None,
         "diagnostics_every": args.diagnostics_every,
         "x_domain": (X_MIN, X_MAX),
         "t_domain": (T_MIN, T_MAX),
@@ -511,8 +534,6 @@ def train(args: argparse.Namespace) -> str:
             os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
         )
         diag = JsonlDiagnostics(diag_path, params=diag_params)
-        opt.diagnostics = diag
-        opt.diagnostics_every = args.diagnostics_every
 
     if not args.quiet:
         blocks = "pde+ic+bc" if use_bc else "pde+ic (exact periodic BC)"
@@ -521,7 +542,8 @@ def train(args: argparse.Namespace) -> str:
             f"arch={args.arch} {args.depth}x{args.hidden} | "
             f"embed={args.embed} | params={n_params:,} | device={device} | "
             f"dtype={torch.get_default_dtype()}\n"
-            f"  blocks={blocks} | N_pde={args.n_pde} | steps={args.steps}",
+            f"  blocks={blocks} | N_pde={args.n_pde} | steps={args.steps} | "
+            f"sampling={'fixed' if fixed_dataset else 'resample_each_step'}",
             flush=True,
         )
 
@@ -538,14 +560,13 @@ def train(args: argparse.Namespace) -> str:
         step_start = time.perf_counter()
         if fixed_batch is None:
             main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
-            if args.engdw_fixed:
+            if fixed_dataset:
                 fixed_batch = main_batch
         else:
             main_batch = fixed_batch
         if args.optimizer == "gnome":
-            aux_batch = sample_batch(
-                n_pde_aux, n_ic_aux, n_bc_aux, device
-            )
+            aux_batch = (sample_aux_from_batch(main_batch, n_pde_aux, n_ic_aux, n_bc_aux)
+                         if fixed_dataset else sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device))
 
             def main_closure():
                 r = stacked_residuals(model, main_batch, args.rho, use_bc)
@@ -555,7 +576,12 @@ def train(args: argparse.Namespace) -> str:
                 r = stacked_residuals(model, aux_batch, args.rho, use_bc)
                 return r, torch.zeros_like(r)
 
-            loss = opt.step(main_closure, aux_closure)
+            loss = opt.step(
+                main_closure, aux_closure,
+                surrogate_partition_sizes=(
+                    residual_partition_sizes(aux_batch, use_bc) if args.partition_residuals else None
+                ),
+            )
         elif args.optimizer == "engdw":
             loss = opt.step(main_batch)
         else:
@@ -564,6 +590,11 @@ def train(args: argparse.Namespace) -> str:
             loss = r.square().sum() / r.shape[0]
             loss.backward()
             opt.step()
+
+        if (diag is not None and args.optimizer == "gnome"
+                and (step + 1) % args.diagnostics_every == 0):
+            for record in opt.get_diagnostics(params=diag.params):
+                diag(record)
 
         applied_lr = current_lr(opt)
         if scheduler is not None:

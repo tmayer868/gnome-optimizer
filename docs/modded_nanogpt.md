@@ -62,37 +62,6 @@ the step and data budgets. Their starting hyperparameters are exploratory,
 not claimed to be tuned benchmark baselines. The standalone AdamW option is
 also an exploratory baseline, not a reproduction of an accepted Adam record.
 
-### Gnome with AdamW embeddings
-
-Enable `embedding_optimizer=adamw` with either Gnome optimizer to assign only
-`model.embed.weight` to an AdamW group inside the same Gnome instance. The output
-head is untied and stays with Gnome, as do the hidden layers and RMSNorm gains.
-`embedding_optimizer=same` is the default and preserves the all-Gnome behavior.
-SOAP and the other optimizer choices retain their existing parameter assignments.
-
-The AdamW group has independent settings: `embed_lr` (default 0.001),
-`embed_beta1` (0.9), `embed_beta2` (0.999), `embed_eps` (1e-8), and
-`embed_weight_decay` (0). These are exploratory settings, not tuned results.
-For Muon, `embed_lr` keeps its existing default of 0.7; its other auxiliary
-AdamW settings are unchanged.
-
-Both groups use the same accumulated token-mean main gradient. Only Gnome
-parameters receive auxiliary curvature gradients and allocate preconditioner
-state. AdamW embeddings start updating on step one, while Gnome's first call
-initializes its basis. The warmup/cooldown multiplier applies to both groups'
-individual learning rates. Logs include the embedding settings and scheduled
-`embedding_lr`; the single Gnome checkpoint contains both groups' state.
-
-Use `fp32_embedding` for CUDA BF16 runs so small embedding updates accumulate
-in FP32 weights. AdamW's moments use FP32 regardless of parameter storage, but
-FP32 moments alone do not prevent rounding when writing back to BF16 weights.
-
-For example, add these flags to a Gnome run:
-
-```bash
---embedding-optimizer adamw --embed-lr 0.001 --fp32-embedding
-```
-
 Muon applies only to hidden matrices, with the reference's separate AdamW groups
 for token embeddings, output weights, and all 1D parameters. It retains summed
 token gradients, as upstream does. Other optimizers use token-mean gradients,

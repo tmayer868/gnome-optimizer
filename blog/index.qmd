@@ -922,24 +922,18 @@ post updates itself on the next render; delete a run and its numbers degrade to 
 rather than silently going stale.
 
 The code is at [`github.com/tmayer868/gnome-optimizer`](https://github.com/tmayer868/gnome-optimizer),
-with dependencies managed by [uv](https://docs.astral.sh/uv/). One command per experiment:
+with dependencies managed by [uv](https://docs.astral.sh/uv/). The OLS and
+Kuramoto–Sivashinsky runners used for this post have since been removed; their
+saved run logs remain readable by the post and viewer. To run the retained PINNs,
+edit their Python configs under `experiments/configs/pinns/`, then run:
 
 ```bash
-git clone https://github.com/tmayer868/gnome-optimizer && cd gnome-optimizer
 uv sync --extra experiments
-
-uv run python -m experiments.ols_regression              --optimizer gnome --lr 0.1
-uv run python -m experiments.pinns.poisson_pinn                --optimizer gnome --steps 50000
-uv run python -m experiments.pinns.burgers_pinn                --optimizer gnome --steps 75000
-uv run python -m experiments.pinns.kuramoto_sivashinsky_pinn   --optimizer gnome --steps 100000
+uv run python -m experiments.pinns.poisson_pinn
+uv run python -m experiments.pinns.burgers_pinn
 ```
 
-Swap `--optimizer soap` or `adamw` for the baselines. The schedule protocol from §1 is
-the default: baseline runs get warmup plus cosine decay to zero out of the box, while
-Gnome ignores the schedule on MSE losses because it self-anneals — so reproducing the
-comparison requires no flag juggling. (`--cosine-decay 1` disables decay for the raw
-fixed-LR baselines of §1.) The regression and PINN experiments run on CPU, Apple MPS, or
-CUDA, whichever is available; the WikiText run (§4) needs `uv sync --extra llm` and a
-GPU. The [README](https://github.com/tmayer868/gnome-optimizer#readme) has the full
-argument lists and the run-artifact format, and
-[`docs/method.md`](../docs/method.md) has the method details that didn't fit here.
+Select the optimizer and schedule in each config. See the
+[README](https://github.com/tmayer868/gnome-optimizer#readme) for current commands
+and the run-artifact format, and [`docs/method.md`](../docs/method.md) for the
+method details.

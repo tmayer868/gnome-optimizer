@@ -32,7 +32,8 @@ Usage:
     uv run -m experiments.pinns.burgers_pinn
     # Edit experiments/configs/pinns/burgers_pinn.py: optimizer='adamw', seed=0
     uv run -m experiments.pinns.burgers_pinn
-    # Edit experiments/configs/pinns/burgers_pinn.py: optimizer='engdw', n_pde=128, n_ic=32, n_bc=16, engdw_line_search=True, steps=1000
+    # Edit experiments/configs/pinns/burgers_pinn.py: optimizer='engdw', n_pde=128, n_ic=32, n_bc=16, steps=1000
+    # In CONFIG["optimizers"]['engdw']: engdw_line_search=True
     uv run -m experiments.pinns.burgers_pinn
 """
 
@@ -582,10 +583,6 @@ def train(args: argparse.Namespace) -> str:
             os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
         )
         diag = JsonlDiagnostics(diag_path, params=diag_params)
-        # Plain attributes, so this attaches to the already-built optimizer —
-        # which is what lets the file be named after the run id.
-        opt.diagnostics = diag
-        opt.diagnostics_every = args.diagnostics_every
 
     if not args.quiet:
         print(
@@ -645,6 +642,11 @@ def train(args: argparse.Namespace) -> str:
             loss = (r ** 2).sum() / r.shape[0]
             loss.backward()
             opt.step()
+
+        if (diag is not None and args.optimizer == "gnome"
+                and (step + 1) % args.diagnostics_every == 0):
+            for record in opt.get_diagnostics(params=diag.params):
+                diag(record)
 
         applied_lr = current_lr(opt)
         if scheduler is not None:

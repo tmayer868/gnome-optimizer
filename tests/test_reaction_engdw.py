@@ -127,6 +127,8 @@ def test_training_and_metadata(tmp_path, monkeypatch, optimizer):
         "--engdw-chunk", "3", "--log-every", "0", "--runs-dir", str(tmp_path),
         "--quiet",
     ] + (["--engdw-momentum", "0.95"] if optimizer == "engdw" else [])))
+    args.fixed_dataset = False
+    args.engdw_fixed = False
     path = reaction.train(args)
     with open(path) as file:
         records = [json.loads(line) for line in file]
@@ -187,6 +189,8 @@ def test_engdw_training_points_and_validation_sampling(tmp_path, monkeypatch, fi
         "--engdw-momentum", str(momentum),
         "--log-every", "1", "--runs-dir", str(tmp_path), "--quiet",
     ] + (["--engdw-fixed"] if fixed else [])))
+    args.fixed_dataset = False
+    args.engdw_fixed = fixed
     with open(reaction.train(args)) as file:
         records = [json.loads(line) for line in file]
     assert records[0]["hyperparameters"]["sampling"] == (

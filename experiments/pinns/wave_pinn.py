@@ -35,11 +35,14 @@ Architecture options (all share the optimizer, so it's the only variable):
       does NOT enforce wave's *Dirichlet* BC (cos(πx)≠0 at the boundaries);
       it only helps spectrally. It's the embedding that makes sense for the
       *periodic* AC problem.
-    - ``fourier``: trainable Fourier features of ``(t, x)`` —
+    - ``fourier``: first embed ``(t, x)`` as ``z = [t, cos(πx), sin(πx)]``,
+      then apply trainable Fourier features —
       ``[sin(zB), cos(zB)]`` with ``B`` initialized from ``N(0, scale²)``.
       The spectral aid the wave solution's high modes want;
       ``--fourier-scale`` controls the initial frequency spread (jaxpi uses
       10 for wave), after which optimization can move the frequencies.
+      This preserves period-2 spatial periodicity; Dirichlet BCs still
+      require the soft loss or the ``hard_bc`` output transform.
 * ``--hard-bc`` — enforce the Dirichlet BC by construction via the output
   transform ``u = sin(πx)·N(t, x)`` (vanishes at x = 0, 1). When set, the
   soft ``bc`` loss block is dropped (it would be identically zero). This is
@@ -454,10 +457,6 @@ def train(args: argparse.Namespace) -> str:
             os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
         )
         diag = JsonlDiagnostics(diag_path, params=diag_params)
-        # Plain attributes, so this attaches to the already-built optimizer —
-        # which is what lets the file be named after the run id.
-        opt.diagnostics = diag
-        opt.diagnostics_every = args.diagnostics_every
 
     if not args.quiet:
         embed_desc = args.embed
@@ -502,6 +501,11 @@ def train(args: argparse.Namespace) -> str:
             loss = (r ** 2).sum() / r.shape[0]
             loss.backward()
             opt.step()
+
+        if (diag is not None and args.optimizer == "gnome"
+                and (step + 1) % args.diagnostics_every == 0):
+            for record in opt.get_diagnostics(params=diag.params):
+                diag(record)
 
         if scheduler is not None:
             scheduler.step()

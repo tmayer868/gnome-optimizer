@@ -77,7 +77,7 @@ def test_training_switch_preserves_state(tmp_path, monkeypatch, optimizer, arch,
         assert_preserved(before, opt.state_dict())
         assert_preserved(weights, model.state_dict())
         assert schedulers[0].state_dict() == schedule
-        assert set(model.parameters()) == set(opt.state)
+        assert {p for p in model.parameters() if p.requires_grad} == set(opt.state)
         for state in opt.state.values():
             for key in ("grad_m", "gnd_m", "exp_avg", "exp_avg_sq"):
                 if key in state:
@@ -98,13 +98,13 @@ def test_training_switch_preserves_state(tmp_path, monkeypatch, optimizer, arch,
     monkeypatch.setattr(ac, "build_optimizer", capture_optimizer)
     monkeypatch.setattr(ac, "switch_to_float64", capture_switch)
     monkeypatch.setattr(ac, "eval_rel_l2", capture_eval)
-    args = ac.parse_args(config_overrides(ac, [
+    args = ac.parse_args({"float64": False, "fix_after": None, **config_overrides(ac, [
         "--optimizer", optimizer, "--arch", arch, "--embed", embed,
         "--embed-dim", "4", "--embed-scale", "1", "--hidden", "4", "--depth", "3",
         "--float64-after", "2", "--steps", "23", "--warmup-steps", "4",
         "--n-pde", "5", "--n-ic", "4", "--n-bc", "3", "--log-every", "1",
         "--runs-dir", str(tmp_path), "--quiet",
-    ]))
+    ])})
     # train() must start in FP32 even when the caller has another default,
     # and restore that default when done.
     torch.set_default_dtype(torch.float64)
@@ -134,7 +134,8 @@ def test_training_switch_preserves_state(tmp_path, monkeypatch, optimizer, arch,
 ])
 def test_invalid_precision_options(flags):
     with pytest.raises(SystemExit):
-        ac.parse_args(config_overrides(ac, ["--optimizer", "gnome", *flags]))
+        ac.parse_args({"float64": False, "fix_after": None,
+                       **config_overrides(ac, ["--optimizer", "gnome", *flags])})
 
 
 @pytest.mark.parametrize("flags,dtype", [
@@ -142,7 +143,8 @@ def test_invalid_precision_options(flags):
     (["--float64-after", "0"], torch.float64),
 ])
 def test_starting_precision_and_restoration(monkeypatch, flags, dtype):
-    args = ac.parse_args(config_overrides(ac, ["--optimizer", "gnome", *flags]))
+    args = ac.parse_args({"float64": False, "float64_after": None, "fix_after": None,
+                          **config_overrides(ac, ["--optimizer", "gnome", *flags])})
     def training(args):
         assert torch.get_default_dtype() == dtype
         raise RuntimeError("test cleanup")

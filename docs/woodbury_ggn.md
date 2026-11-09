@@ -70,7 +70,8 @@ the Woodbury subtraction; `gram_float64` also promotes that reconstruction.
 A small initial run with fixed main points and fresh auxiliary subsets:
 
 ```bash
-# Edit experiments/configs/pinns/poisson_pinn.py: optimizer='woodbury', fixed_dataset=True, hidden=8, depth=3, n_pde=32, n_bc_per_edge=4, aux_frac=0.5, steps=300, lr=0.001, woodbury_damping=0.1, beta2=0.9, warmup_steps=0, cosine_decay=1.0, float64=True, diagnostics_every=50, log_every=50
+# Edit experiments/configs/pinns/poisson_pinn.py: optimizer='woodbury', fixed_dataset=True, hidden=8, depth=3, n_pde=32, n_bc_per_edge=4, steps=300, float64=True, diagnostics_every=50, log_every=50
+# In CONFIG["optimizers"]['woodbury']: aux_frac=0.5, lr=0.001, woodbury_damping=0.1, beta2=0.9, warmup_steps=0, cosine_decay=1.0
 uv run -m experiments.pinns.poisson_pinn
 ```
 

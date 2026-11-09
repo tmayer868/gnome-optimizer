@@ -75,12 +75,10 @@ def test_cosine_schedule_warmup_and_endpoints(floor):
     assert multiplier(100) == pytest.approx(floor)
 
 
-@pytest.mark.parametrize("optimizer,embedding_optimizer", [
-    ("gnome_hutchinson", "same"), ("gnome_hutchinson", "adamw"), ("muon", "same"),
-])
-def test_cosine_schedule_applied_to_groups_and_logged(tmp_path, optimizer, embedding_optimizer):
+@pytest.mark.parametrize("optimizer", ["gnome_hutchinson", "muon"])
+def test_cosine_schedule_applied_to_groups_and_logged(tmp_path, optimizer):
     args = tiny_args(optimizer, "--runs-dir", str(tmp_path), "--quiet", "--save-checkpoint",
-                     "--embedding-optimizer", embedding_optimizer, "--steps", "7",
+                     "--steps", "7",
                      "--warmup-steps", "3", "--lr-schedule", "cosine", "--min-lr-frac", "0.1")
     path = bench.run(args)
     records = [json.loads(line) for line in path.read_text().splitlines()]
@@ -90,8 +88,6 @@ def test_cosine_schedule_applied_to_groups_and_logged(tmp_path, optimizer, embed
     expected = [1 / 3, 2 / 3, 1, 0.1 + 0.45 * (1 + math.sqrt(0.5)),
                 0.55, 0.1 + 0.45 * (1 - math.sqrt(0.5)), 0.1]
     assert [r["lr"] for r in train] == pytest.approx([args.lr * v for v in expected])
-    if embedding_optimizer == "adamw":
-        assert [r["embedding_lr"] for r in train] == pytest.approx([args.embed_lr * v for v in expected])
     saved = torch.load(records[-1]["checkpoint"], weights_only=True)
     for opt in saved["optimizers"]:
         for group in opt["param_groups"]:
@@ -269,12 +265,9 @@ def test_invalid_shards_and_missing_data(tmp_path):
         TokenStream(path, 8, 4, vocab_size=4).next_batch()
 
 
-@pytest.mark.parametrize("optimizer,embedding_optimizer", [
-    ("adamw", "same"), ("gnome_hutchinson", "same"), ("gnome_fisher", "same"), ("muon", "same"),
-    ("gnome_hutchinson", "adamw"), ("gnome_fisher", "adamw"),
-])
-def test_microbatch_accumulation_matches_full_batch(optimizer, embedding_optimizer):
-    args = tiny_args(optimizer, "--embedding-optimizer", embedding_optimizer)
+@pytest.mark.parametrize("optimizer", ["adamw", "gnome_hutchinson", "gnome_fisher", "muon"])
+def test_microbatch_accumulation_matches_full_batch(optimizer):
+    args = tiny_args(optimizer)
     torch.manual_seed(10)
     model = GPT(args.vocab_size, args.n_layer, args.n_embd, args.head_dim)
     full = deepcopy(model)
@@ -330,13 +323,10 @@ def test_evaluation_weights_tokens_and_restores_mode():
     assert model.training
 
 
-@pytest.mark.parametrize("optimizer,embedding_optimizer", [
-    ("adamw", "same"), ("soap", "same"), ("gnome_hutchinson", "same"), ("gnome_fisher", "same"),
-    ("muon", "same"), ("gnome_hutchinson", "adamw"), ("gnome_fisher", "adamw"),
-])
-def test_end_to_end_logs_and_checkpoint(tmp_path, optimizer, embedding_optimizer):
+@pytest.mark.parametrize("optimizer", ["adamw", "soap", "gnome_hutchinson", "gnome_fisher", "muon"])
+def test_end_to_end_logs_and_checkpoint(tmp_path, optimizer):
     args = tiny_args(optimizer, "--runs-dir", str(tmp_path), "--save-checkpoint", "--quiet",
-                     "--embedding-optimizer", embedding_optimizer, "--embed-lr", "0.002")
+                     "--embed-lr", "0.002")
     path = bench.run(args)
     records = [json.loads(line) for line in path.read_text().splitlines()]
     hp = records[0]["hyperparameters"]
@@ -359,44 +349,6 @@ def test_end_to_end_logs_and_checkpoint(tmp_path, optimizer, embedding_optimizer
     assert records[-1]["training_seconds"] > 0
     checkpoint = torch.load(records[-1]["checkpoint"], weights_only=True)
     assert checkpoint["step"] == 3
-    if embedding_optimizer == "adamw":
-        assert hp["embedding_optimizer"] == "adamw"
-        for row in train:
-            multiplier = bench.schedule_multiplier(row["step"] - 1, args.steps, args.cooldown_frac)
-            assert row["metrics"]["embedding_lr"] == pytest.approx(0.002 * multiplier)
-        assert len(checkpoint["optimizers"]) == 1
-        groups = checkpoint["optimizers"][0]["param_groups"]
-        assert [g["update_rule"] for g in groups] == ["gnome", "adamw"]
-        embed_state = checkpoint["optimizers"][0]["state"][groups[1]["params"][0]]
-        assert set(embed_state) == {"step", "exp_avg", "exp_avg_sq"}
-        assert embed_state["step"] == 3
-
-
-def test_gnome_embedding_adamw_groups_and_first_update():
-    args = tiny_args("gnome_hutchinson", "--embedding-optimizer", "adamw",
-                     "--embed-lr", "0.002", "--embed-beta1", "0.8", "--embed-beta2", "0.95",
-                     "--embed-eps", "1e-7", "--embed-weight-decay", "0.1")
-    model = GPT(args.vocab_size, args.n_layer, args.n_embd, args.head_dim, head_init_std=0.02)
-    opts = bench.build_optimizers(model, args, torch.device("cpu"))
-    assert len(opts) == 1
-    gnome, adam = opts[0].param_groups
-    assert adam["params"] == [model.embed.weight]
-    assert all(p is not model.embed.weight for p in gnome["params"])
-    assert any(p is model.proj.weight for p in gnome["params"])
-    assert (adam["lr"], adam["betas"], adam["eps"], adam["weight_decay"]) == (
-        0.002, (0.8, 0.95), 1e-7, 0.1)
-    original = deepcopy(model.state_dict())
-    x, y = torch.randint(32, (5, 4)), torch.randint(32, (5, 4))
-    bench.train_step(model, opts, (x, y), args, torch.device("cpu"), torch.Generator())
-    assert not torch.equal(model.embed.weight, original["embed.weight"])
-    for name, p in model.named_parameters():
-        if name != "embed.weight":
-            torch.testing.assert_close(p, original[name], atol=0, rtol=0)
-
-
-def test_embedding_override_requires_gnome():
-    with pytest.raises(SystemExit):
-        tiny_args("soap", "--embedding-optimizer", "adamw")
 
 
 def test_real_shard_run_and_exhaustion_preflight(tmp_path):

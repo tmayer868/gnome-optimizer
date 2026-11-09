@@ -320,6 +320,7 @@ def test_poisson_integration(tmp_path, monkeypatch, fixed, arch, dtype):
         "--steps", "4", "--n-pde", "8", "--n-bc-per-edge", "3", "--aux-frac", "0.5",
         "--woodbury-damping", "0.1", "--max-history", "2", "--gram-float64",
         "--woodbury-warmup-steps", "2",
+        "--beta1", "0", "--trust-region", "1.0",
         "--diagnostics-every", "2", "--diagnostics-params", "0", "--warmup-steps", "0",
         "--log-every", "2", "--runs-dir", str(tmp_path), "--quiet",
     ] + (["--fixed-dataset"] if fixed else [])))

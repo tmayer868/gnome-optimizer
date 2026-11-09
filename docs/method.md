@@ -48,10 +48,15 @@ with the un-square-rooted denominator. This is the diagonal Gauss-Newton update 
 A pure Newton step has no built-in step-size control. Gnome imposes an **l2 trust region** on the update in the rotated basis:
 
 $$
-\| \Delta\tilde\theta \|_2 \;\le\; T \;=\; c \sqrt{\|p_t\|_2^2 + S_0},
+\| \Delta\tilde\theta \|_2 \;\le\; T, \qquad
+T =
+\begin{cases}
+c\sqrt{N}, & \text{CCE}, \\
+c\sqrt{\|W\|_2^2 + 1}, & \text{MSE}.
+\end{cases}
 $$
 
-where $c$ is `trust_radius` and $S_0 = \|p_0\|_2^2$ is captured when that parameter first participates in an optimizer step. The smallest $\lambda \ge \varepsilon$ that satisfies this constraint is found by solving the secular equation
+Here $c$ is `trust_radius`, $W$ is the current parameter tensor, and $N = \operatorname{numel}(W)$ is its number of scalar parameters. The norm $\|W\|_2$ is the Euclidean norm of the flattened tensor (the Frobenius norm for a matrix). Both CCE surrogate variants, `cce` and `cce_hutchinson`, use the CCE budget. The smallest $\lambda \ge \varepsilon$ that satisfies this constraint is found by solving the secular equation
 
 $$
 \phi(\lambda) \;=\; \left\| \frac{\hat m}{\hat v + \lambda} \right\|_2 \;=\; T,
@@ -64,9 +69,9 @@ via Hebden's reciprocal Newton method. Convergence takes 2 to 3 iterations, warm
 1. **It preserves the update direction.** Uniform damping shrinks the step along the Newton-to-gradient-descent continuum without distorting which coordinates move relative to each other. Per-coordinate clipping projects onto an l-infinity ball, which can scramble the relative ordering of updates.
 2. **No single coordinate dominates.** The l2 norm aggregates all $P$ coordinates, so an outlier with spuriously small $\hat v_i$ cannot single-handedly set the damping for the entire tensor.
 
-**Initialization-based scale.** The budget grows with the current parameter norm and retains the initialization norm as a floor. Equivalently, its RMS form is $T/\sqrt{P} = c\sqrt{\operatorname{mean}(p_t^2) + S_0/P}$. This replaces an absolute per-coordinate floor with a model-supplied scale and adds no hyperparameter.
+**Loss-dependent scale.** For CCE, $T=c\sqrt{N}$ gives a constant RMS update budget $T/\sqrt{N}=c$, independent of the parameter magnitudes. For MSE, $T=c\sqrt{\|W\|_2^2+1}$ grows with the current parameter norm and has a nonzero floor of $c$ at $W=0$. Its RMS form is $T/\sqrt{N}=c\sqrt{\operatorname{mean}(W^2)+1/N}$.
 
-Each parameter stores `initial_sq_norm = p.detach().square().sum()` only if that state entry is absent. If that squared norm is zero, store `1.0` instead. This is the expected squared norm of a length-$N$ vector with Xavier variance $1/N$, assuming a hypothetical square layer: $N(1/N)=1$. It is a scale proxy, not a claim about the tensor's actual layer dimensions. The initial parameters remain zero. Ordinary optimizer checkpointing saves and restores the scalar; older checkpoints acquire it on the next step.
+These budgets depend on the tensor's size or current norm; neither requires an initialization-norm reference.
 
 The existing coordinate clamp to `[-1, 1]` after projection remains in place; it can only reduce the update norm. The trust budget applies before learning-rate scaling and excludes decoupled weight decay.
 
@@ -306,7 +311,7 @@ For each minibatch, with `main_closure` returning $(\hat y, y)$ on the $B-K$ mai
 
    *Global gradient clipping.* If `max_grad_norm` is set, the accumulated main gradient is rescaled so its total L2 norm (across all parameters) does not exceed the given value, matching `torch.nn.utils.clip_grad_norm_`. The curvature surrogate gradient $g_s$ is intentionally left unclipped. Its scale is calibrated by the $1/\sqrt{K}$ normalization and should not be distorted.
 
-2. **Aux forward + backward.** Build $S$ per §5 from the aux logits and sampled randomness. Gradient $g_s = \nabla_\theta S$. Free the aux graph.
+2. **Aux forward + backward.** Build $S$ per §5 from the aux logits and sampled randomness. Gradient $g_s = \nabla_\theta S$. Free the aux graph. With multiple `surrogate_partition_sizes`, compute the partition gradients in one batched backward and use the sums of curvature contributions described in §6.2.
 
 3. **Per-parameter update.** For each parameter tensor:
    - Update the Kronecker factors $L, R$ with EMA from $g_s g_s^\top$ and $g_s^\top g_s$ (`shampoo_beta`).
@@ -314,18 +319,71 @@ For each minibatch, with `main_closure` returning $(\hat y, y)$ on the $B-K$ mai
    - Project $g_{\text{main}}$ and $g_s$ into the rotated basis: $\tilde g = Q_L^\top g\, Q_R$.
    - Update the first-moment EMA from $\tilde g_{\text{main}}$ (`beta1`) and the second-moment EMA from $\tilde g_s^{\,2}$ (`beta2`).
    - Apply bias correction to obtain $\hat m$ and $\hat v$.
-   - Solve for the trust-region damping $\lambda$: the smallest value $\ge \varepsilon$ such that $\|\hat m / (\hat v + \lambda)\|_2 \le c\sqrt{\|p_t\|_2^2 + S_0}$, where $c$ is `trust_radius` and $S_0$ is the fixed initialization reference from §2. Solved via Hebden's reciprocal Newton method (2 to 3 iterations), warm-started from the previous step's $\lambda$, with an analytic bracket from $\min(\hat v)$ and $\max(\hat v)$.
+   - Solve for the trust-region damping $\lambda$: the smallest value $\ge \varepsilon$ such that $\|\hat m / (\hat v + \lambda)\|_2 \le T$, using $T=c\sqrt{N}$ for CCE and $T=c\sqrt{\|W\|_2^2+1}$ for MSE. Here $c$ is `trust_radius`, $N$ is the parameter tensor's element count, and $W$ is its current value, as in §2. Solved via Hebden's reciprocal Newton method (2 to 3 iterations), warm-started from the previous step's $\lambda$, with an analytic bracket from $\min(\hat v)$ and $\max(\hat v)$.
    - Compute the damped Newton step: $\Delta \tilde\theta = \hat m / (\hat v + \lambda)$.
    - Project back to the parameter basis: $\Delta\theta = Q_L \, \Delta\tilde\theta \, Q_R^\top$. Because the $Q$ matrices are orthonormal, $\|\Delta\theta\|_2 = \|\Delta\tilde\theta\|_2$. The trust region bound is preserved exactly.
    - Apply with $-\text{lr}$, then decoupled weight decay. Gnome owns no learning-rate schedule: `lr` is read from the parameter group on every step and multiplies the update *after* the trust-region solve, so it scales step length linearly and any `torch.optim.lr_scheduler` drives Gnome exactly as it drives AdamW.
 
-Two independent forward passes (one for main, one for aux) cost more than a single shared forward, but mean we don't need `retain_graph=True` and don't have to hold the main batch's activations alive while running the surrogate backward. The aux batch is small (default $K=10$), so the second pass is cheap.
+Two independent forward passes (one for main, one for aux) avoid holding the main batch's activations alive while running the surrogate backward. Neither the default single-surrogate path nor the batched partition path needs `retain_graph=True`; each releases the auxiliary graph in its gradient call.
 
 `grad_m` (a vector quantity in the rotated basis) is translated through eigenbasis refreshes: it is rotated back to the parameter basis before the new $Q$ is computed and projected forward into the new basis afterwards. `gnd_m` (a diagonal variance) is permuted along the corresponding tensor axis to match the new eigenvalue ordering but is not re-rotated, matching SOAP's treatment of `exp_avg_sq`.
 
 ### 6.1 The `norm_free` option
 
 By default, the squared surrogate $\tilde g_s^2$ enters the curvature EMA directly. When the surrogate magnitude decays faster than the EMA window (common early in classification training), the oldest entries still in the window carry the most mass and the curvature estimate tracks an obsolete scale. Setting `norm_free=True` normalizes each contribution to unit norm before it enters the EMA, so `beta2` controls recency rather than being overridden by a decaying $\|g_s\|$. Off by default: on MSE objectives the shrinking $\hat v$ is the self-annealing mechanism that lets Gnome hold a fixed learning rate, and normalizing would remove it. Turn it on for fast-learning objectives (classification) where the loss moves a long way inside one EMA window. Note that it rescales $\hat v$, so `lr` generally needs retuning when toggled.
+
+### 6.2 Partitioned surrogates: compute versus variance
+
+`opt.step(main_closure, aux_closure, surrogate_partition_sizes=[n_1, n_2, ...])`
+partitions the auxiliary output into contiguous slices along its first axis.
+The sizes must be positive integers with $\sum_j n_j=K$, the total auxiliary
+batch size. Omitting the argument is equivalent to `[K]`.
+
+For partition $I_j$, form
+
+$$
+S_j = \frac{1}{\sqrt K}\sum_{k\in I_j}\hat y_k^\top A_kR_k,
+\qquad g_j=\nabla_\theta S_j.
+$$
+
+The normalization stays global. Equivalently, a locally normalized surrogate
+would need an additional factor $\sqrt{n_j/K}$. The original surrogate gradient
+is $\sum_j g_j$, so its outer product includes cross terms $g_jg_l^\top$.
+Independent zero-mean probes make those cross terms vanish in expectation.
+Partitioning removes them on every step by using
+
+$$
+\widehat H=\sum_jg_jg_j^\top,
+\qquad \mathbb E_R[\widehat H]=\frac1K\sum_kJ_k^\top H_{y,k}J_k.
+$$
+
+For matrix-shaped parameter gradients $G_j$, update the Kronecker factor EMAs
+once from $\sum_jG_jG_j^\top$ and $\sum_jG_j^\top G_j$. Project each gradient
+in the same current basis, $\widetilde G_j=Q_L^\top G_jQ_R$, and update the
+curvature EMA once from $\sum_j\widetilde G_j^{\,2}$. Never sum the gradients
+before taking outer products or squares. The main-gradient momentum and the
+basis-refresh schedule still advance once per logical step. With
+`use_soap_basis=True`, only the curvature EMA uses the partitioned contributions;
+the basis factors still use the main gradient. With `norm_free=True`, normalize
+the summed squared contribution once, preserving relative partition weights.
+
+For the already-scaled PINN vector from `stack_residuals`, partition sizes are
+the auxiliary blocks' element counts, such as `[n_pde, n_ic, n_bc]`. Combining
+the global normalization with the block scaling in §8 gives
+$S_j=\sqrt{2\lambda_j/n_j}\,r_j^\top R_j$ for raw residual block $r_j$.
+Thus unequal block sizes keep their intended loss weights. A block with multiple
+output components contributes all of its elements to its partition size.
+
+There is one auxiliary forward. For multiple partitions, stack the scalar
+surrogates into a vector and call `torch.autograd.grad` with identity seeds and
+`is_grads_batched=True`. PyTorch's vmap backend batches the vector-Jacobian
+products, returning gradients shaped `[num_partitions, *parameter.shape]`.
+The partition axis is kept separate through curvature accumulation. A single
+partition uses ordinary `autograd.grad` without vmap overhead. The auxiliary
+graph is released by the gradient call, and the separate parameter gradients
+are stored until the update. Finer partitions remove more cross-partition noise
+at the cost of more backward work and gradient storage. Sizes are supplied per
+step, can vary with the auxiliary batch, and are not optimizer checkpoint state.
 
 ## 7. Why the un-square-rooted denominator (again, briefly)
 

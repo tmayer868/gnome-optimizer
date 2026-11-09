@@ -84,6 +84,8 @@ def test_engdw_training_sampling_and_metadata(tmp_path, monkeypatch, arch, fixed
         "--engdw-chunk", "3", "--engdw-damping", "0.001", "--engdw-momentum", "0.9",
         "--lr", "0.05", "--runs-dir", str(tmp_path), "--quiet",
     ] + (["--engdw-fixed"] if fixed else []) + (["--engdw-line-search"] if line_search else [])))
+    args.engdw_fixed = fixed
+    args.engdw_line_search = line_search
     path = poisson.train(args)
     with open(path) as f:
         records = [json.loads(line) for line in f]
