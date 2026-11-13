@@ -8,6 +8,7 @@ relative path here. For example:
 | `experiments.viewer` | `experiments/configs/viewer.py` |
 | `experiments.pinns.allen_cahn_pinn` | `experiments/configs/pinns/allen_cahn_pinn.py` |
 | `experiments.pinns.heat5d_pinn` (four spatial dimensions plus time) | `experiments/configs/pinns/heat5d_pinn.py` |
+| `experiments.pinns.heat_6d` (five spatial dimensions in a unit ball plus time) | `experiments/configs/pinns/heat_6d.py` |
 | `experiments.resnets.cub200` | `experiments/configs/resnets/cub200.py` |
 | `experiments.transformers.cub200_vit` | `experiments/configs/transformers/cub200_vit.py` |
 | `experiments.tabular.covertype` | `experiments/configs/tabular/covertype.py` |
@@ -48,6 +49,14 @@ CONFIG = {
 ```
 
 For example, edit `CONFIG["optimizers"]["gnome"]["lr"]` to tune only Gnome.
+
+Reaction, convection, and Allen–Cahn expose Gnome's EMA basis-update ablation
+as `CONFIG["optimizers"]["gnome"]["basis_transport"]`. Choose
+`"overlap"` (default) for squared-overlap curvature transport or
+`"soap"` for the previous permutation-only curvature handling.
+Both transport the gradient EMA as a vector. This changes EMA handling inside
+Gnome; select `optimizer="gnome"` for either mode. The chosen mode
+is recorded in run metadata and optimizer checkpoints.
 Allen–Cahn, Burgers 2D, convection, reaction, and Heat 5D enable
 `CONFIG["optimizers"]["gnome"]["partition_residuals"] = True`. Each auxiliary
 PDE/IC/BC residual block gets a separate curvature contribution, computed in one
@@ -57,10 +66,44 @@ boundary-derivative residuals for Allen–Cahn. Set this option to `False` to us
 one surrogate over the entire stacked residual. Other optimizers ignore it;
 run metadata records whether partitioning is active.
 
+KdV exposes top-level `weights=[1.0, 1.0, 1.0]` in PDE/IC/BC order,
+and `optimizers["gnome"]["partition_residuals"]` (default `False`).
+Its boundary block combines periodic residuals for `u`, `u_x`,
+and `u_xx`, so the partition sizes are
+`[n_pde_aux, n_ic_aux, 3 * n_bc_aux]`. The BC weight multiplies the mean
+over that entire block. Weights apply to all optimizers, including ENGD and the
+L-BFGS refinement; per-term diagnostic MSEs remain unweighted.
+
+KdV also supports top-level `float64_after=N`: run N steps in float32,
+then finish in float64 with the existing optimizer state and learning-rate
+schedule. `None` disables switching; `0` starts in float64.
+Require `0 <= N < steps` and do not combine it with `float64=True`.
+An MPS run moves to CPU at the switch. The reference retains its original
+precision, and any subsequent L-BFGS refinement uses the finishing precision.
+
+Heat 6D supports top-level `fix_after=N` for every optimizer: resample
+for N steps, then retain the PDE/IC/BC batch sampled at zero-based step N.
+`None` keeps resampling; `0` fixes the batch from the start.
+Gnome draws fresh auxiliary subsets of the fixed blocks without replacement,
+clamping auxiliary sizes to the available points. Validation continues to use
+independent samples. ENGD-W's `engdw_fixed=True` fixes from step zero
+and takes precedence over `fix_after`.
+
 Reaction and convection support top-level `fixed_dataset=True` for every
 optimizer. Gnome draws fresh auxiliary subsets of the fixed main dataset;
 validation remains independent. Their existing `optimizers["engdw"]["engdw_fixed"]`
 option still enables fixed sampling for ENGD-W, even when `fixed_dataset=False`.
+Both also accept top-level `fix_after=None` (default), or an integer in
+`[0, steps)`. For example, `fixed_dataset=False, fix_after=5_000` resamples
+for 5,000 iterations, samples one new batch at step index 5,000, and reuses it
+thereafter. `0` freezes immediately. `fixed_dataset=True` and ENGD-W's
+`engdw_fixed=True` override the delay and freeze from step zero. SS-Broyden
+hybrids freeze at the earlier of `fix_after` and their optimizer handoff;
+there is no resampling during SS-Broyden. Gnome draws new auxiliary subsets
+from the fixed main batch after freezing; validation stays independently
+sampled. Logs include the requested `fix_after`, effective `fixed_from_step`,
+and a `sampling` event when the batch becomes fixed.
+
 Existing field names are retained, including `trust_region`, `beta1`, `beta2`,
 and solver-prefixed names such as `engdw_damping`. The `adamw+lbfgs` block
 contains both the AdamW phase settings and the `lbfgs_*` refinement settings.
@@ -120,3 +163,9 @@ When adding a flat-config experiment, add its defaults here, register field
 types/choices in `experiments/common/config_schema.py`, and construct
 `ConfigParser(__file__)` in the runner. Keep conditional defaults and checks
 with the experiment's parsing function.
+
+Allen–Cahn also accepts `soap+ssbroyden`, with `soap_steps` choosing the
+warm-start budget within total `steps`. Its SOAP schedule spans `soap_steps`;
+refinement fixes the training set and uses float64 by the handoff. Earlier
+`fix_after` and `float64_after` switches still apply. See the
+[Allen–Cahn hybrid details](../../docs/soap_ssbroyden.md#allencahn).

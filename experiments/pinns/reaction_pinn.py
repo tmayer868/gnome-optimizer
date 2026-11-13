@@ -29,6 +29,9 @@ order-of-magnitude anchor rather than a bit-for-bit reproduction.
 Set ``fixed_dataset=True`` in the config to sample training points once for
 any optimizer. Gnome draws fresh auxiliary subsets of those points; validation
 remains independent. ``engdw_fixed`` remains an ENGD-W-only compatibility alias.
+Set ``fix_after=N`` to resample for N steps, then reuse PDE/IC/BC points.
+``None`` preserves default sampling; ``fixed_dataset=True`` overrides the delay.
+SS-Broyden hybrids freeze no later than their optimizer handoff.
 
 ``--embed periodic`` is an ablation that feeds [t, cos(x), sin(x)]. It makes
 the BC exact and drops that residual block. It is not the published setup and
@@ -77,6 +80,10 @@ from experiments.common import (
     pick_device,
     ConcatEmbedding,
     PeriodicEmbedding,
+)
+from experiments.common.ssbroyden import (
+    build_gnome_phase, build_soap_phase, build_ssbroyden_phase,
+    validate_ssbroyden, warm_start_steps,
 )
 from experiments.common.sampling import sample_aux_from_batch
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
@@ -182,9 +189,10 @@ def residual_partition_sizes(batch, use_bc: bool = True) -> list[int]:
 
 
 def stacked_residuals(
-    model: nn.Module, batch, rho: float, use_bc: bool = True
+    model: nn.Module, batch, rho: float, use_bc: bool = True,
+    weights=(1.0, 1.0, 1.0),
 ) -> torch.Tensor:
-    """Stack equal-weight PDE, IC, and optional periodic-BC blocks."""
+    """Stack PDE, IC, and optional periodic-BC blocks with loss weights."""
     t_pde, x_pde, x_ic, t_bc = batch
     blocks = [
         pde_residual(model, t_pde, x_pde, rho),
@@ -192,7 +200,7 @@ def stacked_residuals(
     ]
     if use_bc:
         blocks.append(bc_residual(model, t_bc))
-    return stack_residuals(blocks)
+    return stack_residuals(blocks, weights=weights[:len(blocks)])
 
 
 def term_losses(
@@ -271,6 +279,7 @@ def eval_rel_l2(
 
 def make_engdw_functions(
     model: nn.Module, rho: float, use_bc: bool = True, chunk_size: int | None = 32,
+    weights=(1.0, 1.0, 1.0),
 ):
     """Return the normalized ENGD-W residual and its per-sample Jacobian.
 
@@ -313,7 +322,7 @@ def make_engdw_functions(
             u_l = functional_call(model, params, (t_bc, torch.full_like(t_bc, X_MIN)))
             u_r = functional_call(model, params, (t_bc, torch.full_like(t_bc, X_MAX)))
             blocks.append((u_l - u_r).reshape(-1))
-        return torch.cat([r / math.sqrt(r.numel()) for r in blocks]).unsqueeze(1)
+        return torch.cat([r * math.sqrt(w / r.numel()) for r, w in zip(blocks, weights)]).unsqueeze(1)
 
     def jacobian(params, batch):
         t_pde, x_pde, x_ic, t_bc = batch
@@ -325,11 +334,11 @@ def make_engdw_functions(
         # the necessary N parameter gradients, rather than differentiating
         # a batched forward N times with mostly-zero cotangents.
         jacobians = []
-        for fn, points in blocks:
+        for (fn, points), weight in zip(blocks, weights):
             block = vmap(jacrev(fn), in_dims=(None, 0), chunk_size=chunk_size)(
                 params, points
             )
-            jacobians.append({k: v / math.sqrt(len(points)) for k, v in block.items()})
+            jacobians.append({k: v * math.sqrt(weight / len(points)) for k, v in block.items()})
         return {k: torch.cat([block[k] for block in jacobians]) for k in params}
 
     return residual, jacobian
@@ -347,6 +356,7 @@ def build_optimizer(
     beta1: float = 0.9,
     beta2: float = 0.99,
     trust_region: float = 1.0,
+    basis_transport: str = "overlap",
 ):
     """Construct an optimizer and the shared warmup/cosine schedule."""
     if name == "gnome":
@@ -357,6 +367,7 @@ def build_optimizer(
             shampoo_beta=beta2,
             eps=eps,
             precondition_frequency=10,
+            basis_transport=basis_transport,
             trust_radius=(trust_region if trust_region > 0 else None),
             loss="mse",
             precondition_1d=True,
@@ -396,14 +407,30 @@ def parse_args(argv=None) -> argparse.Namespace:
     from experiments.common.config import ConfigParser
     p = ConfigParser(__file__)
     args = p.parse_args(argv)
+    if any(w < 0 for w in args.weights):
+        p.error("weights must be non-negative")
     if min(args.n_pde, args.n_ic, args.n_bc, args.steps) < 1:
         p.error("sample counts and steps must be positive")
-    if args.optimizer == "gnome" and args.fixed_dataset and not 0 < args.aux_frac <= 1:
-        p.error("fixed_dataset requires aux_frac in (0,1] for Gnome")
+    if args.fix_after is not None and not 0 <= args.fix_after < args.steps:
+        p.error("fix_after must satisfy 0 <= fix_after < steps, or be None")
+    if (args.optimizer == "gnome" and (args.fixed_dataset or args.fix_after is not None)
+            and not 0 < args.aux_frac <= 1):
+        p.error("fixed_dataset or fix_after requires aux_frac in (0,1] for Gnome")
+    if args.optimizer in ("soap+ssbroyden", "gnome+ssbroyden"):
+        try:
+            validate_ssbroyden(args)
+        except ValueError as error:
+            p.error(str(error))
     return args
 
 
 def train(args: argparse.Namespace) -> str:
+    hybrid = args.optimizer in ("soap+ssbroyden", "gnome+ssbroyden")
+    warm_start = args.optimizer.split("+")[0]
+    is_gnome = warm_start == "gnome"
+    phase_steps = warm_start_steps(args) if hybrid else args.steps
+    if hybrid:
+        validate_ssbroyden(args)
     if args.engdw_fixed and args.optimizer != "engdw":
         raise SystemExit("--engdw-fixed requires --optimizer engdw")
     if args.rho < 0.0:
@@ -412,9 +439,17 @@ def train(args: argparse.Namespace) -> str:
         raise SystemExit("--aux-frac must be positive")
     if min(args.n_pde, args.n_ic, args.n_bc, args.steps) < 1:
         raise SystemExit("sample counts and --steps must be positive")
-    if args.diagnostics_every > 0 and args.optimizer != "gnome":
+    if args.diagnostics_every > 0 and not is_gnome:
         raise SystemExit("--diagnostics-every is Gnome-only")
     fixed_dataset = args.fixed_dataset or args.engdw_fixed
+    fixed_from_step = 0 if fixed_dataset else args.fix_after
+    if hybrid:
+        # Quasi-Newton curvature pairs require the same objective across steps.
+        fixed_from_step = (phase_steps if fixed_from_step is None
+                           else min(fixed_from_step, phase_steps))
+    sampling = ("fixed" if fixed_from_step == 0 else
+                "resample_then_fixed" if args.fix_after is not None else
+                f"resample_{warm_start}_then_fixed" if hybrid else "resample_each_step")
     if args.optimizer == "engdw":
         if not math.isfinite(args.engdw_momentum) or not 0 <= args.engdw_momentum < 1:
             raise SystemExit("--engdw-momentum must be finite and in [0, 1)")
@@ -426,7 +461,7 @@ def train(args: argparse.Namespace) -> str:
             raise SystemExit("--lr must be finite and non-negative")
 
     device = pick_device()
-    if args.float64 or args.optimizer == "engdw":
+    if args.float64 or hybrid or args.optimizer == "engdw":
         torch.set_default_dtype(torch.float64)
         if device.type == "mps":
             if not args.quiet:
@@ -447,7 +482,7 @@ def train(args: argparse.Namespace) -> str:
     ).to(device)
     if args.optimizer == "engdw":
         residual_fn, jacobian_fn = make_engdw_functions(
-            model, args.rho, use_bc, chunk_size=args.engdw_chunk,
+            model, args.rho, use_bc, chunk_size=args.engdw_chunk, weights=args.weights,
         )
         opt = ENGDW(
             model, residual_fn, jacobian_fn=jacobian_fn,
@@ -465,6 +500,10 @@ def train(args: argparse.Namespace) -> str:
             energy="0.5 * sum(block MSEs)", residual_scaling="1/sqrt(N_block)",
         )
         scheduler = None
+    elif args.optimizer == "gnome+ssbroyden":
+        opt, opt_cfg, scheduler = build_gnome_phase(model, args, build_optimizer)
+    elif hybrid:
+        opt, opt_cfg, scheduler = build_soap_phase(model, args)
     else:
         opt, opt_cfg, scheduler = build_optimizer(
             args.optimizer,
@@ -478,22 +517,25 @@ def train(args: argparse.Namespace) -> str:
             beta1=args.beta1,
             beta2=args.beta2,
             trust_region=args.trust_region,
+            basis_transport=args.basis_transport,
         )
 
-    n_pde_aux = max(1, int(args.n_pde * args.aux_frac)) if args.optimizer == "gnome" else 0
-    n_ic_aux = max(1, int(args.n_ic * args.aux_frac)) if args.optimizer == "gnome" else 0
-    n_bc_aux = max(1, int(args.n_bc * args.aux_frac)) if args.optimizer == "gnome" else 0
+    n_pde_aux = max(1, int(args.n_pde * args.aux_frac)) if is_gnome else 0
+    n_ic_aux = max(1, int(args.n_ic * args.aux_frac)) if is_gnome else 0
+    n_bc_aux = max(1, int(args.n_bc * args.aux_frac)) if is_gnome else 0
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
         "optimizer": args.optimizer,
-        "partition_residuals": args.optimizer == "gnome" and args.partition_residuals,
+        "partition_residuals": is_gnome and args.partition_residuals,
+        "basis_transport": args.basis_transport if is_gnome else None,
         "steps": args.steps,
         "rho": args.rho,
         "arch": args.arch,
         "fuse_every": getattr(model, "chunks", None),
         "embed": args.embed,
         "blocks": ["pde", "ic", "bc"] if use_bc else ["pde", "ic"],
+        "weights": list(args.weights),
         "hidden": args.hidden,
         "depth": args.depth,
         "n_params": n_params,
@@ -505,10 +547,15 @@ def train(args: argparse.Namespace) -> str:
         "n_ic_aux": n_ic_aux,
         "n_bc_aux": n_bc_aux,
         "fixed_dataset": fixed_dataset,
-        "sampling": "fixed" if fixed_dataset else "resample_each_step",
+        "fix_after": args.fix_after,
+        "fixed_from_step": fixed_from_step,
+        "sampling": sampling,
         "aux_sampling": (
-            "subsample_fixed_main_each_step" if fixed_dataset else "resample_each_step"
-        ) if args.optimizer == "gnome" else None,
+            "subsample_fixed_main_each_step" if fixed_from_step == 0 else
+            "resample_then_subsample_fixed_main"
+            if fixed_from_step is not None and fixed_from_step < phase_steps
+            else "resample_each_step"
+        ) if is_gnome else None,
         "diagnostics_every": args.diagnostics_every,
         "x_domain": (X_MIN, X_MAX),
         "t_domain": (T_MIN, T_MAX),
@@ -543,7 +590,7 @@ def train(args: argparse.Namespace) -> str:
             f"embed={args.embed} | params={n_params:,} | device={device} | "
             f"dtype={torch.get_default_dtype()}\n"
             f"  blocks={blocks} | N_pde={args.n_pde} | steps={args.steps} | "
-            f"sampling={'fixed' if fixed_dataset else 'resample_each_step'}",
+            f"sampling={hyperparameters['sampling']}",
             flush=True,
         )
 
@@ -558,22 +605,31 @@ def train(args: argparse.Namespace) -> str:
 
     for step in range(args.steps):
         step_start = time.perf_counter()
+        quasi_newton = hybrid and step >= phase_steps
+        if hybrid and step == phase_steps:
+            opt = build_ssbroyden_phase(model, args)
+            scheduler = None
+            if not args.quiet:
+                print(f"[{EXPERIMENT}] switching to SS-Broyden at step {step}", flush=True)
         if fixed_batch is None:
             main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
-            if fixed_dataset:
+            if fixed_from_step is not None and step >= fixed_from_step:
                 fixed_batch = main_batch
+                run.log("sampling", step=step, sampling="fixed")
+                if not args.quiet and step > 0:
+                    print(f"[{EXPERIMENT}] freezing training points after {step} steps", flush=True)
         else:
             main_batch = fixed_batch
-        if args.optimizer == "gnome":
+        if is_gnome and not quasi_newton:
             aux_batch = (sample_aux_from_batch(main_batch, n_pde_aux, n_ic_aux, n_bc_aux)
-                         if fixed_dataset else sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device))
+                         if fixed_batch is not None else sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device))
 
             def main_closure():
-                r = stacked_residuals(model, main_batch, args.rho, use_bc)
+                r = stacked_residuals(model, main_batch, args.rho, use_bc, args.weights)
                 return r, torch.zeros_like(r)
 
             def aux_closure():
-                r = stacked_residuals(model, aux_batch, args.rho, use_bc)
+                r = stacked_residuals(model, aux_batch, args.rho, use_bc, args.weights)
                 return r, torch.zeros_like(r)
 
             loss = opt.step(
@@ -584,14 +640,23 @@ def train(args: argparse.Namespace) -> str:
             )
         elif args.optimizer == "engdw":
             loss = opt.step(main_batch)
+        elif quasi_newton:
+            def closure():
+                opt.zero_grad()
+                r = stacked_residuals(model, main_batch, args.rho, use_bc, args.weights)
+                value = r.square().mean()
+                value.backward()
+                return value
+
+            loss = opt.step(closure)
         else:
             opt.zero_grad()
-            r = stacked_residuals(model, main_batch, args.rho, use_bc)
+            r = stacked_residuals(model, main_batch, args.rho, use_bc, args.weights)
             loss = r.square().sum() / r.shape[0]
             loss.backward()
             opt.step()
 
-        if (diag is not None and args.optimizer == "gnome"
+        if (diag is not None and is_gnome and not quasi_newton
                 and (step + 1) % args.diagnostics_every == 0):
             for record in opt.get_diagnostics(params=diag.params):
                 diag(record)
@@ -612,12 +677,14 @@ def train(args: argparse.Namespace) -> str:
             )
             raise SystemExit(DIVERGED_EXIT)
         run.log_train(step, loss=loss_val, lr=applied_lr,
-                      training_seconds=training_seconds)
+                      training_seconds=training_seconds, **(
+                          {"phase": "ssbroyden" if quasi_newton else warm_start} if hybrid else {}
+                      ))
         window.append(loss_val)
 
         should_log = args.log_every and (step + 1) % args.log_every == 0
         is_last = step + 1 == args.steps
-        if should_log or is_last:
+        if should_log or is_last or (hybrid and step + 1 == phase_steps):
             tl = term_losses(
                 model,
                 sample_batch(args.n_pde, args.n_ic, args.n_bc, device),

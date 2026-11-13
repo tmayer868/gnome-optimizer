@@ -17,9 +17,9 @@ CONFIG = {
     # Reuse PDE/IC/BC training points; validation still draws fresh points.
     'fixed_dataset': False,
     # MLP width.
-    'hidden': 86,
+    'hidden': 64,
     # MLP depth.
-    'depth': 10,
+    'depth': 6,
     # Log Gnome's internal state — curvature spectrum, LM damping, trust-region usage — every N
     # steps to a sibling runs/.../{run_id}.diag.jsonl. 0 (default) disables it entirely. Gnome
     # only: SOAP and AdamW expose no such hook.
@@ -42,12 +42,12 @@ CONFIG = {
             # Aux batch sizes for Gnome are max(K_min, int(N * aux_frac)) per block. Each aux pass is a
             # full higher-order residual eval, so this is not free — keep small.
             'aux_frac': 0.10,
-            'lr': 7e-3,
+            'lr': 1e-2,
             # Gnome per-coordinate update bound: lambda is set to the smallest value with
             # max|m̂/(v̂+lambda)| <= this, so no coordinate moves more than lr*trust_region in a step.
             # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain m̂/(v̂+eps)
             # damping.
-            'trust_region': .02,
+            'trust_region': .03,
             # Gnome curvature-damping epsilon in m̂/(v̂+eps): larger -> more gradient-descent-like,
             # smaller -> fuller Newton step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.
             'eps': 1e-12,

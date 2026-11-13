@@ -46,10 +46,11 @@ def test_training_sampling_and_precision_switch(tmp_path, monkeypatch, optimizer
     training, validation = [], []
     residuals, terms = ac.stacked_residuals, ac.term_losses
 
-    def capture_residuals(model, batch, use_bc):
+    def capture_residuals(model, batch, use_bc, weights):
         training.append(tuple(t.clone() for t in batch))
         assert use_bc == (embed not in ("periodic", "fourier"))
-        return residuals(model, batch, use_bc)
+        assert weights == [0.5, 2.0, 3.0]
+        return residuals(model, batch, use_bc, weights)
 
     def capture_terms(model, batch):
         validation.append(tuple(t.clone() for t in batch))
@@ -64,6 +65,7 @@ def test_training_sampling_and_precision_switch(tmp_path, monkeypatch, optimizer
         "--runs-dir", str(tmp_path), "--quiet",
     ])
     overrides.update(fixed_dataset=fixed, fix_after=fix_after, float64=False,
+                     weights=[0.5, 2.0, 3.0],
                      embed_dim=4, embed_scale=1.0,
                      aux_frac=0.25, reference="jaxpi")
     args = ac.parse_args(overrides)
@@ -98,6 +100,7 @@ def test_training_sampling_and_precision_switch(tmp_path, monkeypatch, optimizer
                 assert not torch.isin(aux[0], main[0]).all()
 
     config = records[0]["hyperparameters"]
+    assert config["weights"] == [0.5, 2.0, 3.0]
     assert config["fixed_dataset"] == fixed
     assert config["fix_after"] == fix_after
     assert config["fixed_from_step"] == fixed_from

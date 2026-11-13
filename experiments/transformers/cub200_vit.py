@@ -57,7 +57,7 @@ SCHEMA = {
         "adamw": dict.fromkeys(ADAMW_KEYS),
         "soap": dict.fromkeys(CURVATURE_KEYS | {"normalize_grads", "correct_bias"}),
         "gnome": dict.fromkeys(CURVATURE_KEYS | {"trust_radius", "norm_free", "loss", "aux_batch_size",
-                                               "use_soap_basis"}),
+                                               "use_soap_basis", "basis_transport"}),
         "muon": {"lr": None, "weight_decay": None, "mu": None, "adamw": dict.fromkeys(ADAMW_KEYS)},
     },
     "output": dict.fromkeys(("runs_dir", "log_every", "eval_every_epochs", "save_checkpoint", "quiet")),
@@ -162,6 +162,8 @@ def validate_config(config):
     for key in ("normalize_grads", "correct_bias"):
         boolean(config["optimizers"]["soap"][key], f"optimizers.soap.{key}")
     gnome = config["optimizers"]["gnome"]
+    if gnome["basis_transport"] not in ("overlap", "soap"):
+        raise ValueError("optimizers.gnome.basis_transport must be overlap or soap")
     boolean(gnome["use_soap_basis"], "optimizers.gnome.use_soap_basis")
     boolean(gnome["norm_free"], "optimizers.gnome.norm_free")
     number(gnome["aux_batch_size"], "optimizers.gnome.aux_batch_size", integer=True, positive=True)

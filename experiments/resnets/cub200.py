@@ -204,6 +204,7 @@ def build_optimizer(
     trust_region: float = 1.0, aux_batch_size: int = 10,
     merge_dims: str = "none",
     use_soap_basis: bool = False,
+    basis_transport: str = "overlap",
 ):
     """CUB optimizer settings, independent of other benchmark modules.
 
@@ -228,6 +229,7 @@ def build_optimizer(
     else:
         cfg.update(
             use_soap_basis=use_soap_basis,
+            basis_transport=basis_transport,
             eps=eps, trust_radius=trust_region if trust_region > 0 else None,
             norm_free=False,
             loss="cce" if name == "gnome_fisher" else "cce_hutchinson",
@@ -314,6 +316,7 @@ def train(args) -> str:
         trust_region=args.trust_region, aux_batch_size=args.aux_batch_size,
         merge_dims=args.merge_dims,
         use_soap_basis=args.use_soap_basis,
+        basis_transport=args.basis_transport,
     )
     total_steps = args.epochs * len(loader)
     if args.max_steps is not None:

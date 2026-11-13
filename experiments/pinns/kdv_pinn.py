@@ -26,7 +26,7 @@ Two architectures, selectable via ``--arch``:
 Both architectures accept ``--embed periodic|none``. The default ``periodic``
 uses ``[t, cos(πx), sin(πx)]``, enforcing period-2 spatial periodicity on
 ``[-1, 1]``. ``none`` feeds raw ``[t, x]``. Both retain the PDE, IC, and BC
-blocks with equal weights via ``gnome.stack_residuals``; the BC block enforces
+blocks with configurable weights (equal by default) via ``gnome.stack_residuals``; the BC block enforces
 matching ``u``, ``u_x``, and ``u_xx`` for raw inputs and is redundant up to
 roundoff with the periodic embedding.
 
@@ -89,6 +89,7 @@ from experiments.common import (
     PeriodicEmbedding,
 )
 from experiments.reference_solutions import cached_reference_path, reference_path
+from experiments.common.precision import switch_to_float64 as _switch_optimizer_to_float64
 
 
 EXPERIMENT = "kdv_pinn"
@@ -210,18 +211,25 @@ def sample_batch(
     return t_pde, x_pde, x_ic, t_bc
 
 
+def residual_partition_sizes(batch) -> list[int]:
+    """Scalar residual counts for PDE, IC, and the combined u/u_x/u_xx BC."""
+    t_pde, _x_pde, x_ic, t_bc = batch
+    return [t_pde.numel(), x_ic.numel(), 3 * t_bc.numel()]
+
+
 def stacked_residuals(
     model: nn.Module,
     batch,
     mu_sq: float = DEFAULT_MU_SQ,
+    weights=(1.0, 1.0, 1.0),
 ) -> torch.Tensor:
-    """Per-block residuals stacked via ``stack_residuals`` (equal weights)."""
+    """Per-block residuals stacked via ``stack_residuals`` (PDE, IC, BC weights)."""
     t_pde, x_pde, x_ic, t_bc = batch
     return stack_residuals([
         pde_residual(model, t_pde, x_pde, mu_sq),
         ic_residual(model, x_ic),
         bc_residual(model, t_bc),
-    ])
+    ], weights=weights)
 
 
 def term_losses(
@@ -247,12 +255,13 @@ def term_losses(
 # ``torch.func`` don't compose, so unlike the other paths here we compute the
 # whole residual functionally with ``torch.func``: spatial derivatives via
 # nested ``grad``, then ``jacrev`` over the parameters, all under ``vmap`` over
-# points. Blocks are scaled exactly like ``stack_residuals`` (equal weights) so
+# points. Blocks are scaled exactly like ``stack_residuals`` (including loss weights) so
 # the Gauss-Newton step minimizes the same loss the other optimizers report.
 
 def build_engd_functions(
     model: nn.Module,
     mu_sq: float = DEFAULT_MU_SQ,
+    weights=(1.0, 1.0, 1.0),
 ):
     """Return ``(residual_jacobian_fn, loss_fn)`` builders for ENGD.
 
@@ -323,7 +332,7 @@ def build_engd_functions(
 
     def _scales(sizes):
         n_total = sum(sizes)
-        return [math.sqrt(n_total / s) for s in sizes], n_total
+        return [math.sqrt(w * n_total / size) for w, size in zip(weights, sizes)], n_total
 
     def loss_fn(batch):
         params = _cur_params()
@@ -600,24 +609,35 @@ def eval_rel_l2(
     t_ref: torch.Tensor, x_ref: torch.Tensor, u_ref: torch.Tensor,
     device: torch.device, batch_size: int = 8192,
 ) -> float:
-    """Relative L2 error of the PINN prediction against ``u_ref`` on its grid."""
+    """Relative L2 with model inference native and all error math in float64."""
     nt, nx = u_ref.shape
     tt, xx = torch.meshgrid(t_ref, x_ref, indexing="ij")
-    t_flat = tt.reshape(-1, 1).to(device)
-    x_flat = xx.reshape(-1, 1).to(device)
+    model_dtype = next(
+        (parameter.dtype for parameter in model.parameters()
+         if parameter.is_floating_point()),
+        torch.get_default_dtype(),
+    )
+    t_flat = tt.reshape(-1, 1).to(device=device, dtype=model_dtype)
+    x_flat = xx.reshape(-1, 1).to(device=device, dtype=model_dtype)
+    # Keep float64 conversion off accelerators such as MPS, which has no
+    # float64 support. Transfer first, then promote using the CPU kernel.
+    u_ref64 = u_ref.detach().cpu().to(dtype=torch.float64)
     was_training = model.training
     model.eval()
     preds = []
     with torch.no_grad():
         for i in range(0, t_flat.shape[0], batch_size):
             preds.append(
-                model(t_flat[i:i + batch_size], x_flat[i:i + batch_size]).cpu()
+                model(t_flat[i:i + batch_size], x_flat[i:i + batch_size])
+                .detach()
+                .cpu()
+                .to(dtype=torch.float64)
             )
     if was_training:
         model.train()
     u_pred = torch.cat(preds).reshape(nt, nx)
-    num = (u_pred - u_ref).pow(2).sum().sqrt()
-    den = u_ref.pow(2).sum().sqrt()
+    num = (u_pred - u_ref64).pow(2).sum().sqrt()
+    den = u_ref64.pow(2).sum().sqrt()
     return float(num / den)
 
 
@@ -722,7 +742,7 @@ def lbfgs_phase(
     for i in range(args.lbfgs_steps):
         def closure():
             opt.zero_grad()
-            r = stacked_residuals(model, fixed_batch, args.mu_sq)
+            r = stacked_residuals(model, fixed_batch, args.mu_sq, args.weights)
             loss = (r ** 2).sum() / r.shape[0]
             loss.backward()
             return loss
@@ -768,10 +788,38 @@ def lbfgs_phase(
 def parse_args(argv=None) -> argparse.Namespace:
     from experiments.common.config import ConfigParser
     p = ConfigParser(__file__)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.float64_after is not None and not 0 <= args.float64_after < args.steps:
+        p.error("float64_after must satisfy 0 <= N < steps")
+    if any(w < 0 for w in args.weights):
+        p.error("weights must be non-negative")
+    return args
+
+
+def switch_to_float64(model, opt):
+    """Promote the model and preserve the active optimizer and its schedule."""
+    if isinstance(opt, ENGD):
+        # ENGD retains parameter references and scalar damping, but no tensor EMA.
+        model.zero_grad(set_to_none=True)
+        model.double()
+        opt.params = [p for p in model.parameters() if p.requires_grad]
+        torch.set_default_dtype(torch.float64)
+        return next(model.parameters()).device
+    return _switch_optimizer_to_float64(model, opt)
 
 
 def train(args: argparse.Namespace) -> str:
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(
+        torch.float64 if args.float64 or args.float64_after == 0 else torch.float32
+    )
+    try:
+        return _train(args)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+
+
+def _train(args: argparse.Namespace) -> str:
     if not math.isfinite(args.mu_sq) or args.mu_sq <= 0.0:
         raise ValueError(f"--mu-sq must be finite and positive; got {args.mu_sq}")
     use_mat_reference = args.mu_sq == DEFAULT_MU_SQ
@@ -789,8 +837,7 @@ def train(args: argparse.Namespace) -> str:
 
     # float64 (recommended for ENGD) must precede model construction; MPS has
     # no double support, so it forces CPU.
-    if args.float64:
-        torch.set_default_dtype(torch.float64)
+    if torch.get_default_dtype() == torch.float64:
         device = torch.device("cpu")
     else:
         device = pick_device()
@@ -814,7 +861,7 @@ def train(args: argparse.Namespace) -> str:
     )
     engd_resjac = engd_loss = None
     if args.optimizer == "engd":
-        engd_resjac, engd_loss = build_engd_functions(model, args.mu_sq)
+        engd_resjac, engd_loss = build_engd_functions(model, args.mu_sq, args.weights)
 
     n_pde_aux = max(8, int(args.n_pde * args.aux_frac))
     n_ic_aux = max(2, int(args.n_ic * args.aux_frac))
@@ -836,6 +883,8 @@ def train(args: argparse.Namespace) -> str:
         # Non-zero means a sibling {run_id}.diag.jsonl exists.
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
+        "weights": list(args.weights),
+        "partition_residuals": args.optimizer == "gnome" and args.partition_residuals,
         "arch": args.arch,
         "embed": args.embed,
         "steps": args.steps,
@@ -867,6 +916,7 @@ def train(args: argparse.Namespace) -> str:
         ),
         "device": str(device),
         "dtype": str(torch.get_default_dtype()),
+        "float64_after": args.float64_after,
         **{f"opt.{k}": v for k, v in opt_cfg.items()},
     }
     run = RunLogger(
@@ -940,9 +990,8 @@ def train(args: argparse.Namespace) -> str:
             f"{time.perf_counter() - reference_started:.2f}s",
             flush=True,
         )
-    # Match the run dtype so float32 and float64 evaluation both work.
-    dt = torch.get_default_dtype()
-    t_ref, x_ref, u_ref = t_ref.to(dt), x_ref.to(dt), u_ref.to(dt)
+    # Keep the original reference precision for the float64 finishing stage.
+    # Evaluation casts input coordinates to the current model dtype.
 
     if diag is not None and not args.quiet:
         print(f"  diagnostics every {args.diagnostics_every} steps "
@@ -954,26 +1003,45 @@ def train(args: argparse.Namespace) -> str:
     best_avg = best_rel_l2 = float("inf")
 
     for step in range(args.steps):
+        if step == args.float64_after and step > 0:
+            previous_device = device
+            device = switch_to_float64(model, opt)
+            if args.optimizer == "engd":
+                # Rebind functional-call buffers after model conversion.
+                engd_resjac, engd_loss = build_engd_functions(model, args.mu_sq, args.weights)
+            run.log("precision", step=step, from_dtype="torch.float32",
+                    dtype="torch.float64", from_device=str(previous_device),
+                    device=str(device),
+                    lr=opt.lr if args.optimizer == "engd" else current_lr(opt))
+            if not args.quiet:
+                print(f"[{EXPERIMENT}] after {step} steps: float32 → float64 "
+                      f"| device={previous_device} → {device}", flush=True)
         main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
         if args.optimizer == "gnome":
             aux_batch = sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device)
-
+            # if step % 1000 == 0:
+            #     args.weights[0] = min(1.0, 1.2 * args.weights[0])
             def main_closure():
-                r = stacked_residuals(model, main_batch, args.mu_sq)
+                r = stacked_residuals(model, main_batch, args.mu_sq, args.weights)
                 return r, torch.zeros_like(r)
 
             def aux_closure():
-                r = stacked_residuals(model, aux_batch, args.mu_sq)
+                r = stacked_residuals(model, aux_batch, args.mu_sq, args.weights)
                 return r, torch.zeros_like(r)
 
-            loss = opt.step(main_closure, aux_closure)
+            loss = opt.step(
+                main_closure, aux_closure,
+                surrogate_partition_sizes=(
+                    residual_partition_sizes(aux_batch) if args.partition_residuals else None
+                ),
+            )
         elif args.optimizer == "engd":
             loss_val = opt.step(lambda: engd_resjac(main_batch),
                                 lambda: engd_loss(main_batch))
             loss = None
         else:
             opt.zero_grad()
-            r = stacked_residuals(model, main_batch, args.mu_sq)
+            r = stacked_residuals(model, main_batch, args.mu_sq, args.weights)
             loss = (r ** 2).sum() / r.shape[0]
             loss.backward()
             opt.step()
@@ -1043,6 +1111,8 @@ def train(args: argparse.Namespace) -> str:
         print(f"[{EXPERIMENT}] diagnostics → {diag.path}")
     path = run.finish(
         completed=True,
+        final_dtype=str(next(model.parameters()).dtype),
+        final_device=str(device),
         final_avg_train=last_avg, best_avg_train=best_avg,
         final_rel_l2=last_rel_l2, best_rel_l2=best_rel_l2,
     )

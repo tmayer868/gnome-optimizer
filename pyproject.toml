@@ -40,6 +40,10 @@ experiments = [
     "scipy>=1.10",
     "matplotlib>=3.7",
 ]
+# Full-memory quasi-Newton PINN baseline (imports scimba_torch).
+ssbroyden = [
+    "scimba>=1.4,<1.5",
+]
 # Language-model benchmark (WikiText GPT) — heavier, GPU-oriented.
 llm = [
     "datasets>=2.14",

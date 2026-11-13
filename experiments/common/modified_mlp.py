@@ -423,6 +423,10 @@ class FusedModifiedMLP(nn.Module):
         return out
 
 
+class Sin(nn.Module):
+    def forward(self, x):
+        return torch.sin(x)
+
 class AllFusedExperimental(nn.Module):
     """Plain MLP whose parameters are packed into one near-square tensor.
 

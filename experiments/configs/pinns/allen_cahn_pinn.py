@@ -4,12 +4,12 @@ None keeps an existing automatic/default-dependent setting where supported.
 """
 
 CONFIG = {
-    # Choices: 'gnome', 'soap', 'adamw'.
+    # Choices: 'gnome', 'soap', 'adamw', 'soap+ssbroyden'.
     'optimizer': 'gnome',
     # Network: plain tanh MLP, the gated modified MLP (Wang et al. 2021), or 'fused' — the plain
     # MLP with [W|b] merged per layer and hidden layers grouped per fuse_every. hidden / depth
     # control all three. Choices: 'mlp', 'modified', 'fused', 'fused-modified'.
-    'arch': 'fused',
+    'arch': 'mlp',
     # arch fused only: consecutive hidden layers per parameter tensor. 1 = one tensor per layer,
     # the control every larger value is compared against (identical function and initialization,
     # only the grouping differs). 0 (default) fuses the whole stack. Note depth 4 leaves only k=2
@@ -21,28 +21,32 @@ CONFIG = {
     'seed': 0,
     # Allen-Cahn is stiff; may want more than the default.
     'steps': 200_000,
-    'n_pde': 8000 * 2,
+    'n_pde': 4000,
     'n_ic': 400,
     'n_bc': 400,
+    'weights': [.05, 1.0, 1.0],  # [pde, IC, periodic BC]
+    # The BC weight is ignored for periodic and Fourier embeddings (exact BC).
     # Reuse the same PDE/IC/BC training points every step for any optimizer. Gnome draws fresh
     # auxiliary subsets; validation still resamples.
     'fixed_dataset': False,
     # Resample for this many steps, then freeze a newly sampled PDE/IC/BC dataset.
     # None keeps resampling; 0 fixes from the start. fixed_dataset=True takes precedence.
+    # soap+ssbroyden freezes no later than the optimizer handoff.
     'fix_after': None,
     # Network width.
-    'hidden': 164,
+    'hidden': 50,
     # Network depth: Linear-layer count for arch mlp, number of gated hidden layers for arch
     # modified.
-    'depth': 6,
+    'depth': 5,
     # Run in double precision. Allen-Cahn's stiff canyon geometry can push the residual below the
     # float32 floor (~1e-6 relative), where the Gauss-Newton curvature estimate is reading round-
     # off; float64 moves that floor out of the way. MPS has no double support, so this falls back
     # to CPU there.
-    'float64': False,
+    'float64': True,
     # Switch to float64 after N float32 steps, preserving optimizer state and LR schedule.
     # Requires 0 <= N < steps; 0 starts in float64. MPS moves to CPU at the switch.
-    'float64_after': 100_000,
+    # soap+ssbroyden promotes no later than its handoff, even if this is None.
+    'float64_after': None,
     # Reference used for rel_l2. 'jaxpi' is the published 201x512 Chebfun table and remains the
     # compatibility default. 'highres' uses the validated 8191-point tight reference
     # experiments/reference_solutions/allen_cahn_highres_8191_tight.mat and generates it
@@ -61,18 +65,20 @@ CONFIG = {
     # Each optimizer keeps its own hyperparameters and learning-rate schedule.
     'optimizers': {
         'gnome': {
+            # EMA basis handling: 'overlap' (squared overlaps) or 'soap' (permutation only).
+            'basis_transport': 'overlap',
             # Estimate curvature separately for each auxiliary residual block.
             'partition_residuals': False,
             # Aux batch sizes for Gnome are max(K_min, int(N * aux_frac)) per block. Each aux pass is a
             # full higher-order residual eval, so keep small. With fixed_dataset, sizes are capped at N
             # and aux_frac must be in (0,1].
             'aux_frac': 0.10,
-            'lr': 7e-3,
+            'lr': 8e-3,
             # Gnome per-coordinate update bound: lambda is set to the smallest value with
             # max|m̂/(v̂+lambda)| <= this, so no coordinate moves more than lr*trust_region in a step.
             # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain m̂/(v̂+eps)
             # damping.
-            'trust_region': .15,
+            'trust_region': .05,
             # Gnome curvature-damping epsilon in m̂/(v̂+eps): larger -> more gradient-descent-like,
             # smaller -> fuller Newton step. Allen-Cahn's canyon geometry may want it larger than the
             # 1e-6 default. Gnome only; SOAP/AdamW keep eps=1e-8.
@@ -100,6 +106,18 @@ CONFIG = {
             # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
             # 1.0 disables decay. Gnome (MSE) never decays regardless.
             'cosine_decay': 0.0,
+        },
+        # Total steps includes both phases. SOAP schedules span soap_steps only.
+        'soap+ssbroyden': {
+            'lr': 0.002,
+            'beta1': 0.99,
+            'beta2': 0.999,
+            'weight_decay': 1e-8,
+            'warmup_steps': 200,
+            'cosine_decay': 0.0,
+            'soap_steps': 10_000,
+            'ssbroyden_lr': 1.0,
+            'ssbroyden_tolerance_grad': 1e-10,
         },
         'adamw': {
             'lr': 0.001,

@@ -144,6 +144,7 @@ EXPERIMENT_PACKAGES = {
         "generate_allen_cahn_reference",
         "ginzburg_landau",
         "heat2d_pinn",
+        "heat_6d",
         "helmholtz_pinn",
         "inviscid_burgers_pinn",
         "kdv_pinn",

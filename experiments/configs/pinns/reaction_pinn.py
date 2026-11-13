@@ -4,7 +4,7 @@ None keeps an existing automatic/default-dependent setting where supported.
 """
 
 CONFIG = {
-    # Choices: 'gnome', 'soap', 'adamw', 'engdw'.
+    # Choices: 'gnome', 'soap', 'adamw', 'engdw', 'soap+ssbroyden', 'gnome+ssbroyden'.
     'optimizer': 'gnome',
     # Reaction coefficient. Vanilla whole-domain PINNs are already near 100% relative error at
     # rho=5; rho=10 is the harder published rung.
@@ -18,19 +18,24 @@ CONFIG = {
     # Raw inputs plus a soft BC (published setup), or an exact periodic embedding that drops the
     # BC block. Choices: 'none', 'periodic'.
     'embed': 'none',
-    'seed': 10,
+    'seed': 105,
     'steps': 100000,
     'n_pde': 4000,
     'n_ic': 256,
     'n_bc': 256,
+    'weights': [1.0, 1.0, 1.0],  # [pde, IC, periodic BC]
+    # The BC weight is ignored for the periodic embedding (exact BC).
     # Reuse PDE/IC/BC points for any optimizer; Gnome draws auxiliary subsets.
     # Validation still samples fresh points.
     'fixed_dataset': False,
+    # Resample N steps, then freeze PDE/IC/BC points. None disables delayed freezing.
+    # fixed_dataset / engdw_fixed freeze from step 0; SS-Broyden freezes by its handoff.
+    'fix_after': None,
     # Network width; 50 matches the published model.
-    'hidden': 64,
+    'hidden': 76,
     # Linear-layer count for MLP/fused (four hidden layers at the default); gated hidden-layer
     # count for modified variants.
-    'depth': 10,
+    'depth': 9,
     # Use float64 (always enabled for ENGD-W), falling back to CPU when the selected device is
     # MPS.
     'float64': True,
@@ -44,13 +49,15 @@ CONFIG = {
     # Each optimizer keeps its own hyperparameters and learning-rate schedule.
     'optimizers': {
         'gnome': {
+            # EMA basis handling: 'overlap' (squared overlaps) or 'soap' (permutation only).
+            'basis_transport': 'overlap',
             # Estimate curvature separately for each auxiliary residual block.
-            'partition_residuals': True,
+            'partition_residuals': False,
             # Fraction of each residual block used by Gnome's auxiliary curvature pass.
             'aux_frac': 0.10,
-            'lr': 2e-2,
+            'lr': 1e-2,
             # Gnome trust radius; zero disables the trust-region solve.
-            'trust_region': .03,
+            'trust_region': .07,
             # Gnome curvature damping. Baselines retain their own epsilon.
             'eps': 1e-12,
             'beta1': 0.95,
@@ -59,6 +66,28 @@ CONFIG = {
             'warmup_steps': 200,
             # Final learning-rate fraction after cosine decay.
             'cosine_decay': 0.10,
+        },
+        'gnome+ssbroyden': {
+            # EMA basis handling: 'overlap' (squared overlaps) or 'soap' (permutation only).
+            'basis_transport': 'overlap',
+            # Estimate curvature separately for each auxiliary residual block.
+            'partition_residuals': False,
+            # Fraction of each residual block used by Gnome's auxiliary curvature pass.
+            'aux_frac': 0.10,
+            'lr': 1e-2,
+            # Gnome trust radius; zero disables the trust-region solve.
+            'trust_region': .07,
+            # Gnome curvature damping. Baselines retain their own epsilon.
+            'eps': 1e-12,
+            'beta1': 0.95,
+            'beta2': 0.99,
+            'weight_decay': 1e-8,
+            'warmup_steps': 200,
+            # Final learning-rate fraction after cosine decay.
+            'cosine_decay': 0.10,
+            'gnome_steps': 30_000,
+            'ssbroyden_lr': 1.0,
+            'ssbroyden_tolerance_grad': 1e-10,
         },
         'soap': {
             'lr': 0.003,
@@ -75,6 +104,18 @@ CONFIG = {
             'warmup_steps': 200,
             # Final learning-rate fraction after cosine decay.
             'cosine_decay': 0.0,
+        },
+        # Total steps includes both phases; SOAP settings apply to the warm start.
+        'soap+ssbroyden': {
+            'beta1': 0.99,
+            'beta2': 0.999,
+            'weight_decay': 0.0,
+            'lr': 1e-3,
+            'warmup_steps': 0,
+            'cosine_decay': 1.0,
+            'soap_steps': 30_000,
+            'ssbroyden_lr': 1.0,
+            'ssbroyden_tolerance_grad': 1e-10,
         },
         'engdw': {
             'lr': 0.001,

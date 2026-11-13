@@ -197,6 +197,11 @@ PINN configs keep experiment settings at the top level and optimizer settings
 under `CONFIG["optimizers"]["gnome"]`, `CONFIG["optimizers"]["soap"]`, etc.
 The top-level `optimizer` selects the block, including its learning-rate schedule.
 
+For the transport ablation in reaction, convection, and Allen–Cahn, set
+`CONFIG["optimizers"]["gnome"]["basis_transport"]` to `"overlap"`
+(default) or `"soap"`. These select squared-overlap transport or the
+previous SOAP-style permutation handling inside Gnome, respectively.
+
 Each experiment is a module under `experiments/`, grouped into `pinns`, `resnets`, and
 `transformers` where applicable, and run from the repo root. Every run streams an
 append-only JSONL log to `runs/<experiment>/<run_id>.jsonl` (see below).
@@ -244,6 +249,18 @@ It supports Gnome, SOAP, AdamW, and ENGD-W using the existing heat workflow.
 Architecture, training budgets, and equal PDE/IC/BC loss weights are local
 choices; the K-FAC paper supplies the benchmark problem.
 
+`heat_6d.py` uses six inputs `(t, x1, x2, x3, x4, x5)` for a
+forced heat equation on the 5D unit ball with time in `[0,1]`. Its exact
+solution is `exp(||x||²/2+t)`, diffusivity is `1/5`, and the
+boundary condition is the outward Neumann flux `exp(1/2+t)`. Interior
+and evaluation points are uniform in ball volume; boundary points are uniform
+on the sphere. It supports the same optimizers and residual partitions as Heat 5D.
+
+```bash
+# Edit experiments/configs/pinns/heat_6d.py
+uv run --extra experiments -m experiments.pinns.heat_6d
+```
+
 Burgers uses a float64 Cole–Hopf reference for `rel_l2`. Pass `float64` for
 double-precision training and inference as well. The additional `rel_l2_jaxpi`
 metric uses the original JAXPI dataset. See the
@@ -261,6 +278,12 @@ uv run -m experiments.pinns.allen_cahn_pinn
 This runs 30,000 steps in FP32 and the remaining steps in FP64. On Apple MPS,
 the switch moves training to CPU. Use `float64` to start in FP64; the two
 options are mutually exclusive. The switch is recorded in the run log.
+
+Allen–Cahn also supports `optimizer='soap+ssbroyden'`. Set `soap_steps` in its
+optimizer block to choose the handoff; `steps` includes both phases. The run
+freezes its training batch and promotes to float64 no later than the handoff,
+while honoring earlier `fix_after` / `float64_after` switches. See the
+[configuration details](docs/soap_ssbroyden.md#allencahn).
 
 Allen–Cahn also supports `fixed_dataset` with every optimizer:
 
@@ -616,3 +639,12 @@ runs/            JSONL run artifacts (git-ignored)
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
+
+Reaction and convection also support top-level `fix_after=N`: resample for N
+steps, then keep the training batch. `None` preserves default sampling;
+`fixed_dataset=True` fixes from the start. SS-Broyden hybrids always freeze
+by the optimizer handoff.
+
+SOAP + SS-Broyden and Gnome + SS-Broyden are available for convection and reaction
+through the optional Scimba backend. See [setup and SOAP pilots](docs/soap_ssbroyden.md)
+and [Gnome warm starts and paired results](docs/gnome_ssbroyden.md).

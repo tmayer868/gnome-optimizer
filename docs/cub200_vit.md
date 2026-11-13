@@ -89,6 +89,12 @@ main gradient while keeping the surrogate curvature estimate; it defaults to `Fa
 Set `trust_radius` to `None` to disable it. The runner uses the current local
 Gnome implementation without modifying it.
 
+Set `optimizers.gnome.basis_transport` to `"overlap"` (the default) for
+squared-overlap transport, or `"soap"` for the previous permutation-only
+second-moment transport. This is independent of `use_soap_basis` and applies
+when the selected optimizer is `gnome`. The ResNet CUB-200 config exposes the
+same choice as top-level `basis_transport` for both Gnome variants.
+
 ## Training and outputs
 
 `training` controls seed, device, epochs, training/evaluation batch sizes,

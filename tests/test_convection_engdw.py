@@ -32,11 +32,20 @@ def setup_problem(arch="mlp", embed="none"):
 
 @pytest.mark.parametrize("arch", ["mlp", "modified", "fused", "fused-modified"])
 @pytest.mark.parametrize("embed", ["none", "periodic"])
-def test_functional_residual_and_jacobian_match_autograd(arch, embed):
+@pytest.mark.parametrize("weights", [(1.0, 1.0, 1.0), (0.25, 2.0, 3.0), (0.0, 1.0, 0.0)])
+def test_functional_residual_and_jacobian_match_autograd(arch, embed, weights):
     model, batch, fn = setup_problem(arch, embed)
+    fn, _ = convection.make_engdw_functions(model, 5, embed != "periodic", weights=weights)
     params = dict(model.named_parameters())
     actual = fn(params, batch).flatten()
-    stacked = convection.stacked_residuals(model, batch, 5, embed != "periodic")
+    stacked = convection.stacked_residuals(model, batch, 5, embed != "periodic", weights)
+    t, x, x_ic, t_bc = batch
+    losses = [convection.pde_residual(model, t, x, 5).square().mean(),
+              convection.ic_residual(model, x_ic).square().mean()]
+    if embed != "periodic":
+        losses.append(convection.bc_residual(model, t_bc).square().mean())
+    torch.testing.assert_close(stacked.square().mean(),
+                               sum(w * loss for w, loss in zip(weights, losses)))
     expected = stacked / math.sqrt(stacked.numel())
     torch.testing.assert_close(actual, expected, atol=1e-12, rtol=1e-12)
     jd = jacrev(lambda p: fn(p, batch).flatten(), chunk_size=3)(params)
@@ -47,7 +56,7 @@ def test_functional_residual_and_jacobian_match_autograd(arch, embed):
         grads = torch.autograd.grad(entry, tuple(params.values()), retain_graph=True)
         rows.append(torch.cat([g.flatten() for g in grads]))
     torch.testing.assert_close(J, torch.stack(rows), atol=1e-11, rtol=1e-10)
-    _, jacobian = convection.make_engdw_functions(model, 5, embed != "periodic", 3)
+    _, jacobian = convection.make_engdw_functions(model, 5, embed != "periodic", 3, weights=weights)
     efficient = jacobian(params, batch)
     for key in params:
         torch.testing.assert_close(efficient[key], jd[key], atol=1e-11, rtol=1e-10)
@@ -108,10 +117,12 @@ def test_training_and_metadata(tmp_path, monkeypatch, optimizer, embed):
         "--n-bc", "3", "--engdw-momentum", "0.9", "--engdw-chunk", "3",
         "--log-every", "1", "--runs-dir", str(tmp_path), "--quiet",
     ]))
+    args.weights = [0.25, 2.0, 3.0]
     path = convection.train(args)
     with open(path) as file:
         records = [json.loads(line) for line in file]
     meta = records[0]["hyperparameters"]
+    assert meta["weights"] == args.weights
     assert meta["sampling"] == "resample_each_step"
     assert meta["blocks"] == (["pde", "ic", "bc"] if embed == "none" else ["pde", "ic"])
     if optimizer == "engdw":
@@ -181,3 +192,11 @@ def test_fixed_points_require_engdw():
     args = convection.parse_args(config_overrides(convection, ["--optimizer", "gnome", "--engdw-fixed"]))
     with pytest.raises(SystemExit, match="--engdw-fixed requires --optimizer engdw"):
         convection.train(args)
+
+
+@pytest.mark.parametrize("weights", [[1.0, -1.0, 1.0], [1.0, 1.0],
+                                     [1.0, float("nan"), 1.0],
+                                     [1.0, float("inf"), 1.0]])
+def test_invalid_weights(weights):
+    with pytest.raises(SystemExit):
+        convection.parse_args({"weights": weights})

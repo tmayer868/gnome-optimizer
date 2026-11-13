@@ -18,9 +18,11 @@ CONFIG = {
     'n_pde': 4000,
     'n_ic': 200,
     'n_bc': 200,
+    # Loss weights [PDE, IC, BC]; BC averages the u, u_x, and u_xx residuals together.
+    'weights': [.01, 1.0, 1.0],
     # Dispersive u_xxx coefficient. Defaults to 0.022^2, the JAX-PI benchmark value, which loads
     # kdv.mat. A matching reference is generated for other values.
-    'mu_sq': 0.022 ** 2,
+    'mu_sq':  0.022 ** 2,
     # Odd number of unique periodic Fourier points used for the generated reference.
     'reference_modes': 511,
     # ETDRK4 substeps per 0.005 reference-output interval.
@@ -29,11 +31,14 @@ CONFIG = {
     'hidden': 128,
     # Network depth: Linear-layer count for arch mlp, number of gated hidden layers for arch
     # modified.
-    'depth': 4,
+    'depth': 8,
     # Run in double precision on CPU. Strongly recommended for optimizer engd: the energy-metric
     # Gauss-Newton solve targets accuracy the float32 floor (~1e-6) can't express. Forces
     # device=cpu (MPS has no float64).
     'float64': False,
+    # Switch after N float32 steps, keeping optimizer state and the LR schedule.
+    # None disables; 0 starts in float64. Requires N < steps. MPS switches to CPU.
+    'float64_after': None,
     # Log Gnome's internal state — curvature spectrum, LM damping, trust-region usage — every N
     # steps to a sibling runs/.../{run_id}.diag.jsonl. 0 (default) disables it entirely. Gnome
     # only: SOAP and AdamW expose no such hook.
@@ -47,10 +52,12 @@ CONFIG = {
     # Each optimizer keeps its own hyperparameters and learning-rate schedule.
     'optimizers': {
         'gnome': {
+            # Separate auxiliary PDE, IC, and combined BC curvature contributions.
+            'partition_residuals': False,
             # Aux batch sizes for Gnome are max(K_min, int(N * aux_frac)) per block. Each aux pass is a
             # full higher-order residual eval, so keep small.
             'aux_frac': 0.10,
-            'lr': 5e-2,
+            'lr': 3e-2,
             # Gnome per-coordinate update bound: lambda is set to the smallest value with
             # max|m̂/(v̂+lambda)| <= this, so no coordinate moves more than lr*trust_region in a step.
             # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain m̂/(v̂+eps)

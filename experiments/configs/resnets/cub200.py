@@ -5,7 +5,9 @@ None keeps an existing automatic/default-dependent setting where supported.
 
 CONFIG = {
     # Gnome only: build the basis from the main gradient; keep surrogate curvature.
-    'use_soap_basis': False,
+    'use_soap_basis': True,
+    # Gnome only: 'overlap' (squared-overlap) or 'soap' (permutation).
+    'basis_transport': 'overlap',
     # Choices: 'gnome_fisher', 'gnome_hutchinson', 'soap', 'adamw'.
     'optimizer': 'gnome_hutchinson',
     'data_dir': 'experiments/data',
@@ -13,7 +15,7 @@ CONFIG = {
     'download': False,
     # Architecture; resnet18_pretrained loads cached/downloaded ImageNet weights. Choices:
     # 'resnet8', 'resnet12', 'resnet18', 'resnet18_pretrained'.
-    'model': 'resnet18',
+    'model': 'resnet12',
     # Default: bn for pretrained, gn for scratch. Pretrained gn converts BN, retaining affine
     # weights. Choices: 'gn', 'bn'.
     'norm': None,
@@ -25,11 +27,11 @@ CONFIG = {
     'workers': 0,
     # Choices: 'auto', 'cpu', 'mps', 'cuda'.
     'device': 'auto',
-    'lr': 0.001,
+    'lr': 0.003,
     'weight_decay': 0.01,
-    'beta1': 0.9,
-    'beta2': 0.99,
-    'eps': 1e-6,
+    'beta1': 0.95,
+    'beta2': 0.95,
+    'eps': 1e-12,
     # Gnome RMS update bound before LR scaling; 0 disables.
     'trust_region': 1.0,
     # Choices: 'none', 'greedy', 'spatial', 'patch'.

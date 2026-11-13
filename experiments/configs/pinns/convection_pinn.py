@@ -4,7 +4,7 @@ None keeps an existing automatic/default-dependent setting where supported.
 """
 
 CONFIG = {
-    # Choices: 'gnome', 'soap', 'adamw', 'engdw'.
+    # Choices: 'gnome', 'soap', 'adamw', 'engdw', 'soap+ssbroyden', 'gnome+ssbroyden'.
     'optimizer': 'gnome',
     # Convection speed. THE knob for this benchmark: the PDE is trivial at every value, but
     # first-order optimizers start failing around 20 and are comprehensively broken by 30-40. The
@@ -22,15 +22,20 @@ CONFIG = {
     'embed': 'none',
     'seed': 0,
     'steps': 250000,
-    'n_pde': 4000,
+    'n_pde': 8_000,
     'n_ic': 256,
     'n_bc': 256,
+    'weights': [1.0, 1.0, 1.0],  # [pde, IC, periodic BC]
+    # The BC weight is ignored for the periodic embedding (exact BC).
     # Reuse PDE/IC/BC points for any optimizer; Gnome draws auxiliary subsets.
     # Validation still samples fresh points.
     'fixed_dataset': False,
+    # Resample N steps, then freeze PDE/IC/BC points. None disables delayed freezing.
+    # fixed_dataset / engdw_fixed freeze from step 0; SS-Broyden freezes by its handoff.
+    'fix_after': None,
     # Network width. Default 50 follows Krishnapriyan.
-    'hidden': 64,
-    'depth': 9,
+    'hidden': 128,
+    'depth': 6,
     'float64': True,
     'diagnostics_every': 0,
     # Comma-separated parameter indices to log.
@@ -41,12 +46,14 @@ CONFIG = {
     # Each optimizer keeps its own hyperparameters and learning-rate schedule.
     'optimizers': {
         'gnome': {
+            # EMA basis handling: 'overlap' (squared overlaps) or 'soap' (permutation only).
+            'basis_transport': 'overlap',
             # Estimate curvature separately for each auxiliary residual block.
-            'partition_residuals': True,
+            'partition_residuals': False,
             # Aux batch fraction for Gnome's curvature surrogate.
             'aux_frac': 0.10,
-            'lr': 8e-3,
-            'trust_region': .04,
+            'lr': 5e-3,
+            'trust_region': .25,
             # Gnome curvature damping in m/(v+eps). Gnome only.
             'eps': 1e-12,
             # First-moment EMA for Gnome and SOAP.
@@ -58,12 +65,35 @@ CONFIG = {
             # Final-LR fraction for the cosine decay: 0.0 decays to zero, 1.0 disables decay.
             'cosine_decay': 0.10,
         },
-        'soap': {
-            'lr': 9e-3,
+        'gnome+ssbroyden': {
+            # EMA basis handling: 'overlap' (squared overlaps) or 'soap' (permutation only).
+            'basis_transport': 'overlap',
+            # Estimate curvature separately for each auxiliary residual block.
+            'partition_residuals': False,
+            # Aux batch fraction for Gnome's curvature surrogate.
+            'aux_frac': 0.10,
+            'lr': 8e-3,
+            'trust_region': .10,
+            # Gnome curvature damping in m/(v+eps). Gnome only.
+            'eps': 1e-12,
             # First-moment EMA for Gnome and SOAP.
             'beta1': 0.95,
             # Second-moment / preconditioner EMA for Gnome, SOAP.
             'beta2': 0.99,
+            'weight_decay': 1e-8,
+            'warmup_steps': 600,
+            # Final-LR fraction for the cosine decay: 0.0 decays to zero, 1.0 disables decay.
+            'cosine_decay': 0.10,
+            'gnome_steps': 15_000,
+            'ssbroyden_lr': 1.0,
+            'ssbroyden_tolerance_grad': 1e-10,
+        },
+        'soap': {
+            'lr': 3e-3,
+            # First-moment EMA for Gnome and SOAP.
+            'beta1': 0.99,
+            # Second-moment / preconditioner EMA for Gnome, SOAP.
+            'beta2': 0.999,
             'weight_decay': 1e-8,
             'warmup_steps': 600,
             # Final-LR fraction for the cosine decay: 0.0 decays to zero, 1.0 disables decay.
@@ -75,6 +105,18 @@ CONFIG = {
             'warmup_steps': 600,
             # Final-LR fraction for the cosine decay: 0.0 decays to zero, 1.0 disables decay.
             'cosine_decay': 0.10,
+        },
+        # Total steps includes both phases; SOAP settings apply to the warm start.
+        'soap+ssbroyden': {
+            'beta1': 0.99,
+            'beta2': 0.999,
+            'weight_decay': 0.0,
+            'lr': 3e-3,
+            'warmup_steps': 0,
+            'cosine_decay': 0.0,
+            'soap_steps': 10_000,
+            'ssbroyden_lr': 1.0,
+            'ssbroyden_tolerance_grad': 1e-10,
         },
         'engdw': {
             'lr': 9e-3,

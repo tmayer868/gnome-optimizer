@@ -251,10 +251,19 @@ def sample_batch(
     return t_pde, x_pde, x_ic, t_bc
 
 
+def residual_partition_sizes(batch, hard_bc: bool) -> list[int]:
+    """Element counts in PDE, displacement IC, velocity IC, optional BC order."""
+    t_pde, _x_pde, x_ic, t_bc = batch
+    sizes = [t_pde.numel(), x_ic.numel(), x_ic.numel()]
+    if not hard_bc:
+        sizes.append(2 * t_bc.numel())  # Both boundary endpoints are stacked.
+    return sizes
+
+
 def stacked_residuals(
-    model: nn.Module, batch, hard_bc: bool
+    model: nn.Module, batch, hard_bc: bool, weights=(1.0, 1.0, 1.0, 1.0)
 ) -> torch.Tensor:
-    """Per-block residuals stacked via ``stack_residuals`` (equal weights):
+    """Per-block residuals stacked via ``stack_residuals`` with loss weights:
     pde + displacement IC + velocity IC (+ Dirichlet BC unless ``hard_bc``,
     which enforces it by construction)."""
     t_pde, x_pde, x_ic, t_bc = batch
@@ -265,7 +274,7 @@ def stacked_residuals(
     ]
     if not hard_bc:
         blocks.append(bc_residual(model, t_bc))
-    return stack_residuals(blocks)
+    return stack_residuals(blocks, weights=weights[:len(blocks)])
 
 
 def term_losses(model: nn.Module, batch) -> dict[str, float]:
@@ -370,7 +379,10 @@ def build_optimizer(
 def parse_args(argv=None) -> argparse.Namespace:
     from experiments.common.config import ConfigParser
     p = ConfigParser(__file__)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if any(w < 0 for w in args.weights):
+        p.error("weights must be non-negative")
+    return args
 
 
 def train(args: argparse.Namespace) -> str:
@@ -403,6 +415,7 @@ def train(args: argparse.Namespace) -> str:
         # Non-zero means a sibling {run_id}.diag.jsonl exists.
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
+        "partition_residuals": args.optimizer == "gnome" and args.partition_residuals,
         "arch": args.arch,
         # Realized chunk sizes, not the raw flag: 0 and any value >= depth-2
         # both mean "one chunk", and the sweep needs those runs to compare
@@ -413,6 +426,7 @@ def train(args: argparse.Namespace) -> str:
         "fourier_scale": args.fourier_scale if args.embed == "fourier" else None,
         "fourier_trainable": args.embed == "fourier",
         "hard_bc": args.hard_bc,
+        "weights": list(args.weights),
         "steps": args.steps,
         "hidden": args.hidden,
         "depth": args.depth,
@@ -487,17 +501,23 @@ def train(args: argparse.Namespace) -> str:
             aux_batch = sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device)
 
             def main_closure():
-                r = stacked_residuals(model, main_batch, args.hard_bc)
+                r = stacked_residuals(model, main_batch, args.hard_bc, args.weights)
                 return r, torch.zeros_like(r)
 
             def aux_closure():
-                r = stacked_residuals(model, aux_batch, args.hard_bc)
+                r = stacked_residuals(model, aux_batch, args.hard_bc, args.weights)
                 return r, torch.zeros_like(r)
 
-            loss = opt.step(main_closure, aux_closure)
+            loss = opt.step(
+                main_closure, aux_closure,
+                surrogate_partition_sizes=(
+                    residual_partition_sizes(aux_batch, args.hard_bc)
+                    if args.partition_residuals else None
+                ),
+            )
         else:
             opt.zero_grad()
-            r = stacked_residuals(model, main_batch, args.hard_bc)
+            r = stacked_residuals(model, main_batch, args.hard_bc, args.weights)
             loss = (r ** 2).sum() / r.shape[0]
             loss.backward()
             opt.step()

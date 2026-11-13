@@ -47,7 +47,7 @@ CONFIG = {
     'optimizers': {
         'gnome': {
             # Estimate curvature separately for each auxiliary residual block.
-            'partition_residuals': True,
+            'partition_residuals': False,
             # Aux batch sizes for Gnome are max(K_min, int(N * aux_frac)) per block. Each aux pass is a
             # full higher-order residual eval, so this is not free — keep small.
             'aux_frac': 0.10,
@@ -56,7 +56,7 @@ CONFIG = {
             # ||m_hat/(v_hat+lambda)||_2 <= this * sqrt(P), i.e. a bound on the RMS per-coordinate step.
             # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain
             # m_hat/(v_hat+eps) damping.
-            'trust_region': .04,
+            'trust_region': .05,
             # Gnome curvature-damping epsilon in m_hat/(v_hat+eps): larger -> more gradient-descent-like,
             # smaller -> fuller Newton step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.
             'eps': 1e-12,

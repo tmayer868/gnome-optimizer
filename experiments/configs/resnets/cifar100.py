@@ -11,16 +11,16 @@ CONFIG = {
     'seed': 0,
     'epochs': 30,
     'batch_size': 256,
-    'lr': 0.001,
+    'lr': 0.003,
     # Gnome per-coordinate update bound: lambda is set to the smallest value with
     # max|m̂/(v̂+lambda)| <= this, so no coordinate moves more than lr*trust_region in a step.
     # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain m̂/(v̂+eps)
     # damping.
-    'trust_region': 1.0,
+    'trust_region': .50,
     # Gnome curvature-damping epsilon; with the trust region active this is only the lower bound
     # on lambda, so it can go much smaller than the pre-trust-region default. Gnome only;
     # SOAP/AdamW keep their fixed eps=1e-8.
-    'eps': 1e-6,
+    'eps': 1e-12,
     # First-moment (momentum) EMA for Gnome and SOAP.
     'beta1': 0.9,
     # Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.
@@ -32,7 +32,7 @@ CONFIG = {
     # Gnome/SOAP convolution-factor grouping: 'none'=[O][I][H][W], 'greedy'=existing size-bounded
     # merge, 'spatial'=[O][I][HW], or 'patch'=[O][IHW]. Ignored by AdamW. Choices: 'none',
     # 'greedy', 'spatial', 'patch'.
-    'merge_dims': 'none',
+    'merge_dims': 'patch',
     # Architecture (default resnet12). Choices: 'resnet8', 'resnet12', 'resnet18'.
     'model': 'resnet12',
     # Normalization: GroupNorm (default) or BatchNorm. GroupNorm keeps the per-sample block

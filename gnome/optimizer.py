@@ -262,6 +262,11 @@ class Gnome(Optimizer):
             rotated curvature EMA still uses the surrogate gradient, so this
             changes only the basis source. Default False; can be overridden
             per parameter group and is saved in optimizer checkpoints.
+        basis_transport: How EMA coordinates follow basis updates. "overlap"
+            transports curvature with squared overlaps and momentum with
+            unsquared overlaps. "soap" uses the previous SOAP-style curvature
+            permutation and momentum projection. Default "overlap". Independent
+            of use_soap_basis; saved per parameter group in checkpoints.
         max_precond_dim: Modes larger than this are skipped (no Kronecker
             factor maintained along that dimension).
         trust_radius: l2 trust region on the update in the rotated basis.
@@ -332,6 +337,7 @@ class Gnome(Optimizer):
         precondition_1d: bool = False,
         data_format: str = "channels_first",
         use_soap_basis: bool = False,
+        basis_transport: str = "overlap",
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -367,6 +373,7 @@ class Gnome(Optimizer):
             precondition_1d=precondition_1d,
             trust_radius=trust_radius,
             use_soap_basis=use_soap_basis,
+            basis_transport=basis_transport,
         )
         super().__init__(params, defaults)
         self._data_format = data_format
@@ -385,6 +392,8 @@ class Gnome(Optimizer):
 
     @staticmethod
     def _validate_param_group(group: dict) -> None:
+        if group["basis_transport"] not in ("overlap", "soap"):
+            raise ValueError("basis_transport must be 'overlap' or 'soap'")
         if not isinstance(group["use_soap_basis"], bool):
             raise ValueError("use_soap_basis must be a bool")
         # Accept old all-Gnome groups without retaining the removed selector.
@@ -500,7 +509,8 @@ class Gnome(Optimizer):
         state_dict = dict(state_dict)
         state_dict["param_groups"] = [
             # Accept checkpoints written with the original misspelled option.
-            {"use_soap_basis": group.get("use_soap_basi", False),
+            {"basis_transport": self.defaults["basis_transport"],
+             "use_soap_basis": group.get("use_soap_basi", False),
              **{key: value for key, value in group.items() if key != "use_soap_basi"}}
             for group in state_dict["param_groups"]
         ]
@@ -707,6 +717,7 @@ class Gnome(Optimizer):
         max_precond_dim: int,
         merge_dims: MergeDims,
         precondition_1d: bool,
+        basis_transport: str = "overlap",
     ) -> None:
         """Update factors once from the sum of basis-gradient outer products.
 
@@ -714,13 +725,12 @@ class Gnome(Optimizer):
         terms. With use_soap_basis, the input is just the main gradient.
         Refresh the eigenbasis Q on the usual per-step schedule.
 
-        ``grad_m`` is a first-moment (vector) quantity so it is translated
-        out of the old basis and back into the new basis when Q is
-        refreshed. ``gnd_m`` is a diagonal-variance quantity in the rotated
-        basis; rotating it as a vector can produce negative entries, so it
-        is left in place (same approximation as SOAP).
+        On basis refresh, transport the gradient EMA with basis overlaps and
+        the diagonal curvature EMA with squared overlaps. Between refreshes
+        both EMAs stay in the current basis. The "soap" policy instead retains
+        the previous permutation-only curvature handling and momentum round trip.
         """
-        if state["Q"] is not None:
+        if basis_transport == "soap" and state["Q"] is not None:
             state["grad_m"] = self._project_back(
                 state["grad_m"], state,
                 merge_dims=merge_dims, max_precond_dim=max_precond_dim,
@@ -761,9 +771,9 @@ class Gnome(Optimizer):
         if state["Q"] is None:
             state["Q"] = self._eigvecs_descending(state["GG"])
         elif state["step"] > 0 and state["step"] % state["precondition_frequency"] == 0:
-            self._qr_refresh_eigenbasis(state, max_precond_dim, merge_dims)
+            self._qr_refresh_eigenbasis(state, max_precond_dim, merge_dims, basis_transport)
 
-        if state["step"] > 0:
+        if basis_transport == "soap" and state["step"] > 0:
             state["grad_m"] = self._project(
                 state["grad_m"], state,
                 merge_dims=merge_dims, max_precond_dim=max_precond_dim,
@@ -792,6 +802,7 @@ class Gnome(Optimizer):
         state: dict,
         max_precond_dim: int,
         merge_dims: MergeDims,
+        basis_transport: str = "overlap",
     ) -> None:
         """Incrementally refresh the eigenbasis via one power iteration + QR.
 
@@ -803,23 +814,26 @@ class Gnome(Optimizer):
         refresh is far cheaper than a full ``eigh`` — and avoids the
         CPU↔MPS bounce that ``eigh`` requires on Apple Silicon.
 
-        ``gnd_m`` is a per-coordinate variance in the rotated basis; when
-        we reorder Q's columns by ``sort_idx`` we must permute ``gnd_m``
-        along the corresponding tensor dimension so it stays aligned with
-        the new eigenvalue ordering. (SOAP applies the same permutation to
-        its ``exp_avg_sq``.)
+        Transport each EMA along every refreshed tensor axis. For an overlap
+        C = Q_new.T @ Q_old, the gradient EMA uses C and the diagonal curvature
+        EMA uses C.square(). This assumes historical coordinates were
+        uncorrelated in the old basis, preserves nonnegativity and total
+        curvature mass, and includes eigenvector permutations and sign flips.
+        No separate permutation of the curvature EMA is applied in overlap
+        mode. In soap mode, only reorder curvature coordinates; momentum
+        projection is handled by _update_preconditioner.
         """
         precond_list = state["GG"]
         orth_list = state["Q"]
-        gnd_m = state["gnd_m"]
-
-        # Apply merge_dims to gnd_m so the per-factor dimensions line up.
+        grad_m, gnd_m = state["grad_m"], state["gnd_m"]
+        grad_dtype, gnd_dtype = grad_m.dtype, gnd_m.dtype
         if merge_dims:
-            gnd_m_view, merge_metadata = self._reshape_for_preconditioner(
+            grad_m, merge_metadata = self._reshape_for_preconditioner(
+                grad_m, max_precond_dim, merge_dims
+            )
+            gnd_m, _ = self._reshape_for_preconditioner(
                 gnd_m, max_precond_dim, merge_dims
             )
-        else:
-            gnd_m_view = gnd_m
 
         new_Q = []
         for ind, (m, o) in enumerate(zip(precond_list, orth_list)):
@@ -832,9 +846,7 @@ class Gnome(Optimizer):
 
             est_eig = torch.diag(o_f.T @ m_f @ o_f)
             sort_idx = torch.argsort(est_eig, descending=True)
-            gnd_m_view = gnd_m_view.index_select(ind, sort_idx)
-            o_f = o_f[:, sort_idx]
-            power_iter = m_f @ o_f
+            power_iter = m_f @ o_f[:, sort_idx]
 
             if _prefer_cpu(power_iter):
                 Q_cpu, _ = torch.linalg.qr(power_iter.cpu())
@@ -846,10 +858,25 @@ class Gnome(Optimizer):
                 Q = Q.to(dtype=m.data.dtype)
             new_Q.append(Q)
 
-        if merge_dims:
-            gnd_m_view = self._restore_merged_dims(gnd_m_view, merge_metadata)
+            if basis_transport == "soap":
+                gnd_m = gnd_m.index_select(ind, sort_idx)
+            else:
+                # Contract the old coordinate with the overlap's old-basis axis,
+                # then put the new coordinate back in the same tensor position.
+                overlap = Q.to(work_dtype).T @ o_f
+                grad_m = torch.tensordot(
+                    overlap, grad_m.to(work_dtype), dims=([1], [ind])
+                ).movedim(0, ind)
+                gnd_m = torch.tensordot(
+                    overlap.square(), gnd_m.to(work_dtype), dims=([1], [ind])
+                ).movedim(0, ind)
 
-        state["gnd_m"] = gnd_m_view
+        if merge_dims:
+            grad_m = self._restore_merged_dims(grad_m, merge_metadata)
+            gnd_m = self._restore_merged_dims(gnd_m, merge_metadata)
+
+        state["grad_m"] = grad_m.to(grad_dtype)
+        state["gnd_m"] = gnd_m.to(gnd_dtype)
         state["Q"] = new_Q
 
     # ------------------------------------------------------------------
@@ -1277,6 +1304,7 @@ class Gnome(Optimizer):
                 max_precond_dim=group["max_precond_dim"],
                 merge_dims=group["merge_dims"],
                 precondition_1d=group["precondition_1d"],
+                basis_transport=group["basis_transport"],
             )
             return  # first step: build the basis, skip the update.
 
@@ -1362,4 +1390,5 @@ class Gnome(Optimizer):
             max_precond_dim=group["max_precond_dim"],
             merge_dims=group["merge_dims"],
             precondition_1d=group["precondition_1d"],
+            basis_transport=group["basis_transport"],
         )

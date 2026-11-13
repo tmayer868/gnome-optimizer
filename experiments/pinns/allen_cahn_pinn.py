@@ -22,7 +22,7 @@ Two architectures, selectable via ``--arch``:
   none of the rest of the jaxpi pipeline (random weight factorization,
   Fourier features, causal weighting, grad-norm balancing) is ported.
   The multi-block loss is the same plain ``gnome.stack_residuals``
-  pattern with equal block weights used throughout these experiments.
+  pattern with configurable block weights (equal by default).
 
 Four input embeddings, selectable via ``--embed`` (all architectures):
 
@@ -83,6 +83,11 @@ Usage:
     uv run -m experiments.pinns.allen_cahn_pinn
     # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', float64_after=30000
     uv run -m experiments.pinns.allen_cahn_pinn
+SOAP + SS-Broyden is available as ``optimizer='soap+ssbroyden'``. The
+``soap_steps`` phase runs the usual SOAP updates; remaining total ``steps``
+use Scimba's strong-Wolfe SS-Broyden. Sampling freezes and precision promotes
+to float64 no later than the handoff; earlier ``fix_after`` and
+``float64_after`` switches are retained.
 """
 
 from __future__ import annotations
@@ -98,6 +103,10 @@ import torch.autograd as autograd
 import torch.nn as nn
 
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
+from experiments.common.ssbroyden import (
+    build_soap_phase, build_ssbroyden_phase, validate_ssbroyden,
+)
+from experiments.common.precision import switch_to_float64
 from experiments.baselines import SOAP
 from experiments.common import (
     DIVERGED_EXIT,
@@ -258,9 +267,9 @@ def residual_partition_sizes(batch, use_bc: bool = True) -> list[int]:
 
 
 def stacked_residuals(
-    model: nn.Module, batch, use_bc: bool = True
+    model: nn.Module, batch, use_bc: bool = True, weights=(1.0, 1.0, 1.0)
 ) -> torch.Tensor:
-    """Per-block residuals stacked via ``stack_residuals`` (equal weights).
+    """Stack residuals with loss weights ordered as PDE, IC, periodic BC.
 
     ``use_bc=False`` drops the soft periodicity block, which the periodic
     embedding satisfies exactly — computing it would just append a vector of
@@ -273,7 +282,7 @@ def stacked_residuals(
     ]
     if use_bc:
         blocks.append(bc_residual(model, t_bc))
-    return stack_residuals(blocks)
+    return stack_residuals(blocks, weights=weights[:len(blocks)])
 
 
 def term_losses(model: nn.Module, batch) -> dict[str, float]:
@@ -394,6 +403,7 @@ def build_optimizer(
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
     beta1: float = 0.9, beta2: float = 0.99,
     trust_region: float = 1.0,
+    basis_transport: str = "overlap",
 ):
     """Construct the optimizer and its LR schedule.
 
@@ -407,7 +417,8 @@ def build_optimizer(
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
-            precondition_frequency=5,
+            precondition_frequency=10,
+            basis_transport=basis_transport,
             trust_radius=(trust_region if trust_region > 0 else None),
             loss="mse", precondition_1d=True,
         )
@@ -440,6 +451,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     from experiments.common.config import ConfigParser
     p = ConfigParser(__file__)
     args = p.parse_args(argv)
+    if any(w < 0 for w in args.weights):
+        p.error("weights must be non-negative")
     if min(args.steps, args.n_pde, args.n_ic, args.n_bc) < 1:
         p.error("steps and collocation counts must be positive")
     if args.fix_after is not None and not 0 <= args.fix_after < args.steps:
@@ -451,54 +464,21 @@ def parse_args(argv=None) -> argparse.Namespace:
             p.error("fixed_dataset or fix_after requires aux_frac in (0,1] for Gnome")
     if args.float64_after is not None and not 0 <= args.float64_after < args.steps:
         p.error("--float64-after must satisfy 0 <= N < --steps")
+    if args.optimizer == "soap+ssbroyden":
+        try:
+            validate_ssbroyden(args)
+        except ValueError as error:
+            p.error(str(error))
     return args
 
-
-def switch_to_float64(model: nn.Module, opt: torch.optim.Optimizer) -> torch.device:
-    """Promote a model and its accumulated optimizer state between steps."""
-    old_params = list(model.parameters())
-    device = old_params[0].device
-    opt.zero_grad(set_to_none=True)
-    if device.type == "mps":
-        device = torch.device("cpu")
-        # Transfer first: MPS cannot hold even a temporary float64 tensor.
-        model.to(device)
-    model.double()
-
-    def convert(value):
-        if isinstance(value, torch.Tensor):
-            return value.to(device=device).to(
-                dtype=torch.float64 if value.is_floating_point() else value.dtype
-            )
-        if isinstance(value, dict):
-            return {key: convert(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [convert(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(convert(item) for item in value)
-        return value
-
-    # Module conversion can replace Parameters on a device change. Rebind
-    # optimizer references as well as state keys, retaining the same optimizer.
-    replacements = dict(zip(old_params, model.parameters()))
-    for group in opt.param_groups:
-        group["params"] = [replacements[p] for p in group["params"]]
-    old_state = list(opt.state.items())
-    opt.state.clear()
-    for parameter, state in old_state:
-        opt.state[replacements[parameter]] = {
-            # AdamW's scalar step counter keeps its original dtype/device.
-            key: value if key == "step" else convert(value)
-            for key, value in state.items()
-        }
-    torch.set_default_dtype(torch.float64)
-    return device
 
 
 def train(args: argparse.Namespace) -> str:
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(
-        torch.float64 if args.float64 or args.float64_after == 0 else torch.float32
+        torch.float64 if (args.float64 or args.float64_after == 0 or
+                          (args.optimizer == "soap+ssbroyden" and args.soap_steps == 0))
+        else torch.float32
     )
     try:
         return _train(args)
@@ -507,6 +487,13 @@ def train(args: argparse.Namespace) -> str:
 
 
 def _train(args: argparse.Namespace) -> str:
+    hybrid = args.optimizer == "soap+ssbroyden"
+    if hybrid:
+        validate_ssbroyden(args)
+    float64_from_step = 0 if torch.get_default_dtype() == torch.float64 else args.float64_after
+    if hybrid:
+        float64_from_step = (args.soap_steps if float64_from_step is None
+                             else min(float64_from_step, args.soap_steps))
     device = pick_device()
     if torch.get_default_dtype() == torch.float64:
         if device.type == "mps":
@@ -524,15 +511,22 @@ def _train(args: argparse.Namespace) -> str:
         build_embedding(args.embed, args.embed_dim, args.embed_scale),
         args.hidden, args.depth, args.fuse_every,
     ).to(device)
-    opt, opt_cfg, scheduler = build_optimizer(
-        args.optimizer, model.parameters(), args.lr, args.weight_decay,
-        warmup=args.warmup_steps, total_steps=args.steps,
-        cosine_decay=args.cosine_decay, eps=args.eps,
-        beta1=args.beta1, beta2=args.beta2,
-        trust_region=args.trust_region,
-    )
+    if hybrid:
+        opt, opt_cfg, scheduler = build_soap_phase(model, args, precondition_frequency=1)
+    else:
+        opt, opt_cfg, scheduler = build_optimizer(
+            args.optimizer, model.parameters(), args.lr, args.weight_decay,
+            warmup=args.warmup_steps, total_steps=args.steps,
+            cosine_decay=args.cosine_decay, eps=args.eps,
+            beta1=args.beta1, beta2=args.beta2,
+            trust_region=args.trust_region,
+            basis_transport=args.basis_transport,
+        )
 
     fixed_from_step = 0 if args.fixed_dataset else args.fix_after
+    if hybrid:
+        fixed_from_step = (args.soap_steps if fixed_from_step is None
+                           else min(fixed_from_step, args.soap_steps))
     sampling = ("fixed" if fixed_from_step == 0 else
                 "resample_then_fixed" if fixed_from_step is not None else "resample_each_step")
     n_pde_aux = max(8, int(args.n_pde * args.aux_frac))
@@ -547,6 +541,7 @@ def _train(args: argparse.Namespace) -> str:
     hyperparameters = {
         "optimizer": args.optimizer,
         "partition_residuals": args.optimizer == "gnome" and args.partition_residuals,
+        "basis_transport": args.basis_transport if args.optimizer == "gnome" else None,
         "arch": args.arch,
         # Realized chunk sizes, not the raw flag: 0 and any value >= depth-2
         # both mean "one chunk", and the sweep needs those runs to compare
@@ -556,6 +551,7 @@ def _train(args: argparse.Namespace) -> str:
         "embed_dim": args.embed_dim if args.embed == "fourier" else None,
         "embed_scale": args.embed_scale if args.embed == "fourier" else None,
         "blocks": ["pde", "ic", "bc"] if use_bc else ["pde", "ic"],
+        "weights": list(args.weights),
         # Non-zero means a sibling {run_id}.diag.jsonl exists for this run.
         "diagnostics_every": args.diagnostics_every,
         "steps": args.steps,
@@ -581,6 +577,7 @@ def _train(args: argparse.Namespace) -> str:
         "device": str(device),
         "dtype": str(torch.get_default_dtype()),
         "float64_after": args.float64_after,
+        "float64_from_step": float64_from_step,
         "reference": args.reference,
         **{f"opt.{k}": v for k, v in opt_cfg.items()},
     }
@@ -644,7 +641,7 @@ def _train(args: argparse.Namespace) -> str:
 
     fixed_batch = None
     for step in range(args.steps):
-        if step == args.float64_after and step > 0:
+        if step == float64_from_step and step > 0:
             previous_device = device
             device = switch_to_float64(model, opt)
             if fixed_batch is not None:
@@ -659,6 +656,13 @@ def _train(args: argparse.Namespace) -> str:
             if not args.quiet:
                 print(f"[{EXPERIMENT}] after {step} steps: float32 → float64 "
                       f"| device={previous_device} → {device}", flush=True)
+        quasi_newton = hybrid and step >= args.soap_steps
+        if hybrid and step == args.soap_steps:
+            opt = build_ssbroyden_phase(model, args)
+            scheduler = None
+            run.log("optimizer", step=step, optimizer="ssbroyden")
+            if not args.quiet:
+                print(f"[{EXPERIMENT}] switching to SS-Broyden at step {step}", flush=True)
         if fixed_batch is None:
             main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
             if fixed_from_step is not None and step >= fixed_from_step:
@@ -681,11 +685,11 @@ def _train(args: argparse.Namespace) -> str:
                 aux_batch = sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device)
 
             def main_closure():
-                r = stacked_residuals(model, main_batch, use_bc)
+                r = stacked_residuals(model, main_batch, use_bc, args.weights)
                 return r, torch.zeros_like(r)
 
             def aux_closure():
-                r = stacked_residuals(model, aux_batch, use_bc)
+                r = stacked_residuals(model, aux_batch, use_bc, args.weights)
                 return r, torch.zeros_like(r)
 
             loss = opt.step(
@@ -694,9 +698,18 @@ def _train(args: argparse.Namespace) -> str:
                     residual_partition_sizes(aux_batch, use_bc) if args.partition_residuals else None
                 ),
             )
+        elif quasi_newton:
+            def closure():
+                opt.zero_grad()
+                r = stacked_residuals(model, main_batch, use_bc, args.weights)
+                value = r.square().mean()
+                value.backward()
+                return value
+
+            loss = opt.step(closure)
         else:
             opt.zero_grad()
-            r = stacked_residuals(model, main_batch, use_bc)
+            r = stacked_residuals(model, main_batch, use_bc, args.weights)
             loss = (r ** 2).sum() / r.shape[0]
             loss.backward()
             opt.step()
@@ -717,10 +730,14 @@ def _train(args: argparse.Namespace) -> str:
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.",
                   flush=True)
             raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=loss_val)
+        run.log_train(step, loss=loss_val, **(
+            {"phase": "ssbroyden" if quasi_newton else "soap"} if hybrid else {}
+        ))
         window.append(loss_val)
 
-        if args.log_every and (step + 1) % args.log_every == 0:
+        should_log = args.log_every and (step + 1) % args.log_every == 0
+        at_handoff = hybrid and step + 1 == args.soap_steps
+        if should_log or (hybrid and step + 1 == args.steps) or at_handoff:
             tl = term_losses(
                 model, sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
             )

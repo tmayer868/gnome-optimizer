@@ -65,6 +65,7 @@ CONFIG = {
         },
         "gnome": {
             "use_soap_basis": True,
+            "basis_transport": "overlap",  # "overlap" (squared-overlap) or "soap" (permutation).
             "lr": 7e-4,
             "betas": [0.95, 0.95],
             "eps": 1e-12,
