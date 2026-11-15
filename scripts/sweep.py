@@ -2,11 +2,12 @@
 """Sequential batch runner for hyperparameter sweeps.
 
 Edit ``RUNS`` below — a list of dicts, one per run. Each dict must have an
-``"experiment"`` key naming ``experiments/<experiment>.py``; every other key
-becomes a CLI flag on that experiment (underscores → dashes, so
-``"cosine_decay": 0.0`` → ``--cosine-decay 0.0``). A **bool** value is treated
-as a flag: ``True`` adds ``--key``, ``False`` omits it (for ``store_true`` /
-``store_false`` args like ``--quiet`` or ``--no-augment``).
+``"experiment"`` key naming an experiment module by its leaf name (for
+example, ``"poisson_pinn"``); every other key overrides its CONFIG entry.
+Both True and False are explicit values. Nested dictionaries are merged
+recursively. An optional ``config`` key selects another base Python file.
+Each run gets a complete config snapshot in runs/sweeps/, passed via --config.
+Dry runs preview settings without writing files.
 
 Use ``grid(...)`` to build a cartesian-product sweep: list-valued keywords are
 swept, scalar ones are fixed (e.g. ``grid("poisson_pinn", optimizer="gnome",
@@ -25,6 +26,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -53,37 +55,12 @@ def grid(experiment: str, **params) -> list[dict]:
         runs.append({"experiment": experiment, **fixed, **dict(zip(keys, combo))})
     return runs
 
-
 # ----------------------------------------------------------------------
 # The sweep. Edit this.
 # ----------------------------------------------------------------------
-# lr × eps grid for Gnome on Poisson (3 × 3 = 9 runs):
+# Compare optimizers on Poisson and Burgers:
 
 RUNS = grid(
-    "ols_regression", optimizer="gnome", epochs=100, seed=0,
-    lr=1e-2,
-    eps=1e-6,
-    beta2=.99,
-    dim=128,
-)
-
-RUNS += grid(
-    "ols_regression", optimizer="soap", epochs=100, seed=0,
-    lr=1e-2,
-    beta2=.99,
-    dim=128,
-    cosine=1.0
-)
-
-RUNS += grid(
-    "ols_regression", optimizer="adamw", epochs=100, seed=0,
-    lr=1e-2,
-    dim=128,
-    cosine_decay=1.0
-)
-
-
-RUNS += grid(
     "poisson_pinn", optimizer="gnome", steps=STEPS, seed=0,
     lr=1e-2,
     eps=1e-6,
@@ -123,7 +100,6 @@ RUNS += grid(
     depth=8,
 )
 
-
 RUNS += grid(
     "burgers_pinn", optimizer="adamw", steps=STEPS, seed=0,
     lr=1e-3,
@@ -131,37 +107,7 @@ RUNS += grid(
     depth=8,
 )
 
-
-
-RUNS += grid(
-    "kuramoto_sivashinsky_pinn", optimizer="gnome", steps=STEPS, seed=0,
-    lr=1e-2,
-    eps=1e-6,
-    beta2=.99,
-    hidden=64,
-    depth=8,
-)
-
-RUNS += grid(
-    "kuramoto_sivashinsky_pinn", optimizer="soap", steps=STEPS, seed=0,
-    lr=1e-3,
-    beta2=.99,
-    hidden=64,
-    depth=8,
-)
-
-RUNS += grid(
-    "kuramoto_sivashinsky_pinn", optimizer="adamw", steps=STEPS, seed=0,
-    lr=1e-3,
-    hidden=64,
-    depth=8,
-)
-
 print(f"NUMBER OF RUNS: {len(RUNS)}")
-
-
-
-
 
 # Concatenate grids to sweep several experiments / optimizers in one batch:
 # RUNS = (
@@ -169,43 +115,75 @@ print(f"NUMBER OF RUNS: {len(RUNS)}")
 #          lr=[1e-3, 1e-2], eps=[1e-5, 1e-6], beta2=[0.9, 0.95])
 #     + grid("poisson_pinn", optimizer="soap", steps=STEPS, cosine_decay=0.0,
 #            lr=[5e-4, 1e-3])
-#     + [{"experiment": "ols_regression", "optimizer": "gnome", "lr": 0.1}]  # or hand-write
+#     + [{"experiment": "poisson_pinn", "optimizer": "gnome", "lr": 0.1}]  # or hand-write
 # )
 
 # Stop the whole sweep on the first failing run? Default False: log it and
 # keep going (a bad config shouldn't abort the rest of an overnight sweep).
 STOP_ON_ERROR = False
 
-
 # ----------------------------------------------------------------------
 # Runner
 # ----------------------------------------------------------------------
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
 
 # Exit code an experiment uses to signal "training diverged" (see
 # experiments/common/divergence.py). An expected sweep outcome — reported
 # separately and does NOT fail the batch.
 DIVERGED_EXIT = 3
 
+EXPERIMENT_PACKAGES = {
+    "pinns": {
+        "allen_cahn_pinn",
+        "burgers2d_pinn",
+        "burgers_pinn",
+        "convection_pinn",
+        "generate_allen_cahn_reference",
+        "heat2d_pinn",
+        "heat5d_pinn",
+        "heat_6d",
+        "helmholtz_pinn",
+        "kdv_pinn",
+        "navier_stokes_pinn",
+        "poisson5d_pinn",
+        "poisson_pinn",
+        "reaction_pinn",
+        "wave_pinn",
+    },
+    "resnets": {"cifar100", "cifar_rotation", "cub200", "grating_freq", "utkface"},
+    "transformers": {"wikitext_gpt", "modded_nanogpt", "cub200_vit"},
+    "tabular": {"covertype", "otto"},
+}
 
-def build_cmd(run: dict) -> list[str]:
-    """Turn one run dict into a ``python -m experiments.<exp> --flag val ...``
-    argv list."""
-    run = dict(run)  # don't mutate the caller's dict
-    try:
-        experiment = run.pop("experiment")
-    except KeyError:
-        raise SystemExit(f"run is missing the required 'experiment' key: {run}")
-    cmd = [sys.executable, "-u", "-m", f"experiments.{experiment}"]
-    for key, val in run.items():
-        flag = "--" + key.replace("_", "-")
-        if isinstance(val, bool):
-            if val:
-                cmd.append(flag)     # bare flag; False → omit entirely
-        else:
-            cmd += [flag, str(val)]
-    return cmd
+def experiment_module(experiment: str) -> str:
+    """Resolve a sweep experiment leaf name to its importable module path."""
+    if "." in experiment:
+        return f"experiments.{experiment}"
+    for package, names in EXPERIMENT_PACKAGES.items():
+        if experiment in names:
+            return f"experiments.{package}.{experiment}"
+    return f"experiments.{experiment}"
 
+def build_cmd(run: dict, config_path: Path) -> list[str]:
+    """Launch an experiment with its materialized Python config."""
+    return [sys.executable, "-u", "-m", experiment_module(run["experiment"]),
+            "--config", str(config_path)]
+
+def run_config(run: dict) -> dict:
+    from experiments.common.config import load_config_dict, merge_config_overrides
+
+    if "experiment" not in run:
+        raise ValueError(f"run is missing the required 'experiment' key: {run}")
+    module = experiment_module(run["experiment"])
+    default = Path(REPO) / "experiments" / "configs" / Path(*module.split(".")[1:]).with_suffix(".py")
+    config = load_config_dict(run.get("config", default))
+
+    return merge_config_overrides(
+        config, {key: value for key, value in run.items() if key not in ("experiment", "config")},
+        flat_optimizer_overrides=module.startswith("experiments.pinns."),
+    )
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -219,14 +197,20 @@ def main() -> None:
 
     if args.dry_run:
         for i, run in enumerate(RUNS, 1):
-            print(f"[{i}/{total}] {' '.join(build_cmd(run)[2:])}")
+            run_config(run)
+            path = Path("runs/sweeps/preview") / f"{i:04d}.py"
+            print(f"[{i}/{total}] {' '.join(build_cmd(run, path)[2:])}\n  {_run_summary(run)}")
         return
 
+    from experiments.common.config import write_config
+
+    config_dir = Path(REPO) / "runs" / "sweeps" / str(time.time_ns())
     results = []  # (index, run, returncode, seconds)
     sweep_t0 = time.time()
     try:
         for i, run in enumerate(RUNS, 1):
-            cmd = build_cmd(run)
+            config_path = write_config(config_dir / f"{i:04d}.py", run_config(run))
+            cmd = build_cmd(run, config_path)
             pretty = " ".join(cmd[3:])  # drop python -u -m
             print(f"\n{'='*70}\n[{i}/{total}] {pretty}\n{'='*70}", flush=True)
             t0 = time.time()
@@ -262,11 +246,9 @@ def main() -> None:
     if failed:   # divergence is an expected outcome; only real crashes fail the batch
         sys.exit(1)
 
-
 def _run_summary(run: dict) -> str:
     """Compact one-line view of a run's key hyperparameters (sans experiment)."""
     return " ".join(f"{k}={v}" for k, v in run.items() if k != "experiment")
-
 
 if __name__ == "__main__":
     main()

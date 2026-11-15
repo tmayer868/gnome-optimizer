@@ -1,0 +1,596 @@
+"""5-D Poisson PINN: AdamW vs SOAP vs Gnome.
+
+Apples-to-apples with the 5-D benchmark of "Improving Energy Natural Gradient
+Descent through Woodbury, Momentum, and Randomization" (arXiv:2505.12149,
+Appendix A.2), restructured into this repo's experiment format.
+
+PDE:  -Δu = f(x),    x ∈ (0, 1)^d
+BC:   u = u*  on  ∂Ω    (Dirichlet)
+
+Manufactured solution::
+
+    u*(x)   = Σ_i cos(π x_i)
+    Δu*     = -π² u*        ⇒   -Δu* = π² u*
+    f(x)    = π² Σ_i cos(π x_i)   (= π² u*, known in closed form)
+
+**cos, not sin.** ``∫₀¹ cos(π x) dx = 0``, so ``u*`` has zero mean on the unit
+cube and a constant predictor scores ``rel_l2 = 1.0``. A sine sum has mean
+``2d/π``, so a constant predictor there scores ~0.05 — a degenerate metric.
+The zero-mean cosine target keeps ``rel_l2`` honest.
+
+Why 5-D (not 100-D): 5-D is the rung of the paper's ladder with a full baseline
+set, it's cheap (D = 10,065 params with the reference architecture), and it's
+where the single-precision floor for second-order PDE autodiff actually starts
+to bite — so it's the right first rung.
+
+**Exact Laplacian, no Hutchinson.** With a manufactured solution the PDE
+residual is the only training signal, so a stochastic trace estimate would put
+a variance noise-floor under the residual that no optimizer can escape. At
+d=5 the exact Laplacian (``Σ_i ∂²u/∂x_i²`` via forward-over-reverse autograd)
+is cheap, so we compute it exactly. This is the key difference from the
+higher-dimensional variants.
+
+Two-block residual: PDE (interior), BC (boundary). Stacked through
+``gnome.stack_residuals`` so the multi-block MSE rides Gnome's single-MSE
+surrogate as the per-block independent Rademacher GGN estimator. ``--bc-volume-
+weight`` switches the BC block from equal weighting (the paper's Methods-section
+residual, and Gnome's natural stacking) to the ``|∂Ω| = 2d`` weighting of the
+paper's Background-section loss.
+
+All optimizers support a plain tanh MLP (``arch='mlp'``, the default) or the
+shared fused MLP (``arch='fused'``). ``fuse_every`` groups consecutive hidden
+layers into parameter tensors: 1 keeps one tensor per layer, 2 groups pairs,
+and 0 groups all hidden layers. Width and depth retain the same meanings.
+Gnome, SOAP, and AdamW get the same linear-warmup + cosine-decay schedule
+(``--cosine-decay`` sets the final-lr fraction; 1.0 gives warmup then constant,
+which suits Gnome on MSE since its step self-anneals as the residual shrinks).
+
+Precision defaults to the device's native float32; ``--dtype float64`` pushes
+below the ~1e-5 second-order-autodiff floor (MPS has no float64, so it falls
+back to CPU — use CUDA for real float64 runs).
+
+``--optimizer engdw`` adds the paper's exact Energy Natural Gradient with the
+Woodbury identity as a reference method (the ~1e-6 natural-gradient line). It
+uses the paper's ``1/√Nⱼ`` residual scaling so their tuned damping transfers,
+and is forced to float64 on CUDA/CPU. Note it is a **GPU/reference-only path**:
+the exact Jacobian is built with a naive ``jacrev`` (~O(N²) time, O(N·D)
+memory), so at the paper's N=3500 it is a Thunder/CUDA job, not a laptop one.
+
+Usage::
+
+    # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='gnome', seed=0
+
+    # In CONFIG["optimizers"]['gnome']: lr=0.01
+    uv run -m experiments.pinns.poisson5d_pinn
+    # Edit experiments/configs/pinns/poisson5d_pinn.py: arch='fused', fuse_every=2
+    uv run -m experiments.pinns.poisson5d_pinn
+    # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='soap', seed=0
+    uv run -m experiments.pinns.poisson5d_pinn
+    # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='adamw', seed=0
+    uv run -m experiments.pinns.poisson5d_pinn
+    # reference natural-gradient line (GPU/float64):
+    # Edit experiments/configs/pinns/poisson5d_pinn.py: optimizer='engdw'
+    # In CONFIG["optimizers"]['engdw']: lr=0.052289
+    uv run -m experiments.pinns.poisson5d_pinn
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import time
+
+import torch
+import torch.autograd as autograd
+import torch.nn as nn
+from torch.func import functional_call, jacfwd, jacrev, vmap
+
+from gnome import Gnome, JsonlDiagnostics, stack_residuals
+from experiments.common import FusedLinear
+from experiments.common import MLP as _SharedMLP, ConcatEmbedding, FusedMLP
+from experiments.baselines import ENGDW, SOAP
+from experiments.common import (
+    DIVERGED_EXIT,
+    diverged,
+    RunLogger,
+    cosine_scheduler,
+    current_lr,
+    pick_device,
+)
+
+
+from experiments.common import pinn_options as pinn
+
+EXPERIMENT = "poisson5d_pinn"
+
+PI = math.pi
+
+
+# ========================= Model =========================
+
+class PINN(_SharedMLP):
+    """Maps ``x ∈ ℝ^d → u`` via a plain tanh MLP.
+
+    Uniform-width MLP following the repo convention (same as ``poisson_pinn``):
+    ``hidden`` is the layer width and ``depth`` is the total number of linear
+    layers (input + hidden + output). The paper's A.2 net was a tapered
+    ``5→64→64→48→48→1``; here we use a plain uniform net instead, since the
+    exact architecture isn't important for the optimizer comparison.
+    """
+
+    def __init__(self, d_in: int, hidden: int = 64, depth: int = 5, embedding=None):
+        super().__init__(embedding if embedding is not None else ConcatEmbedding(d_in), hidden=hidden, depth=depth)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(*x.split(1, dim=-1))
+
+
+class FusedPINN(FusedMLP):
+    """Shared fused MLP accepting the benchmark's single ``(batch, d)`` input."""
+
+    def __init__(self, d_in: int, hidden: int = 64, depth: int = 5, fuse_every: int = 0, embedding=None):
+        super().__init__(embedding if embedding is not None else ConcatEmbedding(d_in), hidden=hidden, depth=depth,
+                         fuse_every=fuse_every)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return super().forward(*x.split(1, dim=-1))
+
+
+def build_model(arch: str, d_in: int, hidden: int = 64, depth: int = 5,
+                fuse_every: int = 0, embedding=None) -> nn.Module:
+    if arch == "mlp":
+        return PINN(d_in, hidden=hidden, depth=depth, embedding=embedding)
+    if arch == "fused":
+        return FusedPINN(d_in, hidden=hidden, depth=depth, fuse_every=fuse_every, embedding=embedding)
+    raise ValueError(f"unknown arch: {arch}")
+
+
+# ========================= Exact solution + forcing =========================
+
+def u_star(x: torch.Tensor) -> torch.Tensor:
+    """Manufactured solution ``u*(x) = Σ_i cos(π x_i)`` → ``(B, 1)`` (zero mean)."""
+    return torch.cos(PI * x).sum(dim=1, keepdim=True)
+
+
+def forcing(x: torch.Tensor) -> torch.Tensor:
+    """RHS ``f = -Δu* = π² Σ_i cos(π x_i) = π² u*``."""
+    return (PI ** 2) * u_star(x)
+
+
+# ========================= Laplacian (exact) =========================
+
+def laplacian_exact(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Exact ``Δu = Σ_i ∂²u/∂x_i²`` via forward-over-reverse autograd.
+
+    ``d`` second-derivative passes; cheap at d=5. ``create_graph=True`` keeps
+    the Laplacian differentiable back to θ so it flows through the residual
+    into Gnome's surrogate (and ordinary backprop).
+    """
+    u = model(x)
+    g = autograd.grad(u.sum(), x, create_graph=True)[0]          # (B, d)
+    lap = torch.zeros_like(u)
+    for i in range(x.shape[1]):
+        gi = autograd.grad(g[:, i].sum(), x, create_graph=True)[0][:, i]
+        lap = lap + gi.unsqueeze(1)
+    return lap                                                   # (B, 1)
+
+
+# ========================= Sampling =========================
+
+def sample_interior(
+    n: int, d: int, device: torch.device, dtype: torch.dtype,
+) -> torch.Tensor:
+    """Uniform interior collocation ``x ∈ (0, 1)^d`` (needs grad for Δu)."""
+    return torch.rand(n, d, device=device, dtype=dtype, requires_grad=True)
+
+
+def sample_boundary(
+    n: int, d: int, device: torch.device, dtype: torch.dtype,
+) -> torch.Tensor:
+    """Uniform boundary draws: pin one random coordinate of each point to 0/1."""
+    x = torch.rand(n, d, device=device, dtype=dtype)
+    k = torch.randint(0, d, (n,), device=device)                # coordinate pinned
+    face = torch.randint(0, 2, (n,), device=device).to(x.dtype)  # face 0 or 1
+    x[torch.arange(n, device=device), k] = face
+    return x                                                    # no grad needed
+
+
+# ========================= Residuals =========================
+
+def pde_residual(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Poisson PDE residual ``-Δu - f`` (target zero for ``-Δu = f``)."""
+    return -laplacian_exact(model, x) - forcing(x)
+
+
+def bc_residual(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Dirichlet BC residual ``u(boundary) - u*(boundary)``."""
+    return model(x) - u_star(x)
+
+
+def stacked_residuals(
+    model: nn.Module, n_int: int, n_bc: int, d: int,
+    device: torch.device, dtype: torch.dtype, bc_volume_weight: bool = False,
+) -> torch.Tensor:
+    """PDE + BC residuals stacked via ``stack_residuals``.
+
+    Equal block weights by default (paper's Methods residual); with
+    ``bc_volume_weight`` the BC block gets the ``|∂Ω| = 2d`` factor of the
+    paper's Background-section loss.
+    """
+    r_int = pde_residual(model, sample_interior(n_int, d, device, dtype))
+    r_bc = bc_residual(model, sample_boundary(n_bc, d, device, dtype))
+    weights = [1.0, float(2 * d)] if bc_volume_weight else None
+    return stack_residuals([r_int, r_bc], weights)
+
+
+def term_losses(
+    model: nn.Module, n_int: int, n_bc: int, d: int,
+    device: torch.device, dtype: torch.dtype,
+) -> dict[str, float]:
+    """Per-block MSE for diagnostic logging (fresh batch)."""
+    r_int = pde_residual(model, sample_interior(n_int, d, device, dtype))
+    r_bc = bc_residual(model, sample_boundary(n_bc, d, device, dtype))
+    return {
+        "pde": r_int.pow(2).mean().item(),
+        "bc": r_bc.pow(2).mean().item(),
+    }
+
+
+# ========================= Reference eval =========================
+
+def make_eval_set(
+    d: int, device: torch.device, dtype: torch.dtype,
+    n: int = 30000, seed: int = 1234,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fixed, seeded held-out set of ``n`` interior points and ``u*`` on them.
+
+    Derivative-free (compares ``u_θ`` to ``u*`` directly), so the rel_l2 signal
+    carries no autodiff noise. Held fixed across the whole run so the metric is
+    a clean convergence curve rather than a resampled estimate.
+    """
+    g = torch.Generator().manual_seed(seed)                     # CPU gen (device-agnostic)
+    x = torch.rand(n, d, dtype=dtype, generator=g).to(device)
+    return x, u_star(x)
+
+
+@torch.no_grad()
+def eval_rel_l2(
+    model: nn.Module, x_eval: torch.Tensor, u_eval: torch.Tensor,
+) -> float:
+    """Relative L2 against ``u*`` on the fixed held-out set."""
+    was_training = model.training
+    model.eval()
+    pred = model(x_eval)
+    rel = torch.linalg.norm(pred - u_eval) / torch.linalg.norm(u_eval)
+    if was_training:
+        model.train()
+    return float(rel)
+
+
+# ========================= ENGD-W (Energy Natural Gradient, Woodbury) =========
+
+def make_functional_residual(model: nn.Module, d: int, bc_volume_weight: bool):
+    """Build a *pure-functional* stacked residual ``r(params, x_int, x_bc)``.
+
+    ENGD-W needs the Jacobian ``∂r/∂θ`` via ``torch.func.jacrev``, which requires
+    the residual to be a pure function of a parameter *dict* (``functional_call``),
+    with the Laplacian itself expressed through ``torch.func`` (``jacfwd∘jacrev``)
+    — you cannot nest ``torch.autograd.grad`` inside a ``torch.func`` transform,
+    so this path does *not* reuse ``laplacian_exact`` / ``stacked_residuals``.
+
+    Scaling follows the paper's **Methods** residual: block ``j`` is divided by
+    ``√Nⱼ`` so ``‖r‖² = MSE_int + MSE_bc`` (and ``0.5‖r‖²`` is the ENGD energy).
+    This is *not* ``stack_residuals``' ``√(N/Nⱼ)`` weighting — the two differ by
+    ``√N``, which would rescale the effective damping by ``N`` and break the
+    paper's tuned ``λ``. ``--bc-volume-weight`` multiplies the BC block by
+    ``√(2d)`` (paper's Background loss).
+    """
+    def u_single(params, x):                # x: (d,) -> scalar
+        return functional_call(model, params, (x.unsqueeze(0),)).squeeze()
+
+    def lap_single(params, x):              # Σ_i ∂²u/∂x_i² at one point
+        H = jacfwd(jacrev(u_single, argnums=1), argnums=1)(params, x)   # (d, d)
+        return torch.diagonal(H).sum()
+
+    v_u = vmap(u_single, in_dims=(None, 0))
+    v_lap = vmap(lap_single, in_dims=(None, 0))
+
+    def residual(params, x_int, x_bc):
+        n_int, n_bc = x_int.shape[0], x_bc.shape[0]
+        r_int = (-v_lap(params, x_int).unsqueeze(1) - forcing(x_int)) / math.sqrt(n_int)
+        r_bc = (v_u(params, x_bc).unsqueeze(1) - u_star(x_bc)) / math.sqrt(n_bc)
+        if bc_volume_weight:
+            r_bc = r_bc * math.sqrt(2 * d)
+        return torch.cat([r_int, r_bc], dim=0)                          # (N, 1)
+
+    return residual
+
+
+# ========================= Optimizer factory =========================
+
+def build_optimizer(
+    name: str, params, lr: float, weight_decay: float,
+    warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
+    beta1: float = 0.9, beta2: float = 0.99,
+    trust_region: float = 1.0,
+):
+    """Construct the optimizer and its LR schedule.
+
+    Returns ``(optimizer, config, scheduler)``. Every optimizer gets the same
+    linear-warmup + cosine-decay schedule; ``cosine_decay`` is the final-lr
+    fraction (0.0 -> decay to zero, 1.0 -> warmup then constant). On MSE, 1.0
+    is the natural setting for Gnome -- its Gauss-Newton step self-anneals as
+    the residual shrinks -- where the gradient-RMS baselines do want the decay.
+    """
+    if name == "gnome":
+        cfg = dict(
+            lr=lr, weight_decay=weight_decay,
+            betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
+            precondition_frequency=2,
+            trust_radius=(trust_region if trust_region > 0 else None),
+            loss="mse", precondition_1d=True,
+        )
+        opt = Gnome(params, **cfg)
+    elif name == "soap":
+        cfg = dict(
+            lr=lr, weight_decay=weight_decay,
+            betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
+            precondition_frequency=10, precondition_1d=True,
+        )
+        opt = SOAP(params, **cfg)
+    elif name == "adamw":
+        cfg = dict(
+            lr=lr, weight_decay=weight_decay,
+            betas=(0.9, 0.999), eps=1e-8,
+        )
+        opt = torch.optim.AdamW(params, **cfg)
+    else:
+        raise ValueError(f"unknown optimizer: {name}")
+
+    scheduler = cosine_scheduler(opt, warmup, total_steps, cosine_decay)
+    cfg["warmup"] = warmup
+    cfg["cosine_decay_floor"] = cosine_decay
+    return opt, cfg, scheduler
+
+
+# ========================= CLI / training =========================
+
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    args = p.parse_args(argv)
+    if args.d < 1 or args.hidden < 1 or args.depth < 2:
+        p.error("d and hidden must be positive; depth must be at least 2")
+    if args.fuse_every < 0:
+        p.error("fuse_every must be nonnegative (0 fuses all hidden layers)")
+    return args
+
+
+@pinn.preserve_default_dtype
+def train(args: argparse.Namespace) -> str:
+    hybrid = args.optimizer == "soap+ssbroyden"
+    torch.manual_seed(args.seed)
+    dtype = torch.float64 if hybrid or args.optimizer == "engdw" or args.dtype == "float64" else torch.float32
+    device = pick_device()
+    bcw = args.bc_volume_weight
+    if args.optimizer == "engdw":
+        # ENGD-W needs float64 (the Gram is ill-conditioned and the tuned
+        # damping is float64-scale) and can't use MPS (no float64; torch.func +
+        # cholesky unreliable). CUDA is its real home — the naive jacobian is
+        # ~O(N²) per step, so it's a GPU job at the paper's N=3500. Falls back
+        # to CPU (slow) when there's no GPU.
+        target = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        if dtype is not torch.float64 or device != target:
+            if not args.quiet:
+                print(f"[{EXPERIMENT}] engdw forces float64 on {target.type} "
+                      f"(MPS unsupported); overriding --dtype/device.", flush=True)
+            dtype, device = torch.float64, target
+            args.dtype = "float64"                  # reflect in banner + hyperparams
+    elif device.type == "mps" and dtype is torch.float64:
+        device = torch.device("cpu")               # MPS has no float64
+        if not args.quiet:
+            print(f"[{EXPERIMENT}] float64 requested; MPS has no float64 "
+                  f"— falling back to CPU.", flush=True)
+    model = build_model(args.arch, args.d, hidden=args.hidden, depth=args.depth,
+                        fuse_every=args.fuse_every, embedding=pinn.build_embedding(
+                            args.embedding, args.d, spatial_dims=tuple(range(args.d)),
+                            embed_dim=args.embed_dim, embed_scale=args.embed_scale,
+                        )).to(device=device, dtype=dtype)
+
+    if args.optimizer == "engdw":
+        residual_fn = make_functional_residual(model, args.d, bcw)
+        opt = ENGDW(model, residual_fn, lr=args.lr, damping=args.engdw_damping,
+                    momentum=args.engdw_momentum,
+                    line_search=args.engdw_line_search, chunk_size=args.engdw_chunk)
+        opt_cfg = dict(lr=args.lr, damping=args.engdw_damping,
+                       line_search=args.engdw_line_search,
+                       loss="energy", residual_scaling="paper_methods")
+        scheduler = None
+    elif hybrid:
+        opt, opt_cfg, scheduler = pinn.build_soap_phase(model, args)
+    else:
+        opt, opt_cfg, scheduler = build_optimizer(
+            args.optimizer, model.parameters(), args.lr, args.weight_decay,
+            warmup=args.warmup_steps, total_steps=args.steps,
+            cosine_decay=args.cosine_decay, eps=args.eps,
+            beta1=args.beta1, beta2=args.beta2,
+            trust_region=args.trust_region,
+        )
+
+    n_params = sum(p.numel() for p in model.parameters())
+
+    hyperparameters = {
+        **pinn.metadata(args),
+        # Non-zero means a sibling {run_id}.diag.jsonl exists.
+        "diagnostics_every": args.diagnostics_every,
+        "optimizer": args.optimizer,
+        "arch": args.arch,
+        "fuse_every": getattr(model, "chunks", None),
+        "steps": args.steps,
+        "dtype": str(dtype).removeprefix("torch."),
+        "d": args.d,
+        "hidden": args.hidden,
+        "depth": args.depth,
+        "n_params": n_params,
+        "n_int": args.n_int,
+        "n_bc": args.n_bc,
+        "aux_n_int": args.aux_n_int,
+        "aux_n_bc": args.aux_n_bc,
+        "bc_volume_weight": bcw,
+        "n_eval": args.n_eval,
+        "device": str(device),
+        **{f"opt.{k}": v for k, v in opt_cfg.items()},
+    }
+    run = RunLogger(
+        experiment=EXPERIMENT,
+        optimizer=args.optimizer,
+        seed=args.seed,
+        hyperparameters=hyperparameters,
+        runs_dir=args.runs_dir,
+    )
+
+    # Optional optimizer-internals log. Kept in its own file rather than as
+    # extra records in the run's JSONL: it is one record per *parameter* per
+    # logged step, so it would outnumber the training records several times
+    # over and slow load_run() down for everyone not looking at it.
+    diag = None
+    if args.diagnostics_every > 0:
+        if args.optimizer != "gnome":
+            raise SystemExit(
+                f"--diagnostics-every is Gnome-only; --optimizer "
+                f"{args.optimizer} exposes no diagnostics hook."
+            )
+        diag_params = (
+            None if not args.diagnostics_params
+            else [int(s) for s in args.diagnostics_params.split(",")]
+        )
+        diag_path = os.path.join(
+            os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
+        )
+        diag = JsonlDiagnostics(diag_path, params=diag_params)
+
+    if not args.quiet:
+        print(
+            f"[{EXPERIMENT}] {args.optimizer} | arch={args.arch} | d={args.d} | params={n_params:,} | "
+            f"dtype={args.dtype} | device={device}\n"
+            f"  N_int={args.n_int} N_bc={args.n_bc} | "
+            f"aux={args.aux_n_int}/{args.aux_n_bc} | "
+            f"bc_volume_weight={bcw} | steps={args.steps}",
+            flush=True,
+        )
+    x_eval, u_eval = make_eval_set(
+        args.d, device, dtype, args.n_eval, args.eval_seed)
+
+    if diag is not None and not args.quiet:
+        print(f"  diagnostics every {args.diagnostics_every} steps "
+              f"→ {diag.path}", flush=True)
+    t_start = time.perf_counter()
+    window: list[float] = []
+    last_avg = last_rel_l2 = float("nan")
+    best_avg = best_rel_l2 = float("inf")
+
+    def draw(n_int, n_bc):
+        return (torch.rand(n_int, args.d, device=device, dtype=dtype),
+                sample_boundary(n_bc, args.d, device, dtype))
+
+    def residual_fn(model, batch):
+        interior, boundary = batch
+        r_int = pde_residual(model, interior.clone().requires_grad_(True))
+        r_bc = bc_residual(model, boundary)
+        return stack_residuals([r_int, r_bc], [1.0, float(2 * args.d)] if bcw else None)
+
+    sampler = pinn.BatchSampler(args, lambda: draw(args.n_int, args.n_bc))
+    for step in range(args.steps):
+        quasi_newton = hybrid and step >= args.soap_steps
+        if hybrid and step == args.soap_steps:
+            opt = pinn.build_ssbroyden_phase(model, args)
+            scheduler = None
+            run.log("optimizer", step=step, optimizer="ssbroyden")
+        main_batch = sampler.batch(step)
+        if args.optimizer == "gnome":
+            if sampler.fixed_batch is None:
+                aux_batch = draw(args.aux_n_int, args.aux_n_bc)
+            else:
+                aux_batch = tuple(pinn.subsample_block((block,), n)[0] for block, n in
+                                  zip(main_batch, (args.aux_n_int, args.aux_n_bc)))
+
+            def main_closure():
+                r = residual_fn(model, main_batch)
+                return r, torch.zeros_like(r)
+
+            def aux_closure():
+                r = residual_fn(model, aux_batch)
+                return r, torch.zeros_like(r)
+
+            loss = opt.step(main_closure, aux_closure)
+        elif args.optimizer == "engdw":
+            loss = opt.step(*main_batch)
+        elif quasi_newton:
+            loss = pinn.refinement_step(opt, model, main_batch, residual_fn)
+        else:
+            opt.zero_grad()
+            loss = residual_fn(model, main_batch).square().mean()
+            loss.backward()
+            opt.step()
+
+        if (diag is not None and args.optimizer == "gnome"
+                and (step + 1) % args.diagnostics_every == 0):
+            for record in opt.get_diagnostics(params=diag.params):
+                diag(record)
+
+        if scheduler is not None:
+            scheduler.step()
+
+        loss_val = float(loss.detach().item()) if torch.is_tensor(loss) else float(loss)
+        if diverged(loss_val):
+            if diag is not None:
+                diag.close()
+            run.finish(completed=False, diverged=True, diverged_step=step)
+            print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
+            raise SystemExit(DIVERGED_EXIT)
+        run.log_train(step, loss=loss_val, lr=current_lr(opt), **pinn.phase_metrics(args, step))
+        window.append(loss_val)
+
+        if ((args.log_every and (step + 1) % args.log_every == 0)
+                or step + 1 == args.steps or (hybrid and step + 1 == args.soap_steps)):
+            tl = term_losses(model, args.n_int, args.n_bc, args.d, device, dtype)
+            rl2 = eval_rel_l2(model, x_eval, u_eval)
+            last_avg = sum(window) / len(window)
+            last_rel_l2 = rl2
+            best_avg = min(best_avg, last_avg)
+            best_rel_l2 = min(best_rel_l2, rl2)
+            run.log_val(step + 1, loss=last_avg, lr=current_lr(opt),
+                        pde=tl["pde"], bc=tl["bc"], rel_l2=rl2)
+            if not args.quiet:
+                ms_per = (time.perf_counter() - t_start) / (step + 1) * 1000
+                print(
+                    f"  step {step + 1:6d}/{args.steps}  "
+                    f"avg_train={last_avg:.4e}  "
+                    f"pde={tl['pde']:.3e}  bc={tl['bc']:.3e}  "
+                    f"rel_l2={rl2:.3e}  {ms_per:.1f} ms/step",
+                    flush=True,
+                )
+            window.clear()
+
+    if diag is not None:
+        diag.close()
+        print(f"[{EXPERIMENT}] diagnostics → {diag.path}")
+    path = run.finish(
+        completed=True,
+        final_avg_train=last_avg, best_avg_train=best_avg,
+        final_rel_l2=last_rel_l2, best_rel_l2=best_rel_l2,
+    )
+    print(f"[{EXPERIMENT}] saved → {path}")
+    print(f"  final avg_train={last_avg:.4e}  best={best_avg:.4e}")
+    print(f"  final rel_l2={last_rel_l2:.3e}  best rel_l2={best_rel_l2:.3e}")
+    return path
+
+
+def main():
+    args = parse_args()
+    train(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,601 @@
+"""2D Helmholtz PINN: AdamW vs SOAP vs Gnome.
+
+PDE:  u_xx + u_yy + k²·u - q(x, y) = 0,    (x, y) ∈ [-1, 1]²
+      q(x, y) = (k² - (a₁π)² - (a₂π)²)·sin(a₁πx)·sin(a₂πy)
+BC:   periodic in both directions — enforced *exactly* by construction, see below
+
+Exact solution::
+
+    u(x, y) = sin(a₁πx)·sin(a₂πy)
+
+Section 4.1 of Jnini et al., "Curvature-Aware Optimization for High-Accuracy
+PINNs" (arXiv:2604.05230). Their Table 3, the reference rung ``a₁=1, a₂=4,
+k=1`` — which is where SOAP loses by the widest margin anywhere in the paper:
+
+    SOAP                      rel_L2 = 4.2e-4   rel_Linf = 5.5e-4   1038 s
+    SSBroyden (Optax TR)      rel_L2 = 3.6e-9   rel_Linf = 4.8e-9    319 s
+    NG                        rel_L2 = 4.2e-9   rel_Linf = 5.6e-9    251 s
+    SPRING                    rel_L2 = 2.0e-9   rel_Linf = 2.4e-9    540 s
+
+all at 2,971 parameters. SOAP is simultaneously ~100,000x less accurate and
+4x slower than the natural-gradient line. That five-order gap is the point of
+this experiment: Gnome is SOAP's machinery (rotate into the eigenbasis, EMA
+the curvature, step there) with the curvature source swapped from gradient
+outer products to a Hutchinson GGN estimate. This problem isolates exactly
+that substitution, on the rung where the effect is largest.
+
+**Toggling the embedding.** ``embedding`` accepts ``periodic`` (the paper's
+fixed harmonics, and the default), ``fourier`` (random Fourier features over
+those harmonics), or ``none`` (raw coordinates). With ``bc='auto'``, both
+periodic feature choices use a PDE-only loss, while raw coordinates use a
+Dirichlet BC block. Explicit ``bc='dirichlet'`` retains that block with any
+embedding. ``bc='none'`` with raw coordinates leaves the problem unanchored.
+
+Note that adding the Dirichlet block does *not* rescue the weakly-observed
+modes by much at ``k=1``. A constant offset ``c`` produces ``|r_pde| = k²c = c``
+and ``|r_bc| = c``, so at ``bc_weight = 1`` the BC block merely doubles DC's
+weight against the target mode's 166.8². Use ``--bc-weight`` to push harder.
+
+**Single-block loss — no BC term (with the embedding on).** Inputs pass through a Fourier embedding
+``[cos(πm·x), sin(πm·x), cos(πm·y), sin(πm·y)]`` for ``m = 1..M`` (the paper's
+``cos(2πmx/Lₓ), sin(2πmx/Lₓ)`` with ``Lₓ = 2``). Every feature has period 2,
+so the network is *exactly* 2-periodic in both directions and the periodic BCs
+hold identically — there is nothing to penalize. The exact solution is
+compatible: ``sin(a₁πx)`` has period ``2/a₁``, which divides 2 for integer
+``a₁``.
+
+This makes it the only single-block PINN in this repo. Every other one stacks
+PDE/IC/BC through ``gnome.stack_residuals`` and so mixes "does the optimizer
+handle block conflict" into the result. Here there is exactly one residual, so
+what is measured is curvature quality and nothing else.
+
+**The difficulty ladder.** The paper's four §4.1 architectures are recovered
+exactly by two flags (parameter counts verified against Tables 3, 5 and 6)::
+
+    (a₁,a₂)=(1,4)   k=1        --depth 5 --modes 1    2,971 params  (Table 3)
+    (a₁,a₂)=(6,6)   k=1        --depth 7 --modes 1    4,831 params  (Table 5)
+    (a₁,a₂)=(6,6)   k=10,100   --depth 7 --modes 10   5,911 params  (Table 5)
+    (a₁,a₂)=(10,10) k=1        --depth 9 --modes 1    6,691 params  (Table 6)
+
+**What this script does not reproduce.** The paper resamples collocation
+points with RAD (residual-based adaptive sampling) every 500 epochs, and for
+the ``k=100`` rung uses a progressive domain expansion curriculum
+(``[-0.2,0.2]² → [-0.4,0.4]² → [-0.7,0.7]² → [-1,1]²``). Neither is
+implemented here: we resample uniformly every step, which is this repo's
+convention. The paper states NG converged reliably on the full domain without
+curriculum at moderate frequencies, so the default rung needs neither. Expect
+to need both if you push to ``k=100``.
+
+Also note Table 4, a collocation sweep at otherwise fixed settings, which is a
+free second axis to check against: 10,000 pts → rel_Linf 1.5e-8; 20,000 →
+7.1e-8; 25,000 → 7.4e-9.
+
+All three optimizers share one MLP so the only variable is the optimizer. The
+optimizers all get the same linear-warmup + cosine-decay schedule
+(``--cosine-decay`` sets the final-lr fraction; 1.0 gives warmup then constant,
+which suits Gnome since its step self-anneals as the residual shrinks).
+
+Defaults to float64: the target here is 1e-9, which float32 cannot reach at
+all. The network is tiny (2,971 params) so this costs little.
+
+Usage::
+
+    # Edit experiments/configs/pinns/helmholtz_pinn.py: optimizer='gnome', seed=0
+    uv run -m experiments.pinns.helmholtz_pinn
+    # Edit experiments/configs/pinns/helmholtz_pinn.py: optimizer='soap', seed=0
+    uv run -m experiments.pinns.helmholtz_pinn
+    # Edit experiments/configs/pinns/helmholtz_pinn.py: optimizer='adamw', seed=0
+    uv run -m experiments.pinns.helmholtz_pinn
+    # (6,6) k=10 rung:
+    # Edit experiments/configs/pinns/helmholtz_pinn.py: optimizer='gnome', a1=6.0, a2=6.0, k=10.0, depth=7, modes=10
+    uv run -m experiments.pinns.helmholtz_pinn
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import time
+
+import torch
+import torch.autograd as autograd
+import torch.nn as nn
+
+from gnome import Gnome, JsonlDiagnostics, stack_residuals
+from experiments.baselines import SOAP
+from experiments.common import (
+    DIVERGED_EXIT,
+    diverged,
+    RunLogger,
+    cosine_scheduler,
+    current_lr,
+    pick_device,
+)
+from experiments.common import (
+    ConcatEmbedding,
+    MLP as _SharedMLP,
+    PeriodicEmbedding,
+)
+
+
+from experiments.common import pinn_options as pinn
+
+EXPERIMENT = "helmholtz_pinn"
+
+X_MIN, X_MAX = -1.0, 1.0
+Y_MIN, Y_MAX = -1.0, 1.0
+L_DOMAIN = X_MAX - X_MIN          # = 2, the Fourier embedding period
+
+
+# ========================= Exact solution + forcing =========================
+
+def exact_solution(
+    x: torch.Tensor, y: torch.Tensor, a1: float, a2: float
+) -> torch.Tensor:
+    """``u* = sin(a1·π·x)·sin(a2·π·y)``."""
+    return torch.sin(a1 * math.pi * x) * torch.sin(a2 * math.pi * y)
+
+
+def forcing(
+    x: torch.Tensor, y: torch.Tensor, a1: float, a2: float, k: float
+) -> torch.Tensor:
+    """``q = (k² - (a1π)² - (a2π)²)·u*``.
+
+    Substituting ``u*`` into the operator gives ``u*_xx + u*_yy + k²u* =
+    (k² - (a1π)² - (a2π)²)·u*``, so this ``q`` makes ``u*`` an exact solution
+    by construction — no reference solve, no data file.
+    """
+    coeff = k ** 2 - (a1 * math.pi) ** 2 - (a2 * math.pi) ** 2
+    return coeff * exact_solution(x, y, a1, a2)
+
+
+# ========================= Model =========================
+
+
+class PINN(_SharedMLP):
+    """Maps ``(x, y) → u`` via an optional Fourier embedding then a tanh MLP.
+
+    ``depth`` counts *total* linear layers, so the paper's "4 hidden layers,
+    30 neurons" is ``--depth 5 --hidden 30``.
+
+    ``embedding="none"`` feeds ``(x, y)`` straight in. No input normalization is
+    needed either way — the domain is already ``[-1, 1]²`` and the Fourier
+    features are bounded by construction — so the two paths differ only in
+    periodicity and frequency content, not in input scale.
+    """
+
+    def __init__(self, hidden: int = 30, depth: int = 5, modes: int = 1,
+                 embedding: str = "periodic", embed_dim: int = 32, embed_scale: float = 1.0):
+        embed = pinn.build_embedding(
+            embedding, 2, spatial_dims=(0, 1), length=L_DOMAIN, periodic=True,
+            n_harmonics=modes, embed_dim=embed_dim, embed_scale=embed_scale,
+        )
+        super().__init__(embed, hidden=hidden, depth=depth)
+        self.embedding = embedding
+
+
+# ========================= Residual =========================
+
+def pde_residual(
+    model: nn.Module, x: torch.Tensor, y: torch.Tensor,
+    a1: float, a2: float, k: float,
+) -> torch.Tensor:
+    """Helmholtz residual ``u_xx + u_yy + k²u - q`` at ``(x, y)``.
+
+    This is the *only* residual block — the Fourier embedding already
+    satisfies the periodic BCs exactly, so there is no BC term to stack.
+    """
+    x = x.clone().requires_grad_(True)
+    y = y.clone().requires_grad_(True)
+    u = model(x, y)
+    u_x = autograd.grad(u, x, torch.ones_like(u), create_graph=True)[0]
+    u_y = autograd.grad(u, y, torch.ones_like(u), create_graph=True)[0]
+    u_xx = autograd.grad(u_x, x, torch.ones_like(u_x), create_graph=True)[0]
+    u_yy = autograd.grad(u_y, y, torch.ones_like(u_y), create_graph=True)[0]
+    return u_xx + u_yy + (k ** 2) * u - forcing(x, y, a1, a2, k)
+
+
+def bc_residual(
+    model: nn.Module, x: torch.Tensor, y: torch.Tensor, a1: float, a2: float,
+) -> torch.Tensor:
+    """Dirichlet residual ``u - u*`` on points already lying on ∂Ω.
+
+    For integer ``a1, a2`` the exact solution vanishes on ``∂Ω`` (``sin(a·π·(±1))
+    = 0``), so this is just ``u`` there — but it is written as ``u - u*`` so
+    non-integer frequencies still work.
+
+    Only used when the Fourier embedding is off. With the embedding on,
+    periodicity holds identically and there is nothing to penalize.
+    """
+    return model(x, y) - exact_solution(x, y, a1, a2)
+
+
+# ========================= Sampling =========================
+
+def sample_batch(
+    n: int, device: torch.device, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Uniform interior collocation points on ``[-1, 1]²``.
+
+    Resampled fresh every step (repo convention). The paper instead holds a
+    fixed set and refreshes it with RAD every 500 epochs — see the module
+    docstring.
+    """
+    kw = dict(device=device, dtype=dtype)
+    x = torch.rand(n, 1, **kw) * (X_MAX - X_MIN) + X_MIN
+    y = torch.rand(n, 1, **kw) * (Y_MAX - Y_MIN) + Y_MIN
+    return x, y
+
+
+def sample_boundary(
+    n: int, device: torch.device, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Uniform draws on ``∂Ω``: pin one coordinate to a face at ±1."""
+    kw = dict(device=device, dtype=dtype)
+    x = torch.rand(n, 1, **kw) * (X_MAX - X_MIN) + X_MIN
+    y = torch.rand(n, 1, **kw) * (Y_MAX - Y_MIN) + Y_MIN
+    pin_x = torch.randint(0, 2, (n, 1), device=device) == 0
+    face = torch.where(
+        torch.randint(0, 2, (n, 1), device=device) == 0,
+        torch.tensor(X_MIN, **kw), torch.tensor(X_MAX, **kw),
+    )
+    x = torch.where(pin_x, face, x)
+    y = torch.where(pin_x, y, face)
+    return x, y
+
+
+def residuals(
+    model: nn.Module, batch, a1: float, a2: float, k: float,
+    bc_weight: float | None,
+) -> torch.Tensor:
+    """PDE residual, optionally stacked with a Dirichlet BC block.
+
+    ``bc_weight is None`` → single-block, PDE only (the Fourier-embedding
+    case). Otherwise the two blocks are combined so that
+    ``mean(out²) == mean(r_pde²) + bc_weight·mean(r_bc²)``.
+    """
+    (x, y), bnd = batch
+    r_pde = pde_residual(model, x, y, a1, a2, k)
+    if bc_weight is None:
+        return r_pde
+    return stack_residuals(
+        [r_pde, bc_residual(model, *bnd, a1, a2)], [1.0, bc_weight])
+
+
+# ========================= Eval =========================
+
+def make_eval_set(
+    ns: int, a1: float, a2: float, device: torch.device, dtype: torch.dtype
+):
+    """Tensor-product ``ns × ns`` grid on ``[-1, 1]²`` plus the exact ``u``.
+
+    Endpoints included. Resolution has to beat the solution's own frequency:
+    ``sin(a2·π·y)`` has period ``2/a2``, so ``ns`` should give many points per
+    period at the highest ``a`` you run.
+    """
+    kw = dict(device=device, dtype=dtype)
+    x = torch.linspace(X_MIN, X_MAX, ns, **kw)
+    y = torch.linspace(Y_MIN, Y_MAX, ns, **kw)
+    xx, yy = torch.meshgrid(x, y, indexing="ij")
+    coords = (xx.reshape(-1, 1), yy.reshape(-1, 1))
+    # Evaluate the reference at the same coordinates seen by the model, but
+    # compute the analytic solution in float64. MPS requires CPU for float64.
+    metric_device = torch.device("cpu") if device.type == "mps" else device
+    # Transfer first: a combined MPS-to-CPU/double conversion is unreliable.
+    ref_coords = tuple(c.to(device=metric_device).double() for c in coords)
+    return coords, exact_solution(*ref_coords, a1, a2)
+
+
+def eval_errors(
+    model: nn.Module, coords, u_ref: torch.Tensor, batch_size: int = 65536,
+) -> tuple[float, float]:
+    """Return ``(rel_l2, rel_linf)`` against the exact solution on the grid.
+
+    Both are reported because Table 3 reports both, and they separate cleanly
+    here: rel_L2 is an average over a domain that is mostly easy, rel_Linf
+    catches the antinodes where the oscillation is hardest to fit.
+
+    Model inference retains the training dtype; predictions are promoted to
+    float64 before subtraction and reduction against the float64 reference.
+    """
+    x, y = coords
+    was_training = model.training
+    model.eval()
+    sq = torch.zeros((), device=u_ref.device, dtype=u_ref.dtype)
+    mx = torch.zeros((), device=u_ref.device, dtype=u_ref.dtype)
+    with torch.no_grad():
+        for i in range(0, x.shape[0], batch_size):
+            sl = slice(i, i + batch_size)
+            prediction = model(x[sl], y[sl]).to(device=u_ref.device).double()
+            err = (prediction - u_ref[sl]).abs()
+            sq += err.pow(2).sum()
+            mx = torch.maximum(mx, err.max())
+    if was_training:
+        model.train()
+    rel_l2 = float(sq.sqrt() / u_ref.pow(2).sum().sqrt())
+    rel_linf = float(mx / u_ref.abs().max())
+    return rel_l2, rel_linf
+
+
+# ========================= Optimizer factory =========================
+
+def build_optimizer(
+    name: str, params, lr: float, weight_decay: float,
+    warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
+    beta1: float = 0.9, beta2: float = 0.99,
+    trust_region: float = 1.0,
+):
+    """Construct the optimizer and its LR schedule.
+
+    Returns ``(optimizer, config, scheduler)``. Every optimizer gets the same
+    linear-warmup + cosine-decay schedule; ``cosine_decay`` is the final-lr
+    fraction (0.0 -> decay to zero, 1.0 -> warmup then constant). On MSE, 1.0
+    is the natural setting for Gnome -- its Gauss-Newton step self-anneals as
+    the residual shrinks -- where the gradient-RMS baselines do want the decay.
+    """
+    if name == "gnome":
+        cfg = dict(
+            lr=lr, weight_decay=weight_decay,
+            betas=(beta1, beta2), shampoo_beta=beta2, eps=eps,
+            precondition_frequency=10,
+            trust_radius=(trust_region if trust_region > 0 else None),
+            loss="mse", precondition_1d=True, norm_free=False,
+        )
+        opt = Gnome(params, **cfg)
+    elif name == "soap":
+        cfg = dict(
+            lr=lr, weight_decay=weight_decay,
+            betas=(beta1, beta2), shampoo_beta=beta2, eps=1e-8,
+            precondition_frequency=10, precondition_1d=True,
+        )
+        opt = SOAP(params, **cfg)
+    elif name == "adamw":
+        cfg = dict(
+            lr=lr, weight_decay=weight_decay,
+            betas=(0.9, 0.999), eps=1e-8,
+        )
+        opt = torch.optim.AdamW(params, **cfg)
+    else:
+        raise ValueError(f"unknown optimizer: {name}")
+
+    scheduler = cosine_scheduler(opt, warmup, total_steps, cosine_decay)
+    cfg["warmup"] = warmup
+    cfg["cosine_decay_floor"] = cosine_decay
+    return opt, cfg, scheduler
+
+
+# ========================= CLI / training =========================
+
+def parse_args(argv=None) -> argparse.Namespace:
+    from experiments.common.config import ConfigParser
+    p = ConfigParser(__file__)
+    return p.parse_args(argv)
+
+
+@pinn.preserve_default_dtype
+def train(args: argparse.Namespace) -> str:
+    hybrid = args.optimizer == "soap+ssbroyden"
+    torch.manual_seed(args.seed)
+    device = pick_device()
+    dtype = torch.float64 if hybrid or args.optimizer == "engdw" else getattr(torch, args.dtype)
+    if device.type == "mps" and dtype is torch.float64:
+        device = torch.device("cpu")            # MPS has no float64
+        if not args.quiet:
+            print(f"[{EXPERIMENT}] float64 requested; MPS has no float64 "
+                  f"— falling back to CPU.", flush=True)
+    torch.set_default_dtype(dtype)              # periodic-frequency buffer dtype
+
+    use_bc = args.bc == "dirichlet" or (
+        args.bc == "auto" and args.embedding == "none")
+    bc_weight = args.bc_weight if use_bc else None
+    if args.embedding == "none" and not use_bc:
+        print(f"[{EXPERIMENT}] WARNING: embedding=none with no BC block. "
+              f"Nothing enforces the boundary conditions, so Helmholtz on a "
+              f"bounded domain is ill-posed here — any homogeneous solution "
+              f"(Lv = 0) can be added freely. Results are not meaningful.",
+              flush=True)
+
+    model = PINN(hidden=args.hidden, depth=args.depth, modes=args.modes,
+                 embedding=args.embedding, embed_dim=args.embed_dim, embed_scale=args.embed_scale).to(device=device, dtype=dtype)
+    residual_fn = lambda model, batch: residuals(model, batch, args.a1, args.a2, args.k, bc_weight)
+    if args.optimizer in ("soap+ssbroyden", "engdw"):
+        opt, opt_cfg, scheduler = pinn.build_extra_optimizer(
+            model, args, residual_fn, precondition_frequency=10)
+    else:
+        opt, opt_cfg, scheduler = build_optimizer(
+            args.optimizer, model.parameters(), args.lr, args.weight_decay,
+            warmup=args.warmup_steps, total_steps=args.steps,
+            cosine_decay=args.cosine_decay, eps=args.eps,
+            beta1=args.beta1, beta2=args.beta2,
+            trust_region=args.trust_region,
+        )
+
+    n_aux = max(8, int(args.n_pde * args.aux_frac))
+    n_params = sum(p.numel() for p in model.parameters())
+
+    hyperparameters = {
+        **pinn.metadata(args),
+        # Non-zero means a sibling {run_id}.diag.jsonl exists.
+        "diagnostics_every": args.diagnostics_every,
+        "optimizer": args.optimizer,
+        "steps": args.steps,
+        "dtype": str(dtype).removeprefix("torch."),
+        "a1": args.a1,
+        "a2": args.a2,
+        "k": args.k,
+        "hidden": args.hidden,
+        "depth": args.depth,
+        "modes": args.modes,
+        "embedding": args.embedding,
+        "bc": "dirichlet" if use_bc else "none",
+        "bc_weight": bc_weight,
+        "n_bc": args.n_bc if use_bc else 0,
+        "n_pde": args.n_pde,
+        "n_aux": n_aux,
+        "n_params": n_params,
+        "n_eval": args.n_eval,
+        "device": str(device),
+        **{f"opt.{k}": v for k, v in opt_cfg.items()},
+    }
+    run = RunLogger(
+        experiment=EXPERIMENT,
+        optimizer=args.optimizer,
+        seed=args.seed,
+        hyperparameters=hyperparameters,
+        runs_dir=args.runs_dir,
+    )
+
+    # Optional optimizer-internals log. Kept in its own file rather than as
+    # extra records in the run's JSONL: it is one record per *parameter* per
+    # logged step, so it would outnumber the training records several times
+    # over and slow load_run() down for everyone not looking at it.
+    diag = None
+    if args.diagnostics_every > 0:
+        if args.optimizer != "gnome":
+            raise SystemExit(
+                f"--diagnostics-every is Gnome-only; --optimizer "
+                f"{args.optimizer} exposes no diagnostics hook."
+            )
+        diag_params = (
+            None if not args.diagnostics_params
+            else [int(s) for s in args.diagnostics_params.split(",")]
+        )
+        diag_path = os.path.join(
+            os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
+        )
+        diag = JsonlDiagnostics(diag_path, params=diag_params)
+
+    if not args.quiet:
+        print(
+            f"[{EXPERIMENT}] {args.optimizer} | params={n_params:,} | "
+            f"a=({args.a1:g},{args.a2:g}) k={args.k:g} | "
+            f"embedding={args.embedding}"
+            f"{f'(M={args.modes})' if args.embedding == 'fourier' else ''} | "
+            f"bc={'dirichlet w=' + str(bc_weight) if use_bc else 'none'} | "
+            f"dtype={args.dtype} | device={device}\n"
+            f"  N_pde={args.n_pde}"
+            f"{f' N_bc={args.n_bc}' if use_bc else ''} | "
+            f"aux={n_aux} | steps={args.steps}",
+            flush=True,
+        )
+    eval_coords, u_ref = make_eval_set(
+        args.n_eval, args.a1, args.a2, device, dtype)
+
+    if diag is not None and not args.quiet:
+        print(f"  diagnostics every {args.diagnostics_every} steps "
+              f"→ {diag.path}", flush=True)
+    t_start = time.perf_counter()
+    window: list[float] = []
+    last_avg = last_rel_l2 = last_rel_linf = float("nan")
+    best_avg = best_rel_l2 = best_rel_linf = float("inf")
+
+    n_bc_aux = max(2, int(args.n_bc * args.aux_frac))
+
+    def draw(n_int: int, n_bnd: int):
+        return (sample_batch(n_int, device, dtype),
+                sample_boundary(n_bnd, device, dtype) if use_bc else None)
+
+    sampler = pinn.BatchSampler(args, lambda: draw(args.n_pde, args.n_bc))
+    for step in range(args.steps):
+        quasi_newton = hybrid and step >= args.soap_steps
+        if hybrid and step == args.soap_steps:
+            opt = pinn.build_ssbroyden_phase(model, args)
+            scheduler = None
+            run.log("optimizer", step=step, optimizer="ssbroyden")
+        main_batch = sampler.batch(step)
+        if args.optimizer == "gnome":
+            aux_batch = (pinn.subsample_nested(main_batch, n_aux, n_bc_aux)
+                         if sampler.fixed_batch is not None else draw(n_aux, n_bc_aux))
+
+            def main_closure():
+                r = residuals(model, main_batch, args.a1, args.a2, args.k,
+                              bc_weight)
+                return r, torch.zeros_like(r)
+
+            def aux_closure():
+                r = residuals(model, aux_batch, args.a1, args.a2, args.k,
+                              bc_weight)
+                return r, torch.zeros_like(r)
+
+            loss = opt.step(main_closure, aux_closure)
+        elif args.optimizer == "engdw":
+            loss = opt.step(main_batch)
+        elif quasi_newton:
+            loss = pinn.refinement_step(opt, model, main_batch, residual_fn)
+        else:
+            opt.zero_grad()
+            r = residuals(model, main_batch, args.a1, args.a2, args.k,
+                          bc_weight)
+            # Match Gnome's internal MSE reduction: sum-of-squares / N.
+            loss = (r ** 2).sum() / r.shape[0]
+            loss.backward()
+            opt.step()
+
+        if (diag is not None and args.optimizer == "gnome"
+                and (step + 1) % args.diagnostics_every == 0):
+            for record in opt.get_diagnostics(params=diag.params):
+                diag(record)
+
+        if scheduler is not None:
+            scheduler.step()
+
+        loss_val = float(loss.detach().item()) if torch.is_tensor(loss) else float(loss)
+        if diverged(loss_val):
+            if diag is not None:
+                diag.close()
+            run.finish(completed=False, diverged=True, diverged_step=step)
+            print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
+            raise SystemExit(DIVERGED_EXIT)
+        run.log_train(step, loss=loss_val, lr=current_lr(opt), **pinn.phase_metrics(args, step))
+        window.append(loss_val)
+
+        if ((args.log_every and (step + 1) % args.log_every == 0)
+                or step + 1 == args.steps or (hybrid and step + 1 == args.soap_steps)):
+            rl2, rlinf = eval_errors(model, eval_coords, u_ref)
+            last_avg = sum(window) / len(window)
+            last_rel_l2, last_rel_linf = rl2, rlinf
+            best_avg = min(best_avg, last_avg)
+            best_rel_l2 = min(best_rel_l2, rl2)
+            best_rel_linf = min(best_rel_linf, rlinf)
+            run.log_val(step + 1, loss=last_avg, lr=current_lr(opt),
+                        rel_l2=rl2, rel_linf=rlinf)
+            if not args.quiet:
+                ms_per = (time.perf_counter() - t_start) / (step + 1) * 1000
+                print(
+                    f"  step {step + 1:6d}/{args.steps}  "
+                    f"avg_train={last_avg:.4e}  "
+                    f"rel_l2={rl2:.3e}  rel_linf={rlinf:.3e}  "
+                    f"{ms_per:.1f} ms/step",
+                    flush=True,
+                )
+            window.clear()
+
+
+    if diag is not None:
+        diag.close()
+        print(f"[{EXPERIMENT}] diagnostics → {diag.path}")
+    path = run.finish(
+        completed=True,
+        final_avg_train=last_avg, best_avg_train=best_avg,
+        final_rel_l2=last_rel_l2, best_rel_l2=best_rel_l2,
+        final_rel_linf=last_rel_linf, best_rel_linf=best_rel_linf,
+    )
+
+    print(f"[{EXPERIMENT}] saved → {path}")
+    print(f"  final avg_train={last_avg:.4e}  best={best_avg:.4e}")
+    print(f"  final rel_l2={last_rel_l2:.3e}  best rel_l2={best_rel_l2:.3e}")
+    print(f"  final rel_linf={last_rel_linf:.3e}  "
+          f"best rel_linf={best_rel_linf:.3e}")
+    if args.a1 == 1.0 and args.a2 == 4.0 and args.k == 1.0:
+        print("  (Jnini et al. Table 3: SOAP 4.2e-4, NG 4.2e-9 rel_l2)")
+    return path
+
+
+def main():
+    args = parse_args()
+    train(args)
+
+
+if __name__ == "__main__":
+    main()

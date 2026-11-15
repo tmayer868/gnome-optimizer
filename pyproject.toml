@@ -40,14 +40,28 @@ experiments = [
     "scipy>=1.10",
     "matplotlib>=3.7",
 ]
+# Full-memory quasi-Newton PINN baseline (imports scimba_torch).
+ssbroyden = [
+    "scimba>=1.4,<1.5",
+]
 # Language-model benchmark (WikiText GPT) — heavier, GPU-oriented.
 llm = [
     "datasets>=2.14",
     "transformers>=4.30",
 ]
+# Pretokenized FineWeb benchmark; no tokenizer or datasets package is needed.
+nanogpt = [
+    "torch>=2.4",
+    "huggingface-hub>=0.23",
+]
 # CIFAR-10 rotation-regression benchmark: torchvision for the dataset.
 cifar = [
     "torchvision>=0.15",
+]
+# Image-classification experiments, including CUB-200-2011.
+vision = [
+    "torchvision>=0.15",
+    "pillow>=10.0",
 ]
 # UTKFace age-regression benchmark (kept for reference; not in the writeup):
 # HuggingFace datasets + Pillow for image decode.

@@ -17,8 +17,9 @@ into a second-order method:
    diagonal Gauss-Newton update inside the eigenbasis. A pure Newton step
    has no built-in step-size control, so Gnome damps it with a
    Levenberg-Marquardt ``lambda`` chosen as the smallest value satisfying
-   ``||m / (v + lambda)||_2 <= trust_radius * sqrt(P)``, with ``P`` the
-   element count of the parameter tensor. Because ``Q_L`` and ``Q_R`` are
+   ``||m / (v + lambda)||_2 <= trust_radius * sqrt(||p||² + S0)``, where
+   ``S0`` is the tensor's squared norm on its first optimizer step.
+   Because ``Q_L`` and ``Q_R`` are
    orthonormal the l2 norm survives the rotation back, so the bound holds
    in parameter space too. It is a trust region, not a band-aid: when
    curvature is well-conditioned it never binds, but it prevents blow-ups
@@ -69,10 +70,13 @@ mini-batch into a B-K main slice and a K aux slice):
 
         loss = opt.step(main_closure, aux_closure)
 
-Each closure runs an independent forward, and each backward releases its
-own graph immediately — no ``retain_graph``, no held activations between
-passes. The optimizer never writes into ``p.grad``; gradients are
-obtained via ``torch.autograd.grad`` and applied directly.
+Each closure runs an independent forward. By default each backward releases
+its graph immediately. Optional ``step(..., surrogate_partition_sizes=[...])``
+splits the auxiliary batch into separate surrogates whose gradients are computed
+in one batched autograd call using vmap. Curvature contributions
+are summed without cross-partition outer products. The optimizer never writes
+into ``p.grad``; gradients are obtained via ``torch.autograd.grad`` and applied
+directly.
 
 **Learning-rate schedules.** Gnome does not own a schedule. ``group["lr"]``
 is read fresh on every step and multiplies the update *after* the
@@ -102,12 +106,15 @@ cold.
 from __future__ import annotations
 
 from itertools import chain
+from numbers import Integral
 from typing import Callable, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch.optim.optimizer import Optimizer
 import math
+import random
+import numpy as np
 
 ClosureReturn = Tuple[torch.Tensor, torch.Tensor]
 MergeDims = Union[bool, str, Sequence[Sequence[int]]]
@@ -228,6 +235,7 @@ class Gnome(Optimizer):
 
     Args:
         params: Iterable of parameters or parameter groups.
+            Shared/tied parameters must appear only once.
         lr: Learning rate.
         betas: ``(beta1, beta2)`` for the gradient and curvature EMAs in
             the rotated basis.
@@ -248,19 +256,28 @@ class Gnome(Optimizer):
             Note it rescales ``v_hat``, so ``lr`` generally needs retuning
             when toggled.
         precondition_frequency: Steps between eigenbasis refreshes.
+        use_soap_basis: If True, initialize and update the Kronecker basis
+            factors from the main loss gradient instead of the surrogate.
+            Uses the accumulated, optionally clipped main gradient. The
+            rotated curvature EMA still uses the surrogate gradient, so this
+            changes only the basis source. Default False; can be overridden
+            per parameter group and is saved in optimizer checkpoints.
+        basis_transport: How EMA coordinates follow basis updates. "overlap"
+            transports curvature with squared overlaps and momentum with
+            unsquared overlaps. "soap" uses the previous SOAP-style curvature
+            permutation and momentum projection. Default "overlap". Independent
+            of use_soap_basis; saved per parameter group in checkpoints.
         max_precond_dim: Modes larger than this are skipped (no Kronecker
             factor maintained along that dimension).
         trust_radius: l2 trust region on the update in the rotated basis.
             ``lambda`` is set to the smallest value (floored at ``eps``) for
-            which ``||m / (v + lambda)||_2 <= trust_radius * sqrt(P)``, with
-            ``P = p.numel()``. The ``sqrt(P)`` scaling is what makes a single
-            value work across layers of different width: the l2 norm of the
-            step grows as ``sqrt(P)``, so dividing it out leaves
-            ``trust_radius`` as a dimensionless RMS-per-coordinate bound —
-            roughly the typical per-element update magnitude, in units of
-            ``lr``. Typical values are 0.1 to 1.0. Larger = weaker bound =
-            longer steps; ``None`` disables the solve and falls back to plain
-            ``m / (v + eps)`` damping.
+            which ``||m / (v + lambda)||_2 <= trust_radius * sqrt(||p||² + S0)``.
+            ``S0`` is the squared parameter norm captured on its first step
+            and saved in ordinary optimizer state. An entirely zero tensor
+            uses ``S0 = 1``, the expected squared norm of a length-N vector
+            with Xavier variance ``1/N`` under a hypothetical square layer.
+            Larger = weaker bound = longer steps; ``None`` disables the solve
+            and falls back to plain ``m / (v + eps)`` damping.
 
             Because the bound is on the l2 norm and the ``Q`` matrices are
             orthonormal, it transfers exactly to the parameter basis. A
@@ -300,40 +317,6 @@ class Gnome(Optimizer):
         precondition_1d: Build a Kronecker factor for 1D parameters as well.
         data_format: ``"channels_first"`` or ``"channels_last"`` for the
             ``merge_dims`` layout convention.
-        diagnostics: Optional callable receiving one record ``dict`` per
-            parameter per logged step, describing the optimizer's *internal*
-            state — curvature spectrum, damping, step geometry. This is not a
-            training-metrics channel; it answers questions like "is the trust
-            region binding?" and "how much of the curvature estimate is below
-            ``eps``?". ``None`` (default) disables it, and nothing is computed:
-            the cost is one integer comparison per parameter per step. See
-            :mod:`gnome.diagnostics` for ready-made sinks
-            (``PrintDiagnostics``, ``JsonlDiagnostics``, ``CollectDiagnostics``)
-            and the full record schema.
-        diagnostics_every: Emit every N global steps. Gated on the global step
-            counter, so every parameter emits together and the records form one
-            coherent snapshot. Ignored when ``diagnostics is None``.
-
-        metrics: ``{name: fn}`` dict saying *what* to measure, where
-            ``diagnostics`` says where it goes. Each ``fn`` takes a context
-            dict of the live rotated-basis tensors (``v`` the curvature, ``m``
-            the gradient EMA, ``update`` the damped step, plus ``lam``, ``eps``,
-            ``lr``, ``p``, ``state``, ``group``) and returns a **0-dim
-            tensor** — results are stacked into one host transfer, so a
-            pre-converted Python float would force its own device sync.
-            Defaults to :data:`gnome.diagnostics.DEFAULT_METRICS`; extend it
-            rather than replacing so the built-in fields survive::
-
-                metrics={**DEFAULT_METRICS,
-                         "v_cond": lambda c: c["v"].max() / c["v"].min()}
-
-            Nothing about which statistics exist is hardcoded here.
-
-            All three are plain attributes, so they can be changed mid-run::
-
-                opt.diagnostics = PrintDiagnostics(params=[0])
-                opt.diagnostics_every = 1
-                opt.metrics = {"v_max": lambda c: c["v"].max()}
     """
 
     def __init__(
@@ -353,9 +336,8 @@ class Gnome(Optimizer):
         merge_dims: MergeDims = False,
         precondition_1d: bool = False,
         data_format: str = "channels_first",
-        diagnostics: Optional[Callable[[dict], None]] = None,
-        diagnostics_every: int = 100,
-        metrics: Optional[dict] = None,
+        use_soap_basis: bool = False,
+        basis_transport: str = "overlap",
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -369,18 +351,6 @@ class Gnome(Optimizer):
             raise ValueError(f"Invalid max_grad_norm: {max_grad_norm}")
         if trust_radius is not None and trust_radius <= 0.0:
             raise ValueError(f"Invalid trust_radius: {trust_radius}")
-        if diagnostics is not None and not callable(diagnostics):
-            raise ValueError(
-                f"diagnostics must be callable, got {type(diagnostics).__name__}"
-            )
-        if diagnostics_every < 1:
-            raise ValueError(f"Invalid diagnostics_every: {diagnostics_every}")
-        if metrics is not None:
-            bad = [k for k, v in metrics.items() if not callable(v)]
-            if bad:
-                raise ValueError(
-                    f"metrics values must be callable; not callable: {bad}"
-                )
         if loss not in ("mse", "bce_hutchinson", "cce", "cce_hutchinson"):
             raise ValueError(
                 f"Invalid loss mode: {loss!r}; "
@@ -402,6 +372,8 @@ class Gnome(Optimizer):
             merge_dims=merge_dims,
             precondition_1d=precondition_1d,
             trust_radius=trust_radius,
+            use_soap_basis=use_soap_basis,
+            basis_transport=basis_transport,
         )
         super().__init__(params, defaults)
         self._data_format = data_format
@@ -417,147 +389,101 @@ class Gnome(Optimizer):
         # state["step"], which lags it by one (the first step builds the
         # eigenbasis and returns without updating).
         self._step_count = 0
-        # Optional internal-state logging. Both are plain attributes: flip them
-        # on and off mid-run (e.g. to sample a window around a divergence)
-        # without rebuilding the optimizer. See _emit_diagnostics.
-        self.diagnostics = diagnostics
-        self.diagnostics_every = diagnostics_every
-        # What to measure. Imported lazily to keep gnome.diagnostics from
-        # importing gnome.optimizer back at module scope.
-        if metrics is None:
-            from gnome.diagnostics import DEFAULT_METRICS
-            metrics = dict(DEFAULT_METRICS)
-        self.metrics = metrics
+
+    @staticmethod
+    def _validate_param_group(group: dict) -> None:
+        if group["basis_transport"] not in ("overlap", "soap"):
+            raise ValueError("basis_transport must be 'overlap' or 'soap'")
+        if not isinstance(group["use_soap_basis"], bool):
+            raise ValueError("use_soap_basis must be a bool")
+        # Accept old all-Gnome groups without retaining the removed selector.
+        if group.pop("update_rule", "gnome") != "gnome":
+            raise ValueError("Gnome no longer supports alternate update rules")
+
+    def add_param_group(self, param_group: dict) -> None:
+        group = {**self.defaults, **param_group}
+        self._validate_param_group(group)
+        params = group["params"]
+        if isinstance(params, torch.Tensor):
+            params = [params]
+        elif isinstance(params, set):
+            raise TypeError("Optimizer parameters must have a deterministic order, not a set")
+        else:
+            params = list(params)
+        # PyTorch rejects overlap across groups, but only warns about repeats
+        # within one group. A tensor must never receive two updates here.
+        tensors = [p[1] if isinstance(p, tuple) else p for p in params]
+        if len({id(p) for p in tensors}) != len(tensors):
+            raise ValueError("A parameter may appear only once in an optimizer group")
+        group["params"] = params
+        super().add_param_group(group)
 
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
 
-    def _diagnostics_due(self) -> bool:
-        """Whether this step should emit. Cheap enough to call unconditionally.
-
-        Gated on the *global* step counter rather than sampled per parameter,
-        so when it fires every parameter emits on the same step and the records
-        form one coherent snapshot of the optimizer rather than a scatter of
-        unrelated tensors from unrelated steps.
-        """
-        return (
-            self.diagnostics is not None
-            and self._step_count % self.diagnostics_every == 0
-        )
-
-    def _emit_diagnostics(
+    @torch.no_grad()
+    def get_diagnostics(
         self,
-        idx: int,
-        p: torch.Tensor,
-        group: dict,
-        grad_hat: torch.Tensor,
-        gnd_hat: torch.Tensor,
-        update_rot: torch.Tensor,
-        lam,
-        lr: float,
-    ) -> None:
-        """Build one record of internal state and hand it to ``diagnostics``.
+        metrics: Optional[Sequence[Callable[[dict], dict]]] = None,
+        *,
+        params: Optional[Sequence[int]] = None,
+    ) -> list[dict]:
+        """Read per-parameter state without changing the optimizer.
 
-        Only called when :meth:`_diagnostics_due`, because each metric is a
-        reduction over a full parameter tensor — running them every step would
-        be a real cost, not a rounding error.
+        Returns records with step, param index, shape, numel, lr, and eps.
+        By default, each record also contains lam: the stored damping from
+        the last update, or None before the first update. Parameters without
+        initialized state are omitted. Indices follow trainable parameter order.
 
-        What gets measured is entirely ``self.metrics``: a ``{name: fn}`` dict
-        where each ``fn`` takes the context assembled here and returns a 0-dim
-        tensor. Nothing about *which* statistics exist is hardcoded in the
-        optimizer — see :data:`gnome.diagnostics.DEFAULT_METRICS`. This method
-        only assembles the context and merges the results with the cheap
-        metadata fields (step, shape, lr, ...) that need no reduction.
+        metrics is a sequence of callables receiving a context with p, state,
+        group, step, and param. Each returns a dictionary of named scalar
+        tensors or Python scalars. Pass [] for metadata only. Callables must
+        treat the context as read-only. Tensor results are detached and
+        converted to Python values for logging.
 
-        Every metric result is stacked and moved to host in a **single**
-        transfer. Read individually they would be one device sync each, which
-        on CUDA serializes the whole step — which is why metrics are asked to
-        return 0-dim tensors rather than Python floats.
-
-        The context is in the rotated eigenbasis, where the curvature is
-        diagonal — ``v`` estimates ``diag(Q^T H Q)``, the rotated-GGN
-        diagonal, which are the eigenvalues of H only when Q diagonalizes it. ``update`` is pre-projection but basis-independent in
-        norm: the Q matrices are orthonormal, so its RMS equals that of the
-        final parameter update.
+        params optionally selects parameter indices before metrics run.
+        Scheduling and writing the returned records belong to the caller.
+        No temporary update tensors are retained for diagnostics.
         """
-        eps = group["eps"]
-        trust_radius = group["trust_radius"]
-        # When the trust region is disabled lam is the Python float eps rather
-        # than a device tensor. Report it as-is rather than round-tripping it
-        # through float32, which would come back an ulp under eps and read as
-        # though something had perturbed it.
-        lam_is_tensor = torch.is_tensor(lam)
-        lam_f = float(lam) if not lam_is_tensor else None
+        from gnome.diagnostics import lm_damping
 
-        ctx = {
-            # Rotated-basis tensors — the usual subjects.
-            "v": gnd_hat,           # bias-corrected curvature (GGN diagonal)
-            "m": grad_hat,          # bias-corrected gradient EMA
-            "update": update_rot,   # the damped Newton step, pre-projection
-            # Scalars. lam is a 0-dim tensor when the trust region is active.
-            "lam": lam,
-            "eps": eps,
-            "lr": lr,
-            "trust_radius": trust_radius,
-            # Optimizer-level, so not reachable via group — but metrics that
-            # compare v against raw (un-normalized) quantities need it.
-            "norm_free": self._norm_free,
-            # Escape hatches: the raw pre-bias-correction EMAs live in state
-            # as gnd_m / grad_m, alongside the Kronecker factors GG and the
-            # eigenbasis Q.
-            "p": p,
-            "state": self.state[p],
-            "group": group,
-            "step": self._step_count,
-            "param": idx,
-        }
-
-        names, reductions = [], []
-        for name, fn in self.metrics.items():
-            val = fn(ctx)
-            if not torch.is_tensor(val):
-                raise TypeError(
-                    f"diagnostics metric {name!r} returned "
-                    f"{type(val).__name__}, expected a 0-dim tensor. Returning "
-                    f"a Python number forces a separate device sync per "
-                    f"metric; keep the reduction on-device (e.g. "
-                    f"`c['v'].max()`, not `float(c['v'].max())`)."
-                )
-            names.append(name)
-            reductions.append(val.reshape(()).to(gnd_hat.dtype))
-        if lam_is_tensor:
-            reductions.append(lam.reshape(()).to(gnd_hat.dtype))
-
-        stats = (
-            torch.stack(reductions).cpu().tolist() if reductions else []
-        )  # one host transfer for every metric at once
-        record = dict(zip(names, stats))
-        if lam_is_tensor:
-            lam_f = stats[-1]
-
-        record.update({
-            "step": self._step_count,
-            "param": idx,
-            "shape": tuple(p.shape),
-            "numel": p.numel(),
-            "lr": lr,
-            # Levenberg-Marquardt damping. lam == eps means the trust region
-            # never bound and the step was an undamped Newton step.
-            "eps": eps,
-            "lam": lam_f,
-            # Relative slack so a lam that is float32-equal to eps does not
-            # read as binding on the strength of one ulp.
-            "lam_binding": lam_f > eps * (1.0 + 1e-6),
-        })
-        # trust_ratio needs update_rms, which is a metric rather than a
-        # built-in — so it is only derivable when that metric is in use.
-        if trust_radius is not None and "update_rms" in record:
-            record["trust_ratio"] = record["update_rms"] / trust_radius
-        elif trust_radius is None:
-            record["trust_ratio"] = None
-
-        self.diagnostics(record)
+        metrics = (lm_damping,) if metrics is None else tuple(metrics)
+        if any(not callable(metric) for metric in metrics):
+            raise TypeError("diagnostics metrics must be callable")
+        selected = None if params is None else set(params)
+        records = []
+        idx = 0
+        for group in self.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                param_idx = idx
+                idx += 1
+                state = self.state.get(p)
+                if not state or (selected is not None and param_idx not in selected):
+                    continue
+                context = dict(p=p, state=state, group=group,
+                               step=self._step_count, param=param_idx)
+                record = dict(step=self._step_count, param=param_idx,
+                              shape=tuple(p.shape), numel=p.numel(),
+                              lr=group["lr"], eps=group["eps"])
+                for metric in metrics:
+                    values = metric(context)
+                    if not isinstance(values, dict):
+                        raise TypeError("diagnostics metrics must return dictionaries")
+                    for name, value in values.items():
+                        if name in record:
+                            raise ValueError(f"Duplicate diagnostics field: {name!r}")
+                        if torch.is_tensor(value):
+                            if value.ndim != 0:
+                                raise ValueError(f"Diagnostics field {name!r} must be scalar")
+                            value = value.detach().item()
+                        elif value is not None and not isinstance(value, (bool, int, float)):
+                            raise TypeError(f"Diagnostics field {name!r} must be scalar")
+                        record[name] = value
+                records.append(record)
+        return records
 
     # ------------------------------------------------------------------
     # Checkpointing
@@ -579,6 +505,17 @@ class Gnome(Optimizer):
         if extra is not None:
             # Hand the base implementation only the keys it knows about.
             state_dict = {k: v for k, v in state_dict.items() if k != "gnome"}
+        # Legacy checkpoints use Gnome groups and a surrogate-derived basis.
+        state_dict = dict(state_dict)
+        state_dict["param_groups"] = [
+            # Accept checkpoints written with the original misspelled option.
+            {"basis_transport": self.defaults["basis_transport"],
+             "use_soap_basis": group.get("use_soap_basi", False),
+             **{key: value for key, value in group.items() if key != "use_soap_basi"}}
+            for group in state_dict["param_groups"]
+        ]
+        for group in state_dict["param_groups"]:
+            self._validate_param_group(group)
         super().load_state_dict(state_dict)
         if extra is not None:
             self._step_count = int(extra["step_count"])
@@ -775,59 +712,68 @@ class Gnome(Optimizer):
 
     def _update_preconditioner(
         self,
-        G_s: torch.Tensor,
+        G_s: Union[torch.Tensor, Sequence[torch.Tensor]],
         state: dict,
         max_precond_dim: int,
         merge_dims: MergeDims,
         precondition_1d: bool,
+        basis_transport: str = "overlap",
     ) -> None:
-        """Update the Kronecker factors from the surrogate gradient G_s and,
-        on schedule, refresh the eigenbasis Q.
+        """Update factors once from the sum of basis-gradient outer products.
 
-        ``grad_m`` is a first-moment (vector) quantity so it is translated
-        out of the old basis and back into the new basis when Q is
-        refreshed. ``gnd_m`` is a diagonal-variance quantity in the rotated
-        basis; rotating it as a vector can produce negative entries, so it
-        is left in place (same approximation as SOAP).
+        Multiple surrogate gradients contribute separately, without cross
+        terms. With use_soap_basis, the input is just the main gradient.
+        Refresh the eigenbasis Q on the usual per-step schedule.
+
+        On basis refresh, transport the gradient EMA with basis overlaps and
+        the diagonal curvature EMA with squared overlaps. Between refreshes
+        both EMAs stay in the current basis. The "soap" policy instead retains
+        the previous permutation-only curvature handling and momentum round trip.
         """
-        if state["Q"] is not None:
+        if basis_transport == "soap" and state["Q"] is not None:
             state["grad_m"] = self._project_back(
                 state["grad_m"], state,
                 merge_dims=merge_dims, max_precond_dim=max_precond_dim,
             )
 
-        if G_s.dim() == 1:
-            if precondition_1d and G_s.shape[0] <= max_precond_dim:
+        gradients = [G_s] if isinstance(G_s, torch.Tensor) else G_s
+        if gradients[0].dim() == 1:
+            if precondition_1d and gradients[0].shape[0] <= max_precond_dim:
                 gg = state["GG"][0]
                 # GG uses the preconditioner's working precision (float64 for
                 # double runs, otherwise float32, matching _eigh_safe). Cast
                 # the contribution to that dtype before accumulating it.
-                gg.lerp_(
-                    (G_s.unsqueeze(1) @ G_s.unsqueeze(0)).to(gg.dtype),
-                    1 - state["shampoo_beta"],
-                )
+                outer = None
+                for grad in gradients:
+                    contribution = (grad.unsqueeze(1) @ grad.unsqueeze(0)).to(gg.dtype)
+                    outer = contribution if outer is None else outer.add_(contribution)
+                gg.lerp_(outer, 1 - state["shampoo_beta"])
         else:
-            ref = (
-                self._merge_dims(G_s, max_precond_dim, merge_dims)
-                if merge_dims else G_s
-            )
-            for idx, sh in enumerate(ref.shape):
+            refs = [
+                self._merge_dims(grad, max_precond_dim, merge_dims)
+                if merge_dims else grad
+                for grad in gradients
+            ]
+            for idx, sh in enumerate(refs[0].shape):
                 if sh <= max_precond_dim:
-                    outer = torch.tensordot(
-                        ref, ref,
-                        dims=[
-                            [*chain(range(idx), range(idx + 1, len(ref.shape)))]
-                        ] * 2,
-                    )
                     gg = state["GG"][idx]
-                    gg.lerp_(outer.to(gg.dtype), 1 - state["shampoo_beta"])
+                    outer = None
+                    for ref in refs:
+                        contribution = torch.tensordot(
+                            ref, ref,
+                            dims=[
+                                [*chain(range(idx), range(idx + 1, len(ref.shape)))]
+                            ] * 2,
+                        ).to(gg.dtype)
+                        outer = contribution if outer is None else outer.add_(contribution)
+                    gg.lerp_(outer, 1 - state["shampoo_beta"])
 
         if state["Q"] is None:
             state["Q"] = self._eigvecs_descending(state["GG"])
         elif state["step"] > 0 and state["step"] % state["precondition_frequency"] == 0:
-            self._qr_refresh_eigenbasis(state, max_precond_dim, merge_dims)
+            self._qr_refresh_eigenbasis(state, max_precond_dim, merge_dims, basis_transport)
 
-        if state["step"] > 0:
+        if basis_transport == "soap" and state["step"] > 0:
             state["grad_m"] = self._project(
                 state["grad_m"], state,
                 merge_dims=merge_dims, max_precond_dim=max_precond_dim,
@@ -856,6 +802,7 @@ class Gnome(Optimizer):
         state: dict,
         max_precond_dim: int,
         merge_dims: MergeDims,
+        basis_transport: str = "overlap",
     ) -> None:
         """Incrementally refresh the eigenbasis via one power iteration + QR.
 
@@ -867,23 +814,26 @@ class Gnome(Optimizer):
         refresh is far cheaper than a full ``eigh`` — and avoids the
         CPU↔MPS bounce that ``eigh`` requires on Apple Silicon.
 
-        ``gnd_m`` is a per-coordinate variance in the rotated basis; when
-        we reorder Q's columns by ``sort_idx`` we must permute ``gnd_m``
-        along the corresponding tensor dimension so it stays aligned with
-        the new eigenvalue ordering. (SOAP applies the same permutation to
-        its ``exp_avg_sq``.)
+        Transport each EMA along every refreshed tensor axis. For an overlap
+        C = Q_new.T @ Q_old, the gradient EMA uses C and the diagonal curvature
+        EMA uses C.square(). This assumes historical coordinates were
+        uncorrelated in the old basis, preserves nonnegativity and total
+        curvature mass, and includes eigenvector permutations and sign flips.
+        No separate permutation of the curvature EMA is applied in overlap
+        mode. In soap mode, only reorder curvature coordinates; momentum
+        projection is handled by _update_preconditioner.
         """
         precond_list = state["GG"]
         orth_list = state["Q"]
-        gnd_m = state["gnd_m"]
-
-        # Apply merge_dims to gnd_m so the per-factor dimensions line up.
+        grad_m, gnd_m = state["grad_m"], state["gnd_m"]
+        grad_dtype, gnd_dtype = grad_m.dtype, gnd_m.dtype
         if merge_dims:
-            gnd_m_view, merge_metadata = self._reshape_for_preconditioner(
+            grad_m, merge_metadata = self._reshape_for_preconditioner(
+                grad_m, max_precond_dim, merge_dims
+            )
+            gnd_m, _ = self._reshape_for_preconditioner(
                 gnd_m, max_precond_dim, merge_dims
             )
-        else:
-            gnd_m_view = gnd_m
 
         new_Q = []
         for ind, (m, o) in enumerate(zip(precond_list, orth_list)):
@@ -896,9 +846,7 @@ class Gnome(Optimizer):
 
             est_eig = torch.diag(o_f.T @ m_f @ o_f)
             sort_idx = torch.argsort(est_eig, descending=True)
-            gnd_m_view = gnd_m_view.index_select(ind, sort_idx)
-            o_f = o_f[:, sort_idx]
-            power_iter = m_f @ o_f
+            power_iter = m_f @ o_f[:, sort_idx]
 
             if _prefer_cpu(power_iter):
                 Q_cpu, _ = torch.linalg.qr(power_iter.cpu())
@@ -910,10 +858,25 @@ class Gnome(Optimizer):
                 Q = Q.to(dtype=m.data.dtype)
             new_Q.append(Q)
 
-        if merge_dims:
-            gnd_m_view = self._restore_merged_dims(gnd_m_view, merge_metadata)
+            if basis_transport == "soap":
+                gnd_m = gnd_m.index_select(ind, sort_idx)
+            else:
+                # Contract the old coordinate with the overlap's old-basis axis,
+                # then put the new coordinate back in the same tensor position.
+                overlap = Q.to(work_dtype).T @ o_f
+                grad_m = torch.tensordot(
+                    overlap, grad_m.to(work_dtype), dims=([1], [ind])
+                ).movedim(0, ind)
+                gnd_m = torch.tensordot(
+                    overlap.square(), gnd_m.to(work_dtype), dims=([1], [ind])
+                ).movedim(0, ind)
 
-        state["gnd_m"] = gnd_m_view
+        if merge_dims:
+            grad_m = self._restore_merged_dims(grad_m, merge_metadata)
+            gnd_m = self._restore_merged_dims(gnd_m, merge_metadata)
+
+        state["grad_m"] = grad_m.to(grad_dtype)
+        state["gnd_m"] = gnd_m.to(gnd_dtype)
         state["Q"] = new_Q
 
     # ------------------------------------------------------------------
@@ -947,13 +910,17 @@ class Gnome(Optimizer):
         self,
         y_hat: torch.Tensor,
         aux_idx: torch.Tensor,
+        *,
+        normalization_size: Optional[int] = None,
     ) -> torch.Tensor:
         """Return a scalar S whose gradient w.r.t. parameters is an unbiased
         Hutchinson-style factor of the GGN.
 
         All branches divide their summed surrogate by ``sqrt(K)`` so that
         ``E[(dS/dθ)²] = (1/K) · sum_aux L''·J²`` is an unbiased estimator
-        of ``E_data[L''·J²]``, independent of ``K``.
+        of ``E_data[L''·J²]``, independent of ``K``. For a partition, pass
+        the full auxiliary batch size as ``normalization_size`` to retain
+        the global normalization while selecting only that partition's rows.
 
         MSE: the intrinsic output Hessian is ``L'' = 2`` per element, so
         ``S = (sqrt(2) · eps · y_hat[aux_idx]).sum() / sqrt(K)`` with
@@ -979,7 +946,7 @@ class Gnome(Optimizer):
         Rademacher ``R`` gives ``v = sqrt(p(1-p)) * R`` and
         ``S = <z, detach(v)>.sum() / sqrt(K)``.
         """
-        K = aux_idx.shape[0]
+        K = aux_idx.shape[0] if normalization_size is None else normalization_size
         inv_sqrt_K = K ** -0.5
 
         if self._loss_mode == "cce":
@@ -1020,8 +987,8 @@ class Gnome(Optimizer):
     def _lm_lambda(m, v, T, eps, lam_prev=None, iters=3):
         """Smallest lambda >= eps with ``|| m / (v + lambda) ||_2 <= T``.
 
-        The l2 trust-region solve. ``T`` is ``trust_radius * sqrt(P)`` (see
-        the ``trust_radius`` docstring for why ``sqrt(P)``); the caller is
+        The l2 trust-region solve. ``T`` is ``trust_radius * sqrt(||p||² + S0)``
+        (see ``trust_radius`` for the initialization reference); the caller is
         ``_param_step``, which runs this once per parameter tensor in the
         rotated basis.
 
@@ -1029,8 +996,8 @@ class Gnome(Optimizer):
         the root is unique when ``phi(eps) > T``; otherwise the constraint is
         slack and the bracket floor keeps ``lambda = eps`` (an undamped
         Newton step). Newton is run on Hebden's reciprocal form
-        ``1/T - 1/phi``, which is nearly linear in lambda and converges in
-        2-3 iterations, warm-started from the previous step's lambda inside
+        ``1/T - 1/phi``, which is nearly linear in lambda and often converges
+        in 2-3 iterations, warm-started from the previous step's lambda inside
         an analytic bracket derived from ``min(v)`` and ``max(v)``. All ops
         stay on device -- no ``.item()``, no convergence check, no sync.
 
@@ -1042,15 +1009,13 @@ class Gnome(Optimizer):
         sensitivity; ``l_p`` for large p is the middle ground, and is this
         solver with the exponent changed.)
 
-        **Do not "simplify" the dphi line.** ``.clamp_max`` binds to ``.sum()``
-        before the unary minus, so ``-(q/d).sum().clamp_max(-1e-30)`` clamps a
-        *positive* sum to -1e-30 and negates it to +1e-30 -- wrong sign and
-        wrong magnitude, which makes Newton saturate the bracket instead of
-        solving for the root, silently pinning lambda at the bracket bottom.
-        The parenthesization below is load-bearing.
+        Compute ``slope = -phi'/phi`` from normalized update components.
+        Forming ``sum(m² / (v + lambda)³)`` first can overflow in FP32 for
+        small damping, making the derivative infinite and freezing Newton
+        at the bracket floor. The normalized correction also avoids forming
+        a ``phi²`` numerator.
         """
-        m2 = m * m
-        gn = m2.sum().sqrt()
+        gn = m.norm()
         ratio = gn / T
 
         # Analytic bracket from vmin <= v_i <= vmax.
@@ -1058,14 +1023,16 @@ class Gnome(Optimizer):
         hi = (ratio - v.min()).clamp_(min=eps)
         hi = torch.maximum(hi, lo)  # guard against v.min ~ v.max
 
-        lam = lo if lam_prev is None else lam_prev.clamp(lo, hi)
+        lam = lo if lam_prev is None else torch.as_tensor(
+            lam_prev, device=lo.device, dtype=lo.dtype
+        ).clamp(lo, hi)
 
         for _ in range(iters):
             d = v + lam
-            q = m2 / (d * d)
-            phi = q.sum().sqrt().clamp_min(1e-30)
-            dphi = (-(q / d).sum()).clamp_max(-1e-30) / phi
-            lam = (lam - phi * (phi / T - 1.0) / dphi).clamp(lo, hi)
+            u = m / d
+            phi = u.norm().clamp_min(1e-30)
+            slope = ((u / phi).square() / d).sum().clamp_min(1e-30)
+            lam = (lam + (phi / T - 1.0) / slope).clamp(lo, hi)
 
         return lam
 
@@ -1075,7 +1042,9 @@ class Gnome(Optimizer):
             Callable[[], ClosureReturn],
             Sequence[Callable[[], ClosureReturn]],
         ],
-        aux_closure: Callable[[], ClosureReturn],
+        aux_closure: Optional[Callable[[], ClosureReturn]] = None,
+        *,
+        surrogate_partition_sizes: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         """Perform a single optimization step.
 
@@ -1102,19 +1071,30 @@ class Gnome(Optimizer):
                 but typically on a smaller, disjoint slice of samples.
                 Used to compute the Hutchinson surrogate gradient. Runs once
                 per logical step even when the main batch is accumulated.
+            surrogate_partition_sizes: Optional positive integer sizes of
+                contiguous partitions along the auxiliary output's batch axis.
+                Must sum to ``y_hat_aux.shape[0]``. For a stacked PINN residual,
+                use the auxiliary blocks' element counts in stacking order,
+                e.g. ``[n_pde, n_ic, n_bc]``. Partition gradients are computed
+                together using ``autograd.grad(is_grads_batched=True)``,
+                retaining the full batch's ``1/sqrt(K)`` scaling.
+                Factor outer products and rotated squares are summed, then
+                each EMA is updated once. None uses one surrogate as before.
+                Ignored when there are no trainable Gnome parameters.
 
-        The closures run independent forward passes so each backward
-        releases its computation graph immediately — there is no
-        ``retain_graph`` and no holding of activations across passes.
+        Main and auxiliary closures run independent forward passes. Multiple
+        surrogate partitions share one batched backward, which releases the
+        auxiliary graph. Partition gradients are held until the parameter
+        updates; more partitions cost more backward work and memory.
 
         Returns:
             The scalar main loss (detached) for logging. When multiple
             micro-batch closures are passed, this is their size-weighted
             mean, i.e. the loss over the concatenated main batch.
         """
-        if main_closure is None or aux_closure is None:
+        if main_closure is None:
             raise RuntimeError(
-                "Gnome.step requires (main_closure, aux_closure)."
+                "Gnome.step requires a main_closure."
             )
 
         # Normalize to a list of micro-batch closures. A single callable is
@@ -1129,14 +1109,15 @@ class Gnome(Optimizer):
             main_closures = [main_closure]
         single = len(main_closures) == 1
 
-        self._step_count += 1
-
         params, groups_for_params = [], []
         for group in self.param_groups:
             for p in group["params"]:
                 if p.requires_grad:
                     params.append(p)
                     groups_for_params.append(group)
+        if params and aux_closure is None:
+            raise RuntimeError("Gnome.step requires aux_closure.")
+        self._step_count += 1
 
         # MAIN: loop over micro-batch closures, accumulating a size-weighted
         # average gradient. Each closure runs an independent forward+backward
@@ -1214,34 +1195,70 @@ class Gnome(Optimizer):
                     for g in grads:
                         g.mul_(clip_coef)
 
-        # AUX: forward + backward on the aux batch. Independent graph.
-        with torch.enable_grad():
-            aux_result = aux_closure()
-        if not (isinstance(aux_result, tuple) and len(aux_result) == 2):
-            raise RuntimeError(
-                "aux_closure must return (y_hat, y); got "
-                f"{type(aux_result).__name__}"
-            )
-        y_hat_aux, _y_aux = aux_result
-        if not y_hat_aux.requires_grad:
-            raise RuntimeError(
-                "y_hat from aux_closure must have requires_grad=True."
-            )
-        aux_idx = torch.arange(y_hat_aux.shape[0], device=y_hat_aux.device)
-        S = self._build_surrogate(y_hat_aux, aux_idx)
-        g_aux = torch.autograd.grad(S, params, allow_unused=True)
-        # aux graph is now freed
-        del y_hat_aux, aux_result
+        # AUX: independent graph for the curvature surrogate gradients.
+        g_aux = [None] * len(params)
+        if params:
+            with torch.enable_grad():
+                aux_result = aux_closure()
+            if not (isinstance(aux_result, tuple) and len(aux_result) == 2):
+                raise RuntimeError(
+                    "aux_closure must return (y_hat, y); got "
+                    f"{type(aux_result).__name__}"
+                )
+            y_hat_aux, _y_aux = aux_result
+            if not y_hat_aux.requires_grad:
+                raise RuntimeError(
+                    "y_hat from aux_closure must have requires_grad=True."
+                )
+            K = y_hat_aux.shape[0]
+            sizes = [K] if surrogate_partition_sizes is None else list(surrogate_partition_sizes)
+            if not sizes or any(
+                isinstance(size, bool) or not isinstance(size, Integral) or size <= 0
+                for size in sizes
+            ):
+                raise ValueError("surrogate_partition_sizes must contain positive integers")
+            if sum(sizes) != K:
+                raise ValueError(
+                    f"surrogate_partition_sizes must sum to auxiliary batch size {K}; "
+                    f"got {sum(sizes)}"
+                )
+            surrogates = []
+            start = 0
+            for size in sizes:
+                aux_idx = torch.arange(start, start + size, device=y_hat_aux.device)
+                surrogates.append(
+                    self._build_surrogate(y_hat_aux, aux_idx, normalization_size=K)
+                )
+                start += size
+            if len(surrogates) == 1:
+                # Preserve the ordinary single-surrogate path without vmap overhead.
+                surrogate_grads = torch.autograd.grad(
+                    surrogates[0], params, allow_unused=True,
+                )
+                for i, grad in enumerate(surrogate_grads):
+                    g_aux[i] = [] if grad is None else [grad.detach()]
+            else:
+                # Identity seeds request one VJP per scalar surrogate. The vmap
+                # backend batches those VJPs in one autograd call, returning
+                # [partitions, *parameter.shape] without mixing the gradients.
+                S = torch.stack(surrogates)
+                surrogate_grads = torch.autograd.grad(
+                    S, params,
+                    grad_outputs=torch.eye(len(surrogates), device=S.device, dtype=S.dtype),
+                    is_grads_batched=True, allow_unused=True,
+                )
+                for i, grad in enumerate(surrogate_grads):
+                    g_aux[i] = [] if grad is None else grad.detach().unbind(0)
+                del S
+            del y_hat_aux, aux_result, surrogates
 
         with torch.no_grad():
-            for idx, (p, g, G_s, group) in enumerate(
-                zip(params, g_accum, g_aux, groups_for_params)
-            ):
+            for p, g, G_s, group in zip(params, g_accum, g_aux, groups_for_params):
                 if g is None:
                     continue
-                if G_s is None:
+                if not G_s:
                     G_s = torch.zeros_like(g)
-                self._param_step(p, g.detach(), G_s.detach(), group, idx)
+                self._param_step(p, g.detach(), G_s, group)
 
         return mean_loss
 
@@ -1249,11 +1266,18 @@ class Gnome(Optimizer):
         self,
         p: torch.Tensor,
         g: torch.Tensor,
-        G_s: torch.Tensor,
+        G_s: Union[torch.Tensor, Sequence[torch.Tensor]],
         group: dict,
-        idx: int = 0,
     ) -> None:
         state = self.state[p]
+        surrogate_grads = [G_s] if isinstance(G_s, torch.Tensor) else G_s
+        basis_grad = g if group["use_soap_basis"] else surrogate_grads
+
+        if "initial_sq_norm" not in state:
+            norm_sq = p.detach().square().sum()
+            if norm_sq == 0:
+                norm_sq = norm_sq.new_tensor(1.0)
+            state["initial_sq_norm"] = norm_sq
 
         if "step" not in state:
             state["step"] = 0
@@ -1268,7 +1292,7 @@ class Gnome(Optimizer):
                 else group["betas"][1]
             )
             self._init_preconditioner(
-                G_s, state,
+                g, state,
                 precondition_frequency=group["precondition_frequency"],
                 shampoo_beta=shampoo_beta,
                 max_precond_dim=group["max_precond_dim"],
@@ -1276,10 +1300,11 @@ class Gnome(Optimizer):
                 merge_dims=group["merge_dims"],
             )
             self._update_preconditioner(
-                G_s, state,
+                basis_grad, state,
                 max_precond_dim=group["max_precond_dim"],
                 merge_dims=group["merge_dims"],
                 precondition_1d=group["precondition_1d"],
+                basis_transport=group["basis_transport"],
             )
             return  # first step: build the basis, skip the update.
 
@@ -1291,36 +1316,25 @@ class Gnome(Optimizer):
         lr = group["lr"]
         grad_m, gnd_m = state["grad_m"], state["gnd_m"]
 
-        # Project loss gradient and surrogate into the GGN-derived eigenbasis.
+        # Project loss gradient and surrogate into the selected eigenbasis.
         g_rot = self._project(
             g, state,
             merge_dims=group["merge_dims"],
             max_precond_dim=group["max_precond_dim"],
         )
-        Gs_rot = self._project(
-            G_s, state,
-            merge_dims=group["merge_dims"],
-            max_precond_dim=group["max_precond_dim"],
-        )
-
-        # GND estimate in the rotated basis: squared surrogate, EMA-aggregated.
-        gs_sq = Gs_rot.square()
+        # Rotate and square each partition separately: summing gradients
+        # before squaring would reintroduce the cross-partition noise.
+        gs_sq = None
+        for surrogate_grad in surrogate_grads:
+            Gs_rot = self._project(
+                surrogate_grad, state,
+                merge_dims=group["merge_dims"],
+                max_precond_dim=group["max_precond_dim"],
+            )
+            contribution = Gs_rot.square()
+            gs_sq = contribution if gs_sq is None else gs_sq.add_(contribution)
+        # Normalize the aggregate once, preserving the partitions' relative weights.
         if self._norm_free:
-            # Normalize each contribution to unit norm before it enters the EMA.
-            #
-            # An EMA weights the step k back by beta2**k, but what it weights is
-            # ||g_s||^2, so the effective weight is beta2**k * ||g_s(t-k)||^2.
-            # When the surrogate magnitude decays faster than beta2**k shrinks,
-            # the *oldest* entries still in the window carry the most mass and
-            # the curvature estimate tracks a scale that is already obsolete.
-            # Dividing it out makes beta2 control recency again.
-            #
-            # Off by default because it also removes the self-annealing that
-            # lets Gnome hold a fixed lr on MSE: there, v_hat shrinking with the
-            # residual is the mechanism, not a bug. Turn it on for fast-learning
-            # objectives (classification), where the loss moves a long way
-            # inside one EMA window and there is no residual-driven annealing
-            # to preserve.
             gs_sq = gs_sq / gs_sq.norm().clamp_min(1e-30)
         gnd_m.mul_(beta2).add_(gs_sq, alpha=(1.0 - beta2))
 
@@ -1333,39 +1347,32 @@ class Gnome(Optimizer):
         grad_hat = grad_m / bc1
         gnd_hat = gnd_m / bc2
 
-        # Trust-region damping, solved here in the rotated basis where the
-        # curvature is diagonal and the constraint is therefore a statement
-        # about a diagonal quadratic model.
-        #
-        #   trust_radius is None -> lam = eps, the plain fixed-damping step
-        #   otherwise            -> smallest lam >= eps with
-        #                           ||update||_2 <= trust_radius * sqrt(P)
-        #
-        # Larger trust_radius = weaker bound = longer steps. The bound is on
-        # the update itself, so ||delta_theta||_2 <= lr * trust_radius *
-        # sqrt(P), and since the Q matrices are orthonormal that survives the
-        # projection back: the knob is an RMS-per-coordinate budget, in units
-        # of lr.
         eps = group["eps"]
         trust_radius = group["trust_radius"]
         if trust_radius is None:
             lam = eps
         else:
-            T = trust_radius * math.sqrt(p.numel())
+            T = trust_radius * math.sqrt(
+                10 + p.square().sum() # 10 + p.square().sum()  p.numel()
+            )
             lam = self._lm_lambda(grad_hat, gnd_hat, T, eps,
                                   lam_prev=state.get("lm_lambda"))
-            state["lm_lambda"] = lam
+        state["lm_lambda"] = lam
         # Newton step in the rotated basis, damped by lam.
-        update_rot = grad_hat / gnd_hat.add(lam)
 
-        if self._diagnostics_due():
-            self._emit_diagnostics(
-                idx, p, group, grad_hat, gnd_hat, update_rot, lam, lr
-            )
+        update_unorm = grad_hat / gnd_hat.add(lam)
+        damping = (
+            update_unorm
+            .abs()
+            .clamp(min=0.0, max=1.0)
+        )
 
+        update_rot = torch.sign(grad_hat) * damping
+        # Zero-initialized projections can block gradients upstream. Keep a
+        # zero update at zero instead of dividing by zero during normalization.
         # Rotate back into the parameter basis. Orthonormal Q means the l2
         # norm — and hence the trust-region bound — carries over exactly, so
-        # no further per-coordinate safeguard is applied here.
+        # subsequent coordinate clipping can only reduce that norm.
         update = self._project_back(
             update_rot, state,
             merge_dims=group["merge_dims"],
@@ -1376,11 +1383,12 @@ class Gnome(Optimizer):
         if group["weight_decay"] > 0.0:
             p.add_(p, alpha=-lr * group["weight_decay"])
 
-        # Refresh Kronecker factors with the new surrogate; eigenbasis is
+        # Refresh Kronecker factors with the selected gradient; eigenbasis is
         # recomputed on schedule.
         self._update_preconditioner(
-            G_s, state,
+            basis_grad, state,
             max_precond_dim=group["max_precond_dim"],
             merge_dims=group["merge_dims"],
             precondition_1d=group["precondition_1d"],
+            basis_transport=group["basis_transport"],
         )

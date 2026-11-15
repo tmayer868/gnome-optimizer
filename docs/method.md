@@ -1,6 +1,6 @@
 # Gnome: Gauss-Newton Optimizer via Matrix Eigen-decomposition
 
-Gnome is a second-order PyTorch optimizer that extends [SOAP](https://arxiv.org/abs/2409.11321) into a true Gauss-Newton method. It keeps SOAP's Kronecker-factored eigenbasis machinery but changes the signal those factors are built from, the update rule inside the rotated basis, and how step size is controlled.
+Gnome is a second-order PyTorch optimizer that extends [SOAP](https://arxiv.org/abs/2409.11321) into a true Gauss-Newton method. It keeps SOAP's Kronecker-factored eigenbasis machinery but changes the signal those factors are built from, the update rule inside the rotated basis, how step size is controlled, and how diagonal curvature statistics follow basis changes.
 
 This document describes the algorithm in detail: how it builds off SOAP, the role of the auxiliary surrogate function, and the concrete construction of that surrogate for each supported loss.
 
@@ -19,9 +19,9 @@ periodically diagonalizes them ($L = Q_L \Lambda_L Q_L^\top$, $R = Q_R \Lambda_R
 
 The piece of SOAP we want to inherit is the Kronecker-eigenbasis machinery itself. The piece we want to replace is the **signal** it is fed. SOAP's $L_t$ and $R_t$ are built from past loss gradients, i.e. an empirical-Fisher proxy.
 
-## 2. From SOAP to Gnome: two changes
+## 2. From SOAP to Gnome: three changes
 
-Gnome makes two changes to the SOAP recipe.
+Gnome makes three changes to the SOAP recipe.
 
 **(a) Build the Kronecker factors from a GGN estimate, not from the loss gradient.**
 
@@ -33,7 +33,7 @@ $$
 
 where $J_\theta = \partial \hat y / \partial \theta$ is the model Jacobian and $H_y = \partial^2 \ell / \partial \hat y^2$ is the intrinsic output Hessian of the loss. The Kronecker factors then become EMAs of $g_s g_s^\top$ and $g_s^\top g_s$, which in expectation are the Kronecker factors of the GGN itself.
 
-The factor refresh schedule, eigendecomposition, dim-merging, and projection logic are all carried over from SOAP unchanged.
+The factor refresh schedule, initial eigendecomposition, subsequent subspace iteration with QR, and dimension-merging machinery follow SOAP. The diagonal EMA is transported across basis changes using squared overlaps, as described in (c) and §6.3.
 
 **(b) Newton step inside the rotated basis, with an l2 trust region.**
 
@@ -48,10 +48,15 @@ with the un-square-rooted denominator. This is the diagonal Gauss-Newton update 
 A pure Newton step has no built-in step-size control. Gnome imposes an **l2 trust region** on the update in the rotated basis:
 
 $$
-\| \Delta\tilde\theta \|_2 \;\le\; T \;=\; c \cdot \sqrt{P},
+\| \Delta\tilde\theta \|_2 \;\le\; T, \qquad
+T =
+\begin{cases}
+c\sqrt{N}, & \text{CCE}, \\
+c\sqrt{\|W\|_2^2 + 1}, & \text{MSE}.
+\end{cases}
 $$
 
-where $P$ is the number of elements in the parameter tensor and $c$ is the `trust_radius` hyperparameter (typically $0.1$ to $1.0$). The smallest $\lambda \ge \varepsilon$ that satisfies this constraint is found by solving the secular equation
+Here $c$ is `trust_radius`, $W$ is the current parameter tensor, and $N = \operatorname{numel}(W)$ is its number of scalar parameters. The norm $\|W\|_2$ is the Euclidean norm of the flattened tensor (the Frobenius norm for a matrix). Both CCE surrogate variants, `cce` and `cce_hutchinson`, use the CCE budget. The smallest $\lambda \ge \varepsilon$ that satisfies this constraint is found by solving the secular equation
 
 $$
 \phi(\lambda) \;=\; \left\| \frac{\hat m}{\hat v + \lambda} \right\|_2 \;=\; T,
@@ -64,11 +69,34 @@ via Hebden's reciprocal Newton method. Convergence takes 2 to 3 iterations, warm
 1. **It preserves the update direction.** Uniform damping shrinks the step along the Newton-to-gradient-descent continuum without distorting which coordinates move relative to each other. Per-coordinate clipping projects onto an l-infinity ball, which can scramble the relative ordering of updates.
 2. **No single coordinate dominates.** The l2 norm aggregates all $P$ coordinates, so an outlier with spuriously small $\hat v_i$ cannot single-handedly set the damping for the entire tensor.
 
-**Why $\sqrt{P}$ scaling.** The L2 norm of the Newton step naturally scales as $\sqrt{P}$ (sum of $P$ squared terms). Without the $\sqrt{P}$ factor, a single $c$ could not work across layers of different widths. The scaling makes $c$ a dimensionless "RMS per-coordinate" bound, roughly the allowed typical per-element update magnitude. This is directly analogous to the old per-coordinate `clip=1.0`, but enforced through the L2 budget rather than by projection.
+**Loss-dependent scale.** For CCE, $T=c\sqrt{N}$ gives a constant RMS update budget $T/\sqrt{N}=c$, independent of the parameter magnitudes. For MSE, $T=c\sqrt{\|W\|_2^2+1}$ grows with the current parameter norm and has a nonzero floor of $c$ at $W=0$. Its RMS form is $T/\sqrt{N}=c\sqrt{\operatorname{mean}(W^2)+1/N}$.
+
+These budgets depend on the tensor's size or current norm; neither requires an initialization-norm reference.
+
+The existing coordinate clamp to `[-1, 1]` after projection remains in place; it can only reduce the update norm. The trust budget applies before learning-rate scaling and excludes decoupled weight decay.
 
 **Behavior at the extremes.** When curvature is well-estimated and the unconstrained Newton step already satisfies $\|\hat m / \hat v\|_2 \le T$, the constraint is slack: $\lambda = \varepsilon$ and the update is a pure diagonally-preconditioned Newton step. When curvature is unreliable (small $\hat v_i$, e.g. early in training while the eigenbasis is still warming up), $\lambda$ grows and the update degrades smoothly toward $\hat m / \lambda$, which is bounded gradient descent in the rotated basis. The trust region is a safeguard, not the primary step-size control; at sensible learning rates and $c \sim 1$ it rarely binds on well-conditioned steps.
 
 The dimensional argument for the un-square-rooted denominator: if we model the rotated gradient as $\tilde g \sim \mathcal{N}(0, \tilde H)$ with $\tilde H$ the rotated GGN, then $\mathbb{E}[\tilde g^2] = \tilde H$. The Newton-rescaled coordinate has units $[\text{grad}] / [\text{curvature}]$, i.e. $\tilde g / \tilde H$. Adam's $\sqrt{\tilde v}$ has the wrong units ($\sqrt{[\text{curvature}]}$); it is a heuristic for the gradient *norm*, not the curvature. Gnome's $\hat v$ has the right units.
+
+**(c) Squared-overlap transport across basis updates.**
+
+The curvature EMA is stored in the current rotated basis. When that basis
+changes, its entries must follow the new coordinates. Gnome uses
+**squared-overlap transport**: if
+$A=Q_{L,\mathrm{new}}^\top Q_{L,\mathrm{old}}$ and
+$B=Q_{R,\mathrm{old}}^\top Q_{R,\mathrm{new}}$, it transports the diagonal
+curvature EMA $V$ as
+
+$$
+V_{\mathrm{new}} = A^{\odot 2} V_{\mathrm{old}} B^{\odot 2}.
+$$
+
+This replaces permutation-only handling with a diagonal approximation to the
+second-moment change of basis. It preserves nonnegativity and total diagonal
+mass, and handles eigenvector reordering and sign flips automatically. The
+gradient EMA is transported as a vector using the unsquared overlaps.
+Section 6.3 gives the derivation, assumptions, and implementation details.
 
 ## 3. The GGN matrix
 
@@ -302,36 +330,194 @@ For each minibatch, with `main_closure` returning $(\hat y, y)$ on the $B-K$ mai
 
    *Global gradient clipping.* If `max_grad_norm` is set, the accumulated main gradient is rescaled so its total L2 norm (across all parameters) does not exceed the given value, matching `torch.nn.utils.clip_grad_norm_`. The curvature surrogate gradient $g_s$ is intentionally left unclipped. Its scale is calibrated by the $1/\sqrt{K}$ normalization and should not be distorted.
 
-2. **Aux forward + backward.** Build $S$ per §5 from the aux logits and sampled randomness. Gradient $g_s = \nabla_\theta S$. Free the aux graph.
+2. **Aux forward + backward.** Build $S$ per §5 from the aux logits and sampled randomness. Gradient $g_s = \nabla_\theta S$. Free the aux graph. With multiple `surrogate_partition_sizes`, compute the partition gradients in one batched backward and use the sums of curvature contributions described in §6.2.
 
 3. **Per-parameter update.** For each parameter tensor:
-   - Update the Kronecker factors $L, R$ with EMA from $g_s g_s^\top$ and $g_s^\top g_s$ (`shampoo_beta`).
-   - If on the refresh schedule, recompute the eigenbases $Q_L, Q_R$ (full `eigh` on first build, one step of subspace iteration + QR thereafter).
-   - Project $g_{\text{main}}$ and $g_s$ into the rotated basis: $\tilde g = Q_L^\top g\, Q_R$.
+   - On the first call for this tensor, initialize the Kronecker factors from the basis-gradient outer products and build $Q_L,Q_R$ with full `eigh`. This call builds the basis and skips the parameter update.
+   - On subsequent calls, project $g_{\text{main}}$ and $g_s$ into the current rotated basis: $\tilde g = Q_L^\top g\, Q_R$.
    - Update the first-moment EMA from $\tilde g_{\text{main}}$ (`beta1`) and the second-moment EMA from $\tilde g_s^{\,2}$ (`beta2`).
    - Apply bias correction to obtain $\hat m$ and $\hat v$.
-   - Solve for the trust-region damping $\lambda$: the smallest value $\ge \varepsilon$ such that $\|\hat m / (\hat v + \lambda)\|_2 \le c \cdot \sqrt{P}$, where $c$ is `trust_radius` and $P$ is the number of elements in the parameter tensor. Solved via Hebden's reciprocal Newton method (2 to 3 iterations), warm-started from the previous step's $\lambda$, with an analytic bracket from $\min(\hat v)$ and $\max(\hat v)$.
+   - Solve for the trust-region damping $\lambda$: the smallest value $\ge \varepsilon$ such that $\|\hat m / (\hat v + \lambda)\|_2 \le T$, using $T=c\sqrt{N}$ for CCE and $T=c\sqrt{\|W\|_2^2+1}$ for MSE. Here $c$ is `trust_radius`, $N$ is the parameter tensor's element count, and $W$ is its current value, as in §2. Solved via Hebden's reciprocal Newton method (2 to 3 iterations), warm-started from the previous step's $\lambda$, with an analytic bracket from $\min(\hat v)$ and $\max(\hat v)$.
    - Compute the damped Newton step: $\Delta \tilde\theta = \hat m / (\hat v + \lambda)$.
    - Project back to the parameter basis: $\Delta\theta = Q_L \, \Delta\tilde\theta \, Q_R^\top$. Because the $Q$ matrices are orthonormal, $\|\Delta\theta\|_2 = \|\Delta\tilde\theta\|_2$. The trust region bound is preserved exactly.
    - Apply with $-\text{lr}$, then decoupled weight decay. Gnome owns no learning-rate schedule: `lr` is read from the parameter group on every step and multiplies the update *after* the trust-region solve, so it scales step length linearly and any `torch.optim.lr_scheduler` drives Gnome exactly as it drives AdamW.
+   - Update the Kronecker factor EMAs from $g_s g_s^\top$ and $g_s^\top g_s$ (`shampoo_beta`), or from the main gradient when `use_soap_basis=True`.
+   - At a scheduled refresh, compute the new eigenbases using one subspace iteration plus QR. Apply squared-overlap transport to the curvature EMA and unsquared-overlap transport to the gradient EMA (§6.3). These transported EMAs are ready before the next step incorporates its rotated gradients. Between refreshes, both remain in the current basis.
 
-Two independent forward passes (one for main, one for aux) cost more than a single shared forward, but mean we don't need `retain_graph=True` and don't have to hold the main batch's activations alive while running the surrogate backward. The aux batch is small (default $K=10$), so the second pass is cheap.
+Two independent forward passes (one for main, one for aux) avoid holding the main batch's activations alive while running the surrogate backward. Neither the default single-surrogate path nor the batched partition path needs `retain_graph=True`; each releases the auxiliary graph in its gradient call.
 
-`grad_m` (a vector quantity in the rotated basis) is translated through eigenbasis refreshes: it is rotated back to the parameter basis before the new $Q$ is computed and projected forward into the new basis afterwards. `gnd_m` (a diagonal variance) is permuted along the corresponding tensor axis to match the new eigenvalue ordering but is not re-rotated, matching SOAP's treatment of `exp_avg_sq`.
+Basis refresh and EMA transport occur after the current parameter update. Transport changes the coordinates of the stored statistics; it does not increment the EMA counters or apply another decay factor.
 
 ### 6.1 The `norm_free` option
 
 By default, the squared surrogate $\tilde g_s^2$ enters the curvature EMA directly. When the surrogate magnitude decays faster than the EMA window (common early in classification training), the oldest entries still in the window carry the most mass and the curvature estimate tracks an obsolete scale. Setting `norm_free=True` normalizes each contribution to unit norm before it enters the EMA, so `beta2` controls recency rather than being overridden by a decaying $\|g_s\|$. Off by default: on MSE objectives the shrinking $\hat v$ is the self-annealing mechanism that lets Gnome hold a fixed learning rate, and normalizing would remove it. Turn it on for fast-learning objectives (classification) where the loss moves a long way inside one EMA window. Note that it rescales $\hat v$, so `lr` generally needs retuning when toggled.
 
+### 6.2 Partitioned surrogates: compute versus variance
+
+`opt.step(main_closure, aux_closure, surrogate_partition_sizes=[n_1, n_2, ...])`
+partitions the auxiliary output into contiguous slices along its first axis.
+The sizes must be positive integers with $\sum_j n_j=K$, the total auxiliary
+batch size. Omitting the argument is equivalent to `[K]`.
+
+For partition $I_j$, form
+
+$$
+S_j = \frac{1}{\sqrt K}\sum_{k\in I_j}\hat y_k^\top A_kR_k,
+\qquad g_j=\nabla_\theta S_j.
+$$
+
+The normalization stays global. Equivalently, a locally normalized surrogate
+would need an additional factor $\sqrt{n_j/K}$. The original surrogate gradient
+is $\sum_j g_j$, so its outer product includes cross terms $g_jg_l^\top$.
+Independent zero-mean probes make those cross terms vanish in expectation.
+Partitioning removes them on every step by using
+
+$$
+\widehat H=\sum_jg_jg_j^\top,
+\qquad \mathbb E_R[\widehat H]=\frac1K\sum_kJ_k^\top H_{y,k}J_k.
+$$
+
+For matrix-shaped parameter gradients $G_j$, update the Kronecker factor EMAs
+once from $\sum_jG_jG_j^\top$ and $\sum_jG_j^\top G_j$. Project each gradient
+in the same current basis, $\widetilde G_j=Q_L^\top G_jQ_R$, and update the
+curvature EMA once from $\sum_j\widetilde G_j^{\,2}$. Never sum the gradients
+before taking outer products or squares. The main-gradient momentum and the
+basis-refresh schedule still advance once per logical step. With
+`use_soap_basis=True`, only the curvature EMA uses the partitioned contributions;
+the basis factors still use the main gradient. With `norm_free=True`, normalize
+the summed squared contribution once, preserving relative partition weights.
+
+For the already-scaled PINN vector from `stack_residuals`, partition sizes are
+the auxiliary blocks' element counts, such as `[n_pde, n_ic, n_bc]`. Combining
+the global normalization with the block scaling in §8 gives
+$S_j=\sqrt{2\lambda_j/n_j}\,r_j^\top R_j$ for raw residual block $r_j$.
+Thus unequal block sizes keep their intended loss weights. A block with multiple
+output components contributes all of its elements to its partition size.
+
+There is one auxiliary forward. For multiple partitions, stack the scalar
+surrogates into a vector and call `torch.autograd.grad` with identity seeds and
+`is_grads_batched=True`. PyTorch's vmap backend batches the vector-Jacobian
+products, returning gradients shaped `[num_partitions, *parameter.shape]`.
+The partition axis is kept separate through curvature accumulation. A single
+partition uses ordinary `autograd.grad` without vmap overhead. The auxiliary
+graph is released by the gradient call, and the separate parameter gradients
+are stored until the update. Finer partitions remove more cross-partition noise
+at the cost of more backward work and gradient storage. Sizes are supplied per
+step, can vary with the auxiliary batch, and are not optimizer checkpoint state.
+
+### 6.3 Squared-overlap transport
+
+Let $M_{\mathrm{old}}$ and $V_{\mathrm{old}}$ denote the stored, uncorrected
+gradient and diagonal curvature EMAs (`grad_m` and `gnd_m`)
+immediately before a basis refresh. For a matrix-shaped parameter, define
+
+$$
+A=Q_{L,\mathrm{new}}^\top Q_{L,\mathrm{old}},
+\qquad
+B=Q_{R,\mathrm{old}}^\top Q_{R,\mathrm{new}}.
+$$
+
+A historical gradient with old coordinates $X$ has new coordinates $AXB$.
+The first moment therefore has an exact linear change of basis:
+
+$$
+M_{\mathrm{new}} = A M_{\mathrm{old}} B.
+$$
+
+For the second moment, retain only its diagonal in the old basis. The resulting
+**squared-overlap transport** is
+
+$$
+\boxed{V_{\mathrm{new}} = A^{\odot 2} V_{\mathrm{old}} B^{\odot 2}},
+\qquad
+(V_{\mathrm{new}})_{ij}
+=\sum_{a,b} A_{ia}^{\,2}(V_{\mathrm{old}})_{ab}B_{bj}^{\,2}.
+$$
+
+Here $\odot 2$ is elementwise squaring. Applying the unsquared overlaps to $V$
+would treat second moments as vector coordinates and could produce negative
+curvature estimates. The squared overlaps give the diagonal of the transformed
+diagonal second-moment model instead.
+
+**Approximation and exact cases.** Using column-major vectorization, let
+$T=B^\top\otimes A$ and
+$D=\operatorname{Diag}(\operatorname{vec}V_{\mathrm{old}})$.
+The formula above computes $\operatorname{diag}(TDT^\top)$ without forming
+either full matrix. If the stored diagonal equals the diagonal of the historical
+second-moment matrix $C$, write $C=D+E$, with $E$ its omitted off-diagonal
+part. The exact new diagonal also
+contains $\operatorname{diag}(TET^\top)$. The transport is exact for signed
+permutations, or whenever that historical second-moment matrix is diagonal in
+the old basis.
+
+For a single transport with $D=\operatorname{Diag}(\operatorname{diag}C)$,
+orthogonality gives the absolute-error bound
+
+$$
+\left\|\operatorname{diag}(TCT^\top)
+      -\operatorname{diag}(TDT^\top)\right\|_2
+\leq \|E\|_F.
+$$
+
+Thus small historical off-diagonal mass makes the local transport error small.
+The relevant matrix is the historical second moment represented by the EMA;
+the instantaneous GGN being nearly diagonal alone does not establish this
+condition. Repeated transports discard newly introduced off-diagonal terms,
+so approximation error can accumulate and diagonal statistics can become
+smoother. The bound above does not include error already present in the stored
+diagonal.
+
+**Preserved properties.** Squared orthogonal overlap matrices are doubly
+stochastic. Consequently, for nonnegative $V_{\mathrm{old}}$,
+
+$$
+V_{\mathrm{new}}\geq 0,
+\qquad
+\sum_{i,j}(V_{\mathrm{new}})_{ij}
+=\sum_{i,j}(V_{\mathrm{old}})_{ij},
+$$
+
+up to numerical roundoff. Eigenvalue reordering is already included in the
+overlaps, so there is no additional permutation of $V$. Eigenvector sign flips
+cancel under squaring. Preservation of total diagonal mass does not imply
+preservation of individual diagonal entries or of the full covariance.
+
+**Tensor implementation and timing.** Along each preconditioned tensor axis
+$k$, form $C_k=Q_{k,\mathrm{new}}^\top Q_{k,\mathrm{old}}$. Contract that axis
+of `grad_m` with $C_k$ and of `gnd_m` with $C_k^{\odot 2}$.
+For the right axis of a matrix, $C_R=B^\top$, so the axis contraction is exactly
+right multiplication by $B^{\odot 2}$ in the boxed formula. Merged dimensions
+are handled in their grouped layout and restored afterward; unpreconditioned
+axes are left unchanged. The matrix case adds two overlap products and two
+matrix multiplications for the curvature transport, plus the first-moment
+transport, without storing historical gradients or a full covariance.
+
+The implementation applies this transformation at the end of each scheduled
+basis refresh, after incorporating the current gradient and surrogate in the
+old basis and applying the current parameter update. The next step projects
+its gradients into the new basis and incorporates them into the transported
+EMAs. Transport preserves the EMA step count and does not apply extra decay;
+the usual bias-correction factors remain in use. With residual partitioning,
+transport the single aggregate curvature EMA once per refresh.
+
+**Configuration.** Squared-overlap transport is the default methodology,
+selected by `Gnome(..., basis_transport="overlap")`. The retained
+`basis_transport="soap"` option provides the previous permutation-only
+curvature handling and momentum projection for ablations. It is independent of
+`use_soap_basis`, which selects the source of the Kronecker factors.
+The selected transport mode is stored per parameter group in checkpoints.
+Reaction, convection, and Allen–Cahn expose it as
+`CONFIG["optimizers"]["gnome"]["basis_transport"]`.
+
 ## 7. Why the un-square-rooted denominator (again, briefly)
 
-Suppose the rotated GGN is approximately diagonal with diagonal $d$. The second-moment EMA of the rotated surrogate gradient satisfies
+Suppose the rotated GGN is approximately diagonal with diagonal $d$. For a fixed basis and current parameters, the squared surrogate satisfies
 
 $$
 \mathbb{E}\!\left[\tilde g_s^{\,2}\right]_i \;=\; \mathbb{E}\!\left[(Q^\top g_s)_i^2\right] \;=\; (Q^\top \text{GGN}\, Q)_{ii} \;\approx\; d_i.
 $$
 
-So $\hat v \approx d$, and $\hat m / \hat v$ is the per-coordinate Newton step in the rotated basis. The Adam denominator $\sqrt{\hat v}$ has the wrong units for a Newton step (it scales like $\sqrt{\text{curvature}}$, not curvature), which is why Adam needs $\varepsilon$ as a numerical-safety constant calibrated against the gradient norm. Moving curvature from "noisy outer product of gradients" to "true GGN estimate" only pays off when we also move the denominator from $\sqrt{\hat v}$ to $\hat v$.
+Averaging these contributions gives $\hat v \approx d$ when curvature varies slowly over the EMA window and the squared-overlap transport error (§6.3) is small. Then $\hat m / \hat v$ is the per-coordinate Newton step in the rotated basis. The Adam denominator $\sqrt{\hat v}$ has the wrong units for a Newton step (it scales like $\sqrt{\text{curvature}}$, not curvature), which is why Adam needs $\varepsilon$ as a numerical-safety constant calibrated against the gradient norm. Moving curvature from "noisy outer product of gradients" to "true GGN estimate" only pays off when we also move the denominator from $\sqrt{\hat v}$ to $\hat v$.
 
 ## 8. Multi-block losses (PINNs)
 

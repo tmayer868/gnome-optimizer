@@ -25,12 +25,10 @@ without checkpoints::
 
 Relation to :mod:`gnome.diagnostics`
 ------------------------------------
-``diagnostics`` is continuous and cheap: it reads state the optimizer already
-maintains, so it runs every N steps for free, but its ``rho_proxy`` is a
-Kronecker-model estimate that clamps to a useless 0.0 whenever the model is
-cold. This is occasional and expensive — one backward per residual entry — and
-exact. Use both: ``rho_proxy`` for the shape of the curve, ``measure_rho`` for
-the number.
+opt.get_diagnostics() reads persistent optimizer state on demand and reports
+LM damping by default. It does not measure basis quality. measure_rho performs
+an occasional, expensive measurement — one backward per residual entry — to
+quantify the off-diagonal curvature directly.
 
 Cost and scaling
 ----------------

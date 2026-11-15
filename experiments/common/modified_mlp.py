@@ -1,7 +1,7 @@
 """Modified MLP (Wang, Teng & Perdikaris 2021) — shared by the PINN benchmarks.
 
 Single source of truth for the gated architecture used by ``allen_cahn``,
-``kdv``, ``kuramoto_sivashinsky``, ``ldc`` and ``wave``. Each of those files
+``kdv`` and ``wave``. Each of those files
 supplies its own input embedding and (where needed) an output transform; the
 trunk lives here so the encoder layout stays identical across benchmarks.
 
@@ -42,25 +42,14 @@ is an open experiment, not a recommendation.
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
-class ConcatEmbed(nn.Module):
-    """``[c₁, …, c_n]`` — the raw coordinates, concatenated. No parameters.
-
-    The identity embedding, for problems with no periodicity to encode.
-    """
-
-    def __init__(self, n_coords: int):
-        super().__init__()
-        self.out_dim = n_coords
-
-    def forward(self, *coords: torch.Tensor) -> torch.Tensor:
-        return torch.cat(coords, dim=1)
+from experiments.common.embedding_layers import ConcatEmbedding
 
 
 class ModifiedMLP(nn.Module):
@@ -307,7 +296,7 @@ class MLP(nn.Module):
     :class:`ModifiedMLP` — ``embed`` exposes ``out_dim`` and takes the
     problem's coordinates positionally, ``out_transform(out, *coords)``
     imposes a hard BC — so the two are drop-in swappable behind an ``--arch``
-    flag. Use :class:`ConcatEmbed` where the old local class did a bare
+    flag. Use :class:`ConcatEmbedding` where the old local class did a bare
     ``torch.cat``.
 
     ``depth`` counts affine layers, matching every call site it replaces:
@@ -433,6 +422,10 @@ class FusedModifiedMLP(nn.Module):
             out = self.out_transform(out, *coords)
         return out
 
+
+class Sin(nn.Module):
+    def forward(self, x):
+        return torch.sin(x)
 
 class AllFusedExperimental(nn.Module):
     """Plain MLP whose parameters are packed into one near-square tensor.

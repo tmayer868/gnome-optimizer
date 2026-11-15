@@ -1,0 +1,107 @@
+"""Settings for experiments.pinns.wave_pinn. Edit CONFIG, then run the module.
+
+None keeps an existing automatic/default-dependent setting where supported.
+"""
+
+CONFIG = {
+    # Choices: 'adamw', 'soap', 'gnome', 'soap+ssbroyden', 'engdw'.
+    'optimizer': 'gnome',
+    # arch fused only: consecutive hidden layers per parameter tensor. 1 = one tensor per layer,
+    # the control every larger value is compared against (identical function and initialization,
+    # only the grouping differs). 0 (default) fuses the whole stack. depth 4 leaves only k=2
+    # hidden layers to group, so raise depth to give this room.
+    'fuse_every': 2,
+    # Spatial mode number m of the second component: the solution is sin(pi x)cos(c pi t) + A
+    # sin(m pi x)cos(c m pi t). Any m solves the same PDE with the same Dirichlet BCs, so this
+    # changes ONLY which harmonic sits on top of the fundamental. 4 (default) is jaxpi's
+    # benchmark, giving sin(4 pi x)cos(8 pi t); 3 is the Double-PINN paper's, giving sin(3 pi
+    # x)cos(6 pi t). Lower m is an easier target — less high-frequency content for the network to
+    # resolve — so runs at different m are NOT comparable to each other, only to the paper that
+    # uses that m.
+    'second_mode': 4.0,
+    # Network: plain tanh MLP or the gated modified MLP. Choices: 'mlp', 'modified', 'fused',
+    # 'fused-modified'.
+    'arch': 'mlp',
+    # Enforce Dirichlet u=0 by construction via u = sin(πx)·N(t,x); drops the soft bc loss block.
+    'hard_bc': False,
+    'weights': [5e-4, 1.0, 1.0, 1.0],  # [pde, displacement IC, velocity IC, Dirichlet BC]
+    # The Dirichlet BC weight is ignored when hard_bc=True.
+    'seed': 0,
+    'steps': 200000,
+    'n_pde': 6000,
+    # IC points (shared by the displacement and velocity IC blocks).
+    'n_ic': 2000,
+    'n_bc': 200,
+    # Network width.
+    'hidden': 128,
+    # Network depth: Linear-layer count for arch mlp, number of gated hidden layers for arch
+    # modified.
+    'depth': 10,
+    # Log Gnome's internal state — curvature spectrum, LM damping, trust-region usage — every N
+    # steps to a sibling runs/.../{run_id}.diag.jsonl. 0 (default) disables it entirely. Gnome
+    # only: SOAP and AdamW expose no such hook.
+    'diagnostics_every': 0,
+    # Comma-separated parameter indices to log, e.g. '0,4'. Default logs every parameter, which
+    # is one record per tensor per logged step — narrow it to keep the file readable.
+    'diagnostics_params': None,
+    'log_every': 200,
+    'runs_dir': 'runs',
+    'quiet': False,
+    # Each optimizer keeps its own hyperparameters and learning-rate schedule.
+    'optimizers': {
+        'adamw': {
+            'lr': 0.001,
+            'weight_decay': 1e-08,
+            'warmup_steps': 200,
+            'cosine_decay': 0.0,
+        },
+        'soap': {
+            'lr': 0.001,
+            'beta1': 0.99,
+            'beta2': 0.999,
+            'weight_decay': 1e-08,
+            'warmup_steps': 200,
+            'cosine_decay': 0.0,
+        },
+        'gnome': {
+            'partition_residuals': False,
+            'aux_frac': 0.1,
+            'lr': 0.007,
+            'trust_region': 0.15,
+            'eps': 1e-12,
+            'beta1': 0.95,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
+            'warmup_steps': 200,
+            'cosine_decay': 0.1,
+        },
+        'soap+ssbroyden': {
+            'lr': 0.001,
+            'beta1': 0.99,
+            'beta2': 0.999,
+            'weight_decay': 1e-08,
+            'warmup_steps': 200,
+            'cosine_decay': 0.0,
+            'soap_steps': 30000,
+            'ssbroyden_lr': 1.0,
+            'ssbroyden_tolerance_grad': 1e-10,
+        },
+        'engdw': {
+            'lr': 0.05,
+            'engdw_damping': 1e-06,
+            'engdw_momentum': 0.0,
+            'engdw_line_search': True,
+            'engdw_chunk': 32,
+            'engdw_fixed': False,
+        },
+    },
+    # Input features: 'none', 'periodic', or 'fourier'.
+    'embedding': 'none',
+    # Even number of random Fourier features.
+    'embed_dim': 196,
+    # Initial standard deviation of the frozen Fourier projection.
+    'embed_scale': 1.5,
+    'fixed_dataset': False,
+    'fix_after': None,
+    'float64': False,
+}
