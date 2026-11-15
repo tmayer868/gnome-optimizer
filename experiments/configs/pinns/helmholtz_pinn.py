@@ -4,7 +4,7 @@ None keeps an existing automatic/default-dependent setting where supported.
 """
 
 CONFIG = {
-    # Choices: 'gnome', 'soap', 'adamw', 'adamw+lbfgs'.
+    # Choices: 'adamw', 'soap', 'gnome', 'soap+ssbroyden', 'engdw'.
     'optimizer': 'gnome',
     'seed': 0,
     'steps': 20000,
@@ -26,14 +26,12 @@ CONFIG = {
     # Fourier embedding modes M; input width is 4M. Paper uses M=1 for low frequency and M=10 for
     # the k=10/100 rungs (depth 7 modes 10 -> 5911 params). Ignored when embedding raw.
     'modes': 1,
-    # fourier: periodic input features, BCs hold exactly, single-block PDE-only loss (the paper's
-    # setup). raw: feed (x,y) directly — periodicity is then NOT enforced, so a BC block is
-    # required (see bc) or the problem is ill-posed. Choices: 'fourier', 'raw'.
-    'embedding': 'fourier',
-    # Boundary treatment. auto = none with embedding fourier, dirichlet with raw. Set explicitly
-    # to get the off-diagonal combinations: `embedding fourier bc dirichlet` adds a BC block
-    # while keeping the embedding, which is the clean single-variable ablation (embedding fixed,
-    # block count changed). Choices: 'auto', 'none', 'dirichlet'.
+    # periodic: deterministic spatial harmonics; fourier: random Fourier projection;
+    # none: raw coordinates. The periodic options satisfy periodic BCs exactly.
+    # Input features: 'none', 'periodic', or 'fourier'.
+    'embedding': 'periodic',
+    # auto uses no BC block with periodic features and Dirichlet BCs with none.
+    # Explicit 'dirichlet' retains the BC loss with any embedding.
     'bc': 'auto',
     # Boundary points per step when the BC block is on.
     'n_bc': 1000,
@@ -58,71 +56,55 @@ CONFIG = {
     'quiet': False,
     # Each optimizer keeps its own hyperparameters and learning-rate schedule.
     'optimizers': {
-        'gnome': {
-            # Aux batch size for Gnome is max(8, int(n_pde * aux_frac)). Each aux pass is a full second-
-            # order residual eval, so this is not free — keep small.
-            'aux_frac': 0.03,
+        'adamw': {
             'lr': 0.001,
-            # Gnome l2 trust radius: lambda is set to the smallest value >= eps with
-            # ||m_hat/(v_hat+lambda)||_2 <= this * sqrt(P), i.e. a bound on the RMS per-coordinate step.
-            # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain
-            # m_hat/(v_hat+eps) damping.
-            'trust_region': 1.0,
-            # Gnome curvature-damping epsilon in m_hat/(v_hat+eps): larger -> more gradient-descent-like,
-            # smaller -> fuller Newton step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.
-            'eps': 1e-6,
-            # First-moment (momentum) EMA for Gnome and SOAP.
-            'beta1': 0.9,
-            # Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.
-            'beta2': 0.99,
-            'weight_decay': 1e-8,
-            # Linear LR warmup steps, applied to every optimizer.
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Gnome (MSE) never decays regardless.
             'cosine_decay': 0.0,
         },
         'soap': {
             'lr': 0.001,
-            # First-moment (momentum) EMA for Gnome and SOAP.
             'beta1': 0.9,
-            # Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.
             'beta2': 0.99,
-            'weight_decay': 1e-8,
-            # Linear LR warmup steps, applied to every optimizer.
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Gnome (MSE) never decays regardless.
             'cosine_decay': 0.0,
         },
-        'adamw': {
+        'gnome': {
+            'aux_frac': 0.03,
             'lr': 0.001,
-            'weight_decay': 1e-8,
-            # Linear LR warmup steps, applied to every optimizer.
+            'trust_region': 1.0,
+            'eps': 1e-06,
+            'beta1': 0.9,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Gnome (MSE) never decays regardless.
             'cosine_decay': 0.0,
         },
-        'adamw+lbfgs': {
+        'soap+ssbroyden': {
             'lr': 0.001,
-            'weight_decay': 1e-8,
-            # Linear LR warmup steps, applied to every optimizer.
+            'beta1': 0.9,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Gnome (MSE) never decays regardless.
             'cosine_decay': 0.0,
-            # Outer L-BFGS steps after the AdamW phase (optimizer adamw+lbfgs only). Each outer step runs
-            # up to lbfgs_max_iter inner iterations, so the total budget is lbfgs_steps * lbfgs_max_iter.
-            # Runs on a single fixed collocation batch. 0 skips the phase.
-            'lbfgs_steps': 500,
-            # Inner iterations per L-BFGS outer step. Must be >1: the strong-Wolfe line search cannot
-            # recover from a cold identity Hessian in one iteration and stalls. adamw+lbfgs only.
-            'lbfgs_max_iter': 20,
-            # L-BFGS history size (stored curvature pairs). adamw+lbfgs only.
-            'lbfgs_history': 50,
-            # L-BFGS step scale; with a strong-Wolfe line search 1.0 is standard. adamw+lbfgs only.
-            'lbfgs_lr': 1.0,
+            'soap_steps': 10000,
+            'ssbroyden_lr': 1.0,
+            'ssbroyden_tolerance_grad': 1e-10,
+        },
+        'engdw': {
+            'lr': 0.05,
+            'engdw_damping': 1e-06,
+            'engdw_momentum': 0.0,
+            'engdw_line_search': True,
+            'engdw_chunk': 32,
+            'engdw_fixed': False,
         },
     },
+    # Even number of random Fourier features.
+    'embed_dim': 32,
+    # Initial standard deviation of the frozen Fourier projection.
+    'embed_scale': 1.0,
+    'fixed_dataset': False,
+    'fix_after': None,
 }

@@ -33,7 +33,7 @@ Set ``fix_after=N`` to resample for N steps, then reuse PDE/IC/BC points.
 ``None`` preserves default sampling; ``fixed_dataset=True`` overrides the delay.
 SS-Broyden hybrids freeze no later than their optimizer handoff.
 
-``--embed periodic`` is an ablation that feeds [t, cos(x), sin(x)]. It makes
+``embedding periodic`` is an ablation that feeds [t, cos(x), sin(x)]. It makes
 the BC exact and drops that residual block. It is not the published setup and
 slightly changes the function class: the Gaussian agrees in value at the two
 endpoints but its periodic extension is not C1 there. The PDE contains no
@@ -81,13 +81,15 @@ from experiments.common import (
     ConcatEmbedding,
     PeriodicEmbedding,
 )
-from experiments.common.ssbroyden import (
-    build_gnome_phase, build_soap_phase, build_ssbroyden_phase,
+from experiments.baselines.ssbroyden import (
+    build_soap_phase, build_ssbroyden_phase,
     validate_ssbroyden, warm_start_steps,
 )
 from experiments.common.sampling import sample_aux_from_batch
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
 
+
+from experiments.common import pinn_options as pinn
 
 EXPERIMENT = "reaction_pinn"
 
@@ -122,12 +124,9 @@ def exact_solution(
 # ========================= Models =========================
 
 
-def build_embedding(name: str) -> nn.Module:
-    if name == "none":
-        return ConcatEmbedding(2)
-    if name == "periodic":
-        return PeriodicEmbedding(2, wavenumber=1.0)
-    raise ValueError(f"unknown embedding: {name}")
+def build_embedding(name: str, embed_dim: int = 32, embed_scale: float = 1.0) -> nn.Module:
+    return pinn.build_embedding(name, 2, spatial_dims=(1,), length=X_MAX - X_MIN,
+                                periodic=True, embed_dim=embed_dim, embed_scale=embed_scale)
 
 
 def build_model(
@@ -416,7 +415,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     if (args.optimizer == "gnome" and (args.fixed_dataset or args.fix_after is not None)
             and not 0 < args.aux_frac <= 1):
         p.error("fixed_dataset or fix_after requires aux_frac in (0,1] for Gnome")
-    if args.optimizer in ("soap+ssbroyden", "gnome+ssbroyden"):
+    if args.optimizer == "soap+ssbroyden":
         try:
             validate_ssbroyden(args)
         except ValueError as error:
@@ -424,8 +423,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
+@pinn.preserve_default_dtype
 def train(args: argparse.Namespace) -> str:
-    hybrid = args.optimizer in ("soap+ssbroyden", "gnome+ssbroyden")
+    hybrid = args.optimizer == "soap+ssbroyden"
     warm_start = args.optimizer.split("+")[0]
     is_gnome = warm_start == "gnome"
     phase_steps = warm_start_steps(args) if hybrid else args.steps
@@ -472,10 +472,10 @@ def train(args: argparse.Namespace) -> str:
             device = torch.device("cpu")
     torch.manual_seed(args.seed)
 
-    use_bc = args.embed != "periodic"
+    use_bc = args.embedding not in ("periodic", "fourier")
     model = build_model(
         args.arch,
-        build_embedding(args.embed),
+        build_embedding(args.embedding, args.embed_dim, args.embed_scale),
         args.hidden,
         args.depth,
         args.fuse_every,
@@ -500,8 +500,6 @@ def train(args: argparse.Namespace) -> str:
             energy="0.5 * sum(block MSEs)", residual_scaling="1/sqrt(N_block)",
         )
         scheduler = None
-    elif args.optimizer == "gnome+ssbroyden":
-        opt, opt_cfg, scheduler = build_gnome_phase(model, args, build_optimizer)
     elif hybrid:
         opt, opt_cfg, scheduler = build_soap_phase(model, args)
     else:
@@ -526,6 +524,7 @@ def train(args: argparse.Namespace) -> str:
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
+        **pinn.metadata(args),
         "optimizer": args.optimizer,
         "partition_residuals": is_gnome and args.partition_residuals,
         "basis_transport": args.basis_transport if is_gnome else None,
@@ -533,7 +532,7 @@ def train(args: argparse.Namespace) -> str:
         "rho": args.rho,
         "arch": args.arch,
         "fuse_every": getattr(model, "chunks", None),
-        "embed": args.embed,
+        "embed": args.embedding,
         "blocks": ["pde", "ic", "bc"] if use_bc else ["pde", "ic"],
         "weights": list(args.weights),
         "hidden": args.hidden,
@@ -587,7 +586,7 @@ def train(args: argparse.Namespace) -> str:
         print(
             f"[{EXPERIMENT}] {args.optimizer} | rho={args.rho:g} | "
             f"arch={args.arch} {args.depth}x{args.hidden} | "
-            f"embed={args.embed} | params={n_params:,} | device={device} | "
+            f"embed={args.embedding} | params={n_params:,} | device={device} | "
             f"dtype={torch.get_default_dtype()}\n"
             f"  blocks={blocks} | N_pde={args.n_pde} | steps={args.steps} | "
             f"sampling={hyperparameters['sampling']}",

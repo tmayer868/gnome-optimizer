@@ -4,7 +4,7 @@ None keeps an existing automatic/default-dependent setting where supported.
 """
 
 CONFIG = {
-    # Choices: 'gnome', 'soap', 'adamw', 'engdw'.
+    # Choices: 'adamw', 'soap', 'gnome', 'soap+ssbroyden', 'engdw'.
     'optimizer': 'gnome',
     'seed': 0,
     # Use double precision for training and evaluation; falls back to CPU on MPS, which has no
@@ -38,64 +38,56 @@ CONFIG = {
     'quiet': False,
     # Each optimizer keeps its own hyperparameters and learning-rate schedule.
     'optimizers': {
-        'gnome': {
-            # Aux batch sizes for Gnome are max(K_min, int(N * aux_frac)) per block. Each aux pass is a
-            # full higher-order residual eval, so this is not free — keep small.
-            'aux_frac': 0.10,
-            'lr': 1e-2,
-            # Gnome per-coordinate update bound: lambda is set to the smallest value with
-            # max|m̂/(v̂+lambda)| <= this, so no coordinate moves more than lr*trust_region in a step.
-            # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain m̂/(v̂+eps)
-            # damping.
-            'trust_region': .03,
-            # Gnome curvature-damping epsilon in m̂/(v̂+eps): larger -> more gradient-descent-like,
-            # smaller -> fuller Newton step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.
-            'eps': 1e-12,
-            # First-moment (momentum) EMA for Gnome and SOAP.
-            'beta1': 0.99,
-            # Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.
-            'beta2': 0.99,
-            'weight_decay': 1e-8,
-            # Linear LR warmup for Gnome/SOAP/AdamW; ignored by ENGD-W.
+        'adamw': {
+            'lr': 0.001,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Ignored by ENGD-W.
-            'cosine_decay': 0.10,
+            'cosine_decay': 0.0,
         },
         'soap': {
             'lr': 0.001,
-            # First-moment (momentum) EMA for Gnome and SOAP.
             'beta1': 0.9,
-            # Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.
             'beta2': 0.99,
-            'weight_decay': 1e-8,
-            # Linear LR warmup for Gnome/SOAP/AdamW; ignored by ENGD-W.
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Ignored by ENGD-W.
             'cosine_decay': 0.0,
         },
-        'adamw': {
-            'lr': 0.001,
-            'weight_decay': 1e-8,
-            # Linear LR warmup for Gnome/SOAP/AdamW; ignored by ENGD-W.
+        'gnome': {
+            'aux_frac': 0.1,
+            'lr': 0.01,
+            'trust_region': 0.03,
+            'eps': 1e-12,
+            'beta1': 0.99,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Ignored by ENGD-W.
+            'cosine_decay': 0.1,
+        },
+        'soap+ssbroyden': {
+            'lr': 0.001,
+            'beta1': 0.9,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
+            'warmup_steps': 200,
             'cosine_decay': 0.0,
+            'soap_steps': 30000,
+            'ssbroyden_lr': 1.0,
+            'ssbroyden_tolerance_grad': 1e-10,
         },
         'engdw': {
-            # ENGD-W fixed damping in J J^T + lambda I; no weight decay or schedule.
-            'engdw_damping': 1e-6,
-            # ENGD-W regularization-center momentum in [0,1).
+            'engdw_damping': 1e-06,
             'engdw_momentum': 0.0,
-            # Same-batch grid line search over [1e-3,1], overriding lr.
             'engdw_line_search': False,
-            # Per-point Jacobian vmap chunk size; the exact solve still uses all rows.
             'engdw_chunk': 32,
-            # ENGD-W-only compatibility alias for fixed_dataset.
             'engdw_fixed': False,
             'lr': 0.001,
         },
     },
+    # Input features: 'none', 'periodic', or 'fourier'.
+    'embedding': 'none',
+    # Even number of random Fourier features.
+    'embed_dim': 32,
+    # Initial standard deviation of the frozen Fourier projection.
+    'embed_scale': 1.0,
+    'fix_after': None,
 }

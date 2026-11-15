@@ -24,9 +24,9 @@ Two architectures, selectable via ``--arch``:
   The multi-block loss is the same plain ``gnome.stack_residuals``
   pattern with configurable block weights (equal by default).
 
-Four input embeddings, selectable via ``--embed`` (all architectures):
+Three input embeddings, selectable via ``embedding`` (all architectures):
 
-* ``none`` (default) feeds raw ``[t, x]`` and the periodic BC is imposed
+* ``none`` feeds raw ``[t, x]`` and the periodic BC is imposed
   *softly*, as a third residual block matching ``u`` and ``u_x`` across
   the endpoints.
 * ``periodic`` feeds ``[t, cos(πx), sin(πx)]``, which makes the network
@@ -34,13 +34,10 @@ Four input embeddings, selectable via ``--embed`` (all architectures):
   machine precision for ``u`` and *every* x-derivative, so the soft BC
   block is redundant and is **dropped** (two blocks instead of three).
   This is how jaxpi imposes exact periodic BCs for Allen-Cahn.
-* ``polynomial`` feeds ``[t, 1-x², x(1-x²)]``. Endpoint values match
-  exactly, but endpoint spatial derivatives need not, so it keeps the
-  soft BC block (three blocks).
 * ``fourier`` first maps to ``z = [t, cos(πx), sin(πx)]``, then feeds
-  ``[z, sin(zB), cos(zB)]`` to the network. ``B`` is a *trainable* matrix
+  ``[z, sin(zB), cos(zB)]`` to the network. ``B`` is a frozen random matrix
   initialized ``~ N(0, scale²)``, sized by ``embed_dim`` and ``embed_scale``.
-  Learned Fourier features retain exact period-2 spatial periodicity,
+  Fourier features retain exact period-2 spatial periodicity,
   including derivatives, so the soft BC block is **dropped**. ``embed_dim``
   counts the Fourier features; the three periodic input features are added.
 
@@ -71,15 +68,13 @@ Usage:
     uv run -m experiments.pinns.allen_cahn_pinn
     # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='soap', arch='mlp'
     uv run -m experiments.pinns.allen_cahn_pinn
-    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', embed='fourier', embed_dim=32, embed_scale=10.0
+    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', embedding='fourier', embed_dim=32, embed_scale=10.0
     uv run -m experiments.pinns.allen_cahn_pinn
     # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', diagnostics_every=500, diagnostics_params='0'
     uv run -m experiments.pinns.allen_cahn_pinn
     # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='adamw', arch='modified'
     uv run -m experiments.pinns.allen_cahn_pinn
-    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', embed='periodic'
-    uv run -m experiments.pinns.allen_cahn_pinn
-    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', embed='polynomial'
+    # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', embedding='periodic'
     uv run -m experiments.pinns.allen_cahn_pinn
     # Edit experiments/configs/pinns/allen_cahn_pinn.py: optimizer='gnome', float64_after=30000
     uv run -m experiments.pinns.allen_cahn_pinn
@@ -103,7 +98,7 @@ import torch.autograd as autograd
 import torch.nn as nn
 
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
-from experiments.common.ssbroyden import (
+from experiments.baselines.ssbroyden import (
     build_soap_phase, build_ssbroyden_phase, validate_ssbroyden,
 )
 from experiments.common.precision import switch_to_float64
@@ -130,6 +125,8 @@ from experiments.reference_solutions import (
     cached_reference_path,
 )
 
+
+from experiments.common import pinn_options as pinn
 
 EXPERIMENT = "allen_cahn_pinn"
 
@@ -170,7 +167,7 @@ class MLP(_SharedMLP):
 
 def build_model(arch: str, embed: nn.Module, hidden: int, depth: int,
                 fuse_every: int = 0) -> nn.Module:
-    """``(t, x) → u``. The input embedding is whatever ``--embed`` selects.
+    """``(t, x) → u``. The input embedding is whatever ``embedding`` selects.
 
     ``fused`` and ``fused-modified`` are the same function classes as ``mlp``
     and ``modified`` respectively — they differ only in how the weights are
@@ -472,12 +469,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
-
+@pinn.preserve_default_dtype
 def train(args: argparse.Namespace) -> str:
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(
         torch.float64 if (args.float64 or args.float64_after == 0 or
-                          (args.optimizer == "soap+ssbroyden" and args.soap_steps == 0))
+                          (args.optimizer == "soap+ssbroyden" and args.soap_steps == 0)
+                          or args.optimizer == "engdw")
         else torch.float32
     )
     try:
@@ -505,13 +503,16 @@ def _train(args: argparse.Namespace) -> str:
     # Both periodic embeddings satisfy the BC block by construction, including
     # after training the Fourier projection.
     # 'polynomial' matches endpoint values but still needs derivative matching.
-    use_bc = args.embed not in ("periodic", "fourier")
+    use_bc = args.embedding not in ("periodic", "fourier")
     model = build_model(
         args.arch,
-        build_embedding(args.embed, args.embed_dim, args.embed_scale),
+        build_embedding(args.embedding, args.embed_dim, args.embed_scale),
         args.hidden, args.depth, args.fuse_every,
     ).to(device)
-    if hybrid:
+    if args.optimizer == "engdw":
+        residual_fn = lambda model, batch: stacked_residuals(model, batch, use_bc, args.weights)
+        opt, opt_cfg, scheduler = pinn.build_extra_optimizer(model, args, residual_fn)
+    elif hybrid:
         opt, opt_cfg, scheduler = build_soap_phase(model, args, precondition_frequency=1)
     else:
         opt, opt_cfg, scheduler = build_optimizer(
@@ -523,7 +524,7 @@ def _train(args: argparse.Namespace) -> str:
             basis_transport=args.basis_transport,
         )
 
-    fixed_from_step = 0 if args.fixed_dataset else args.fix_after
+    fixed_from_step = 0 if args.fixed_dataset or args.engdw_fixed else args.fix_after
     if hybrid:
         fixed_from_step = (args.soap_steps if fixed_from_step is None
                            else min(fixed_from_step, args.soap_steps))
@@ -539,6 +540,7 @@ def _train(args: argparse.Namespace) -> str:
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
+        **pinn.metadata(args),
         "optimizer": args.optimizer,
         "partition_residuals": args.optimizer == "gnome" and args.partition_residuals,
         "basis_transport": args.basis_transport if args.optimizer == "gnome" else None,
@@ -547,9 +549,9 @@ def _train(args: argparse.Namespace) -> str:
         # both mean "one chunk", and the sweep needs those runs to compare
         # equal. None for the archs that have no such grouping.
         "fuse_every": getattr(model, "chunks", None),
-        "embed": args.embed,
-        "embed_dim": args.embed_dim if args.embed == "fourier" else None,
-        "embed_scale": args.embed_scale if args.embed == "fourier" else None,
+        "embed": args.embedding,
+        "embed_dim": args.embed_dim if args.embedding == "fourier" else None,
+        "embed_scale": args.embed_scale if args.embedding == "fourier" else None,
         "blocks": ["pde", "ic", "bc"] if use_bc else ["pde", "ic"],
         "weights": list(args.weights),
         # Non-zero means a sibling {run_id}.diag.jsonl exists for this run.
@@ -563,7 +565,7 @@ def _train(args: argparse.Namespace) -> str:
         "n_pde_aux": n_pde_aux,
         "n_ic_aux": n_ic_aux,
         "n_bc_aux": n_bc_aux,
-        "fixed_dataset": args.fixed_dataset,
+        "fixed_dataset": args.fixed_dataset or args.engdw_fixed,
         "fix_after": args.fix_after,
         "fixed_from_step": fixed_from_step,
         "sampling": sampling,
@@ -613,7 +615,7 @@ def _train(args: argparse.Namespace) -> str:
         blocks = "pde+ic+bc" if use_bc else "pde+ic (exact periodic BC)"
         print(
             f"[{EXPERIMENT}] {args.optimizer} | arch={args.arch} "
-            f"{args.depth}x{args.hidden} | embed={args.embed} | "
+            f"{args.depth}x{args.hidden} | embed={args.embedding} | "
             f"params={n_params:,} | device={device} | "
             f"dtype={torch.get_default_dtype()}\n"
             f"  N_pde={args.n_pde} N_ic={args.n_ic} N_bc={args.n_bc} | "
@@ -698,6 +700,8 @@ def _train(args: argparse.Namespace) -> str:
                     residual_partition_sizes(aux_batch, use_bc) if args.partition_residuals else None
                 ),
             )
+        elif args.optimizer == "engdw":
+            loss = opt.step(main_batch)
         elif quasi_newton:
             def closure():
                 opt.zero_grad()
@@ -722,7 +726,7 @@ def _train(args: argparse.Namespace) -> str:
         if scheduler is not None:
             scheduler.step()
 
-        loss_val = float(loss.detach().item())
+        loss_val = float(loss.detach().item()) if torch.is_tensor(loss) else float(loss)
         if diverged(loss_val):
             run.finish(completed=False, diverged=True, diverged_step=step)
             if diag is not None:
@@ -737,7 +741,7 @@ def _train(args: argparse.Namespace) -> str:
 
         should_log = args.log_every and (step + 1) % args.log_every == 0
         at_handoff = hybrid and step + 1 == args.soap_steps
-        if should_log or (hybrid and step + 1 == args.steps) or at_handoff:
+        if should_log or step + 1 == args.steps or at_handoff:
             tl = term_losses(
                 model, sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
             )

@@ -377,12 +377,6 @@ reference download. Final-step evaluation runs even when `log_every=0`.
 existing Gnome surrogate with a finite EMA history of raw matrix gradients
 and an exact damped Woodbury solve per parameter tensor:
 
-```bash
-# Edit experiments/configs/pinns/poisson_pinn.py: optimizer='woodbury', fixed_dataset=True, hidden=8, depth=3, n_pde=32, n_bc_per_edge=4, steps=300, float64=True, diagnostics_every=50, log_every=50
-# In CONFIG["optimizers"]['woodbury']: aux_frac=0.5, lr=0.001, woodbury_damping=0.1, beta2=0.9, warmup_steps=0, cosine_decay=1.0
-uv run -m experiments.pinns.poisson_pinn
-```
-
 Import it as `from gnome.experimental import WoodburyGGN`. The defaults are
 `beta1=0`, `beta2=0.99`, `damping=1e-3`, and `history_tol=0.01` (459 samples
 per tensor). `max_history` overrides the derived window; `gram_float64`
@@ -408,63 +402,6 @@ uv run -m experiments.pinns.reaction_pinn
 This baseline uses float64 and fixed damping, with either a fixed learning rate
 or a same-batch grid line search. See [the comparison protocol](docs/reaction_engdw.md)
 for residual normalization, settings matching the Gnome run, and validation.
-
-**Convection across a parameter range, then fine-tuning:**
-
-```bash
-uv run -m experiments.pinns.convection_family_pinn --optimizer gnome \
-    --beta-range 1 200 --beta 200 \
-    --stage1-steps 30000 --stage2-steps 20000 --cosine-decay 1
-```
-
-Both stage arguments enable a model with inputs `(t, x, beta)`, with beta
-normalized to `[-1, 1]` using the fixed range bounds. Stage 1 samples beta uniformly
-across the range for every PDE, initial-condition, and boundary-condition point.
-Stage 2 fixes beta at the target. Optimizer state carries across the transition;
-one LR schedule spans the sum of the stage budgets, which replace `steps`.
-The example uses warmup then constant LR; omit `cosine_decay=1` for cosine decay
-over the full run. Either stage budget can be zero for a control run.
-
-In staged mode, the default range is `[1, 200]` and default target is `200`.
-The original `(t, x)` benchmark remains in `experiments.pinns.convection_pinn`,
-with its beta default of `40`. Family runs write to `runs/convection_family_pinn/`. Logs identify each stage; `rel_l2` and PDE/IC/BC validation losses always
-refer to the target. Additional `rel_l2_beta_*` metrics score the endpoints and
-midpoint, including at the stage transition and final step. Training loss in stage 1
-averages over the family, while stage 2 training loss covers only the target.
-
-**2D complex Ginzburg–Landau, trained globally in time:**
-
-```bash
-uv run --extra experiments -m experiments.pinns.ginzburg_landau \
-    --optimizer gnome --time-interval 0.2 --depth 5 --hidden 128 \
-    --n-pde 8192 --n-ic 2048 --steps 100000
-```
-
-One two-output shared MLP solves the entire physical interval `[time_start,T]`
-at once. `--time-interval` sets the upper bound (default `1.0`); `--time-start`
-sets the lower bound (default `0.0`), with `0 <= time_start < T <= 1`.
-For example, `--time-start 0.4 --time-interval 0.8` trains on `[0.4,0.8]`,
-using the cached reference at t=0.4 as its initial condition. Both spatial
-directions use the shared hard periodic embedding. The objective is the sum
-of the four block MSEs `pde_u`, `pde_v`, `ic_u`, `ic_v`. Choose `gnome`, `soap`,
-`adamw`, `adam`, or `engdw`. `width` aliases `hidden`; depth counts affine
-layers, so depth 5 means four hidden layers and the output layer.
-
-`ic_weight` sets a fixed weight on both IC blocks:
-`loss = pde + ic_weight * ic`. It defaults to `1.0`; try `ic_weight=10` or
-`ic_weight=100` to emphasize the initial condition. All optimizers use this
-same weighted objective, including Gnome's curvature pass and ENGD-W's solve.
-Logged `ic`, `ic_u`, and `ic_v` remain unweighted; `ic_weighted` and `objective`
-report the weighted IC contribution and total validation objective.
-
-A separately generated complex128 Fourier/ETDRK4 reference is cached over
-`[0,1]` and reused across horizons. Chunked evaluation reports combined-complex
-`rel_l2` plus `rel_l2_u` and `rel_l2_v`. `log_every` controls residual logging;
-`eval_every` controls the more expensive relative errors (default 200).
-The final step always reports both. Runs also save field comparisons at five
-times, amplitude and wrapped-phase errors, and training curves. Use `--no-plots`
-for a diagnostic run. See [benchmark details](docs/ginzburg_landau.md) for
-reference validation, precision options, and a horizon sweep.
 
 **WikiText-103 GPT** (needs the `llm` extra + a GPU; downloads the dataset on first run):
 
@@ -640,11 +577,10 @@ runs/            JSONL run artifacts (git-ignored)
 
 MIT — see [`LICENSE`](LICENSE).
 
-Reaction and convection also support top-level `fix_after=N`: resample for N
-steps, then keep the training batch. `None` preserves default sampling;
-`fixed_dataset=True` fixes from the start. SS-Broyden hybrids always freeze
-by the optimizer handoff.
-
-SOAP + SS-Broyden and Gnome + SS-Broyden are available for convection and reaction
-through the optional Scimba backend. See [setup and SOAP pilots](docs/soap_ssbroyden.md)
-and [Gnome warm starts and paired results](docs/gnome_ssbroyden.md).
+All runnable PINN experiments share optimizer choices `adamw`, `soap`, `gnome`,
+`soap+ssbroyden`, and `engdw`; `embedding` choices `periodic`, `fourier`, and
+`none`; plus `fix_after`, `fixed_dataset`, and float64 selection. See
+[shared PINN options](docs/pinn_options.md) and
+[SS-Broyden setup and SOAP pilots](docs/soap_ssbroyden.md).
+The [historical Gnome warm-start comparison](docs/gnome_ssbroyden.md) remains
+available as a record of earlier runs.

@@ -23,7 +23,7 @@ Two architectures, selectable via ``--arch``:
   none of the rest of the jaxpi pipeline (random weight factorization,
   Fourier features, causal weighting, grad-norm balancing) is ported.
 
-Both architectures accept ``--embed periodic|none``. The default ``periodic``
+Both architectures accept ``embedding periodic|none``. The default ``periodic``
 uses ``[t, cos(πx), sin(πx)]``, enforcing period-2 spatial periodicity on
 ``[-1, 1]``. ``none`` feeds raw ``[t, x]``. Both retain the PDE, IC, and BC
 blocks with configurable weights (equal by default) via ``gnome.stack_residuals``; the BC block enforces
@@ -36,13 +36,9 @@ optimizer. Every optimizer gets the same linear-warmup + cosine-decay schedule
 constant, which suits Gnome on MSE since its step self-anneals as the
 residual shrinks).
 
-``--optimizer adamw+lbfgs`` is the classic PINN recipe (and the paper's
-real first-order baseline — nobody runs Adam alone): the Adam phase runs
-for ``--steps`` as usual, then an L-BFGS phase (``--lbfgs-steps``) refines
-on a *fixed, full-batch* collocation set. L-BFGS builds a curvature history
-from a sequence of (grad, step) pairs, which is only meaningful if the
-objective is the same function each iteration — so, unlike the Adam phase,
-its points are drawn once and held constant.
+The optimizer choices are AdamW, SOAP, Gnome, SOAP + SS-Broyden, and
+ENGD-W. The hybrid freezes one complete batch at the handoff and refines the
+same weighted objective with a strong-Wolfe line search.
 
 ``--mu-sq`` controls the dispersive coefficient and defaults to ``0.022²``,
 the JAX-PI benchmark value. That default uses the common static ``kdv.mat``
@@ -56,9 +52,9 @@ Usage:
     uv run -m experiments.pinns.kdv_pinn
     # Edit experiments/configs/pinns/kdv_pinn.py: optimizer='soap', arch='mlp'
     uv run -m experiments.pinns.kdv_pinn
-    # Edit experiments/configs/pinns/kdv_pinn.py: optimizer='gnome', embed='none'
+    # Edit experiments/configs/pinns/kdv_pinn.py: optimizer='gnome', embedding='none'
     uv run -m experiments.pinns.kdv_pinn
-    # Edit experiments/configs/pinns/kdv_pinn.py: optimizer='adamw+lbfgs', arch='modified'
+    # Edit experiments/configs/pinns/kdv_pinn.py: optimizer='soap+ssbroyden', arch='modified'
     uv run -m experiments.pinns.kdv_pinn
 """
 
@@ -76,7 +72,7 @@ import torch.autograd as autograd
 import torch.nn as nn
 
 from gnome import Gnome, JsonlDiagnostics, stack_residuals
-from experiments.baselines import SOAP, ENGD
+from experiments.baselines import SOAP
 from experiments.common import (
     ConcatEmbedding,
     DIVERGED_EXIT,
@@ -91,6 +87,8 @@ from experiments.common import (
 from experiments.reference_solutions import cached_reference_path, reference_path
 from experiments.common.precision import switch_to_float64 as _switch_optimizer_to_float64
 
+
+from experiments.common import pinn_options as pinn
 
 EXPERIMENT = "kdv_pinn"
 
@@ -112,12 +110,9 @@ KDV_URL = (
 
 
 # ========================= Models =========================
-def build_embedding(embed: str) -> nn.Module:
-    if embed == "periodic":
-        return PeriodicEmbedding(2, wavenumber=math.pi)
-    if embed == "none":
-        return ConcatEmbedding(2)
-    raise ValueError(f"unknown embedding: {embed}")
+def build_embedding(embed: str, embed_dim: int = 32, embed_scale: float = 1.0) -> nn.Module:
+    return pinn.build_embedding(embed, 2, spatial_dims=(1,), length=X_MAX - X_MIN,
+                                periodic=True, embed_dim=embed_dim, embed_scale=embed_scale)
 
 
 class MLP(nn.Module):
@@ -127,10 +122,10 @@ class MLP(nn.Module):
     or raw ``[t, x]`` with ``embed="none"``."""
 
     def __init__(self, hidden: int = 256, depth: int = 4,
-                 embed: str = "periodic"):
+                 embed: str = "periodic", embed_dim: int = 32, embed_scale: float = 1.0):
         super().__init__()
         assert depth >= 2
-        self.embed = build_embedding(embed)
+        self.embed = build_embedding(embed, embed_dim, embed_scale)
         layers: list[nn.Module] = [nn.Linear(self.embed.out_dim, hidden), nn.Tanh()]
         for i in range(depth - 1):
             layers += [nn.Linear(hidden, hidden), nn.Tanh()]
@@ -142,13 +137,13 @@ class MLP(nn.Module):
         return self.net(self.embed(t, x))
 
 def build_model(arch: str, hidden: int, depth: int,
-                embed: str = "periodic") -> nn.Module:
+                embed: str = "periodic", embed_dim: int = 32, embed_scale: float = 1.0) -> nn.Module:
     """``(t, x) → u`` with periodic features or raw coordinates."""
     if arch == "mlp":
-        return MLP(hidden=hidden, depth=depth, embed=embed)
+        return MLP(hidden=hidden, depth=depth, embed=embed, embed_dim=embed_dim, embed_scale=embed_scale)
     if arch == "modified":
         return ModifiedMLP(
-            build_embedding(embed),
+            build_embedding(embed, embed_dim, embed_scale),
             hidden=hidden,
             depth=depth,
         )
@@ -244,120 +239,6 @@ def term_losses(
         "ic": ic_residual(model, x_ic).pow(2).mean().item(),
         "bc": bc_residual(model, t_bc).pow(2).mean().item(),
     }
-
-
-# ========================= ENGD residual + parameter-Jacobian =========================
-#
-# ENGD's metric is the Gauss-Newton Gram of the PINN residual w.r.t. the
-# parameters (see experiments/baselines/engd.py). To build it we need the
-# per-collocation-point Jacobian ``J_r = ∂r/∂θ`` of the *residual* — which
-# itself contains spatial derivatives (u_x, u_xx, u_xxx). ``autograd.grad`` and
-# ``torch.func`` don't compose, so unlike the other paths here we compute the
-# whole residual functionally with ``torch.func``: spatial derivatives via
-# nested ``grad``, then ``jacrev`` over the parameters, all under ``vmap`` over
-# points. Blocks are scaled exactly like ``stack_residuals`` (including loss weights) so
-# the Gauss-Newton step minimizes the same loss the other optimizers report.
-
-def build_engd_functions(
-    model: nn.Module,
-    mu_sq: float = DEFAULT_MU_SQ,
-    weights=(1.0, 1.0, 1.0),
-):
-    """Return ``(residual_jacobian_fn, loss_fn)`` builders for ENGD.
-
-    ``residual_jacobian_fn(batch) -> (r, J)`` with ``r`` shape ``(M,)`` and
-    ``J`` shape ``(M, p)`` (columns in ``parameters_to_vector`` order).
-    ``loss_fn(batch) -> float`` is the mean-square loss at the current params.
-    """
-    from torch.func import functional_call, grad, jacrev, vmap
-
-    buffers = {k: v for k, v in model.named_buffers()}
-    param_names = [n for n, _ in model.named_parameters()]
-
-    def u_scalar(params, t, x):
-        out = functional_call(model, {**params, **buffers},
-                              (t.view(1, 1), x.view(1, 1)))
-        return out.reshape(())
-
-    du_t = grad(u_scalar, argnums=1)
-    du_x = grad(u_scalar, argnums=2)
-    du_xx = grad(du_x, argnums=2)
-    du_xxx = grad(du_xx, argnums=2)
-
-    def pde_pt(params, t, x):
-        return (du_t(params, t, x)
-                + ETA * u_scalar(params, t, x) * du_x(params, t, x)
-                + mu_sq * du_xxx(params, t, x))
-
-    def ic_pt(params, x):
-        return u_scalar(params, torch.zeros_like(x), x) - torch.cos(math.pi * x)
-
-    def bc_pt(params, t, xl, xr):
-        # Periodic BC through u_xx (KdV is third-order): [u, u_x, u_xx] matched
-        # across the two ends. The boundary coords ``xl, xr`` are passed in
-        # (built with the batch's dtype/device) rather than created inside —
-        # ``t.new_tensor(...)`` under vmap trips a dispatch error. Returns a
-        # length-3 vector per t.
-        return torch.stack([
-            u_scalar(params, t, xr) - u_scalar(params, t, xl),
-            du_x(params, t, xr) - du_x(params, t, xl),
-            du_xx(params, t, xr) - du_xx(params, t, xl),
-        ])
-
-    pde_r = vmap(pde_pt, in_dims=(None, 0, 0))
-    pde_j = vmap(jacrev(pde_pt, argnums=0), in_dims=(None, 0, 0))
-    ic_r = vmap(ic_pt, in_dims=(None, 0))
-    ic_j = vmap(jacrev(ic_pt, argnums=0), in_dims=(None, 0))
-    bc_r = vmap(bc_pt, in_dims=(None, 0, 0, 0))
-    bc_j = vmap(jacrev(bc_pt, argnums=0), in_dims=(None, 0, 0, 0))
-
-    def _cols(jac_dict, n_rows):
-        """Flatten a jacrev pytree {name: (n_rows..., *param_shape)} to (n_rows, p)."""
-        return torch.cat([jac_dict[n].reshape(n_rows, -1) for n in param_names],
-                         dim=1)
-
-    def _cur_params():
-        return {n: p.detach() for n, p in model.named_parameters()}
-
-    def _blocks(params, batch):
-        t_pde, x_pde, x_ic, t_bc = batch
-        tp, xp = t_pde.reshape(-1), x_pde.reshape(-1)
-        xi, tb = x_ic.reshape(-1), t_bc.reshape(-1)
-        xl = torch.full_like(tb, X_MIN)
-        xr = torch.full_like(tb, X_MAX)
-        r_pde = pde_r(params, tp, xp)
-        r_ic = ic_r(params, xi)
-        r_bc = bc_r(params, tb, xl, xr).reshape(-1)   # (3 * N_bc,)
-        return (r_pde, r_ic, r_bc), (tp, xp, xi, tb, xl, xr)
-
-    def _scales(sizes):
-        n_total = sum(sizes)
-        return [math.sqrt(w * n_total / size) for w, size in zip(weights, sizes)], n_total
-
-    def loss_fn(batch):
-        params = _cur_params()
-        (r_pde, r_ic, r_bc), _ = _blocks(params, batch)
-        sizes = [r_pde.numel(), r_ic.numel(), r_bc.numel()]
-        scales, n_total = _scales(sizes)
-        sq = (scales[0] ** 2 * (r_pde @ r_pde)
-              + scales[1] ** 2 * (r_ic @ r_ic)
-              + scales[2] ** 2 * (r_bc @ r_bc))
-        return float(sq / n_total)
-
-    def residual_jacobian_fn(batch):
-        params = _cur_params()
-        (r_pde, r_ic, r_bc), (tp, xp, xi, tb, xl, xr) = _blocks(params, batch)
-        J_pde = _cols(pde_j(params, tp, xp), tp.numel())
-        J_ic = _cols(ic_j(params, xi), xi.numel())
-        J_bc = _cols(bc_j(params, tb, xl, xr), 3 * tb.numel())
-        sizes = [r_pde.numel(), r_ic.numel(), r_bc.numel()]
-        scales, _ = _scales(sizes)
-        r = torch.cat([r_pde * scales[0], r_ic * scales[1], r_bc * scales[2]])
-        J = torch.cat([J_pde * scales[0], J_ic * scales[1], J_bc * scales[2]],
-                      dim=0)
-        return r, J
-
-    return residual_jacobian_fn, loss_fn
 
 
 # ========================= Reference solution + eval =========================
@@ -648,7 +529,6 @@ def build_optimizer(
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
     beta1: float = 0.9, beta2: float = 0.99,
     trust_region: float = 1.0,
-    engd_lr: float = 1.0, engd_damping: float = 1e-8,
 ):
     """Construct the optimizer and its LR schedule.
 
@@ -667,12 +547,6 @@ def build_optimizer(
             loss="mse", precondition_1d=True,
         )
         opt = Gnome(params, **cfg)
-    elif name == "engd":
-        # Energy Natural Gradient: dense Gauss-Newton on the PINN residual in
-        # the operator-induced metric. Fixed step (line-searched) + adaptive LM
-        # damping, no schedule. Reference optimizer — small nets + float64.
-        cfg = dict(lr=engd_lr, damping=engd_damping)
-        return ENGD(params, lr=engd_lr, damping=engd_damping), cfg, None
     elif name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
@@ -680,9 +554,7 @@ def build_optimizer(
             precondition_frequency=20, precondition_1d=True,
         )
         opt = SOAP(params, **cfg)
-    elif name in ("adamw", "adamw+lbfgs"):
-        # adamw+lbfgs uses plain AdamW for phase 1; the L-BFGS refinement is
-        # a separate phase appended after the main loop (see lbfgs_phase).
+    elif name == "adamw":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(0.9, 0.999), eps=1e-8,
@@ -695,92 +567,6 @@ def build_optimizer(
     cfg["warmup"] = warmup
     cfg["cosine_decay_floor"] = cosine_decay
     return opt, cfg, scheduler
-
-
-# ========================= L-BFGS refinement phase =========================
-
-def lbfgs_phase(
-    model: nn.Module, device: torch.device, args: argparse.Namespace,
-    run: RunLogger, t_ref: torch.Tensor, x_ref: torch.Tensor,
-    u_ref: torch.Tensor, start_step: int, best_rel_l2: float,
-) -> dict:
-    """Full-batch L-BFGS refinement, run after the Adam phase.
-
-    L-BFGS approximates curvature from a history of (grad, step) pairs, which
-    is only valid if the objective is a fixed function — so we draw ONE
-    collocation set here and reuse it for every iteration (unlike the Adam
-    phase, which resamples each step). ``torch.optim.LBFGS`` re-evaluates the
-    closure several times per ``.step()`` for its strong-Wolfe line search;
-    each outer step runs ``--lbfgs-max-iter`` inner iterations (must be >1 —
-    the line search cannot recover from a cold identity Hessian in a single
-    iteration and stalls). Returns the final/best metrics for the run summary.
-    """
-    fixed_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
-    opt = torch.optim.LBFGS(
-        model.parameters(), lr=args.lbfgs_lr, max_iter=args.lbfgs_max_iter,
-        history_size=args.lbfgs_history, line_search_fn="strong_wolfe",
-        tolerance_grad=1e-12, tolerance_change=1e-12,
-    )
-    # Log at roughly the same iteration cadence as the Adam phase: one outer
-    # step is lbfgs_max_iter inner iterations.
-    log_every = max(1, args.log_every // args.lbfgs_max_iter)
-
-    if not args.quiet:
-        total_iters = args.lbfgs_steps * args.lbfgs_max_iter
-        print(
-            f"[{EXPERIMENT}] L-BFGS refinement: {args.lbfgs_steps} outer steps "
-            f"x {args.lbfgs_max_iter} = {total_iters} iters on a fixed batch "
-            f"(N_pde={args.n_pde} N_ic={args.n_ic} N_bc={args.n_bc}, "
-            f"history={args.lbfgs_history}, lr={args.lbfgs_lr})",
-            flush=True,
-        )
-
-    t_start = time.perf_counter()
-    last_loss = last_rel_l2 = float("nan")
-    last_pde = last_ic = last_bc = float("nan")
-
-    for i in range(args.lbfgs_steps):
-        def closure():
-            opt.zero_grad()
-            r = stacked_residuals(model, fixed_batch, args.mu_sq, args.weights)
-            loss = (r ** 2).sum() / r.shape[0]
-            loss.backward()
-            return loss
-
-        loss = opt.step(closure)
-        last_loss = float(loss.detach().item())
-        step = start_step + i
-        if diverged(last_loss):
-            run.finish(completed=False, diverged=True, diverged_step=step)
-            print(f"[{EXPERIMENT}] L-BFGS diverged at step {step} — stopping.",
-                  flush=True)
-            raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=last_loss)
-
-        if (i + 1) % log_every == 0:
-            tl = term_losses(model, fixed_batch, args.mu_sq)
-            rl2 = eval_rel_l2(model, t_ref, x_ref, u_ref, device)
-            last_pde, last_ic, last_bc = tl["pde"], tl["ic"], tl["bc"]
-            last_rel_l2 = rl2
-            best_rel_l2 = min(best_rel_l2, rl2)
-            run.log_val(step + 1, loss=last_loss, lr=args.lbfgs_lr,
-                        pde=tl["pde"], ic=tl["ic"], bc=tl["bc"], rel_l2=rl2)
-            if not args.quiet:
-                ms_per = (time.perf_counter() - t_start) / (i + 1) * 1000
-                print(
-                    f"  L-BFGS {i + 1:5d}/{args.lbfgs_steps}  "
-                    f"loss={last_loss:.4e}  pde={tl['pde']:.3e}  "
-                    f"ic={tl['ic']:.3e}  bc={tl['bc']:.3e}  "
-                    f"rel_l2={rl2:.3e}  {ms_per:.1f} ms/step",
-                    flush=True,
-                )
-
-    return {
-        "last_avg": last_loss,
-        "last_rel_l2": last_rel_l2,
-        "best_rel_l2": best_rel_l2,
-        "last_pde": last_pde, "last_ic": last_ic, "last_bc": last_bc,
-    }
 
 
 # ========================= CLI / training =========================
@@ -798,20 +584,14 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def switch_to_float64(model, opt):
     """Promote the model and preserve the active optimizer and its schedule."""
-    if isinstance(opt, ENGD):
-        # ENGD retains parameter references and scalar damping, but no tensor EMA.
-        model.zero_grad(set_to_none=True)
-        model.double()
-        opt.params = [p for p in model.parameters() if p.requires_grad]
-        torch.set_default_dtype(torch.float64)
-        return next(model.parameters()).device
     return _switch_optimizer_to_float64(model, opt)
 
 
+@pinn.preserve_default_dtype
 def train(args: argparse.Namespace) -> str:
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(
-        torch.float64 if args.float64 or args.float64_after == 0 else torch.float32
+        torch.float64 if args.float64 or args.float64_after == 0 or args.optimizer in ("engdw", "soap+ssbroyden") else torch.float32
     )
     try:
         return _train(args)
@@ -820,6 +600,7 @@ def train(args: argparse.Namespace) -> str:
 
 
 def _train(args: argparse.Namespace) -> str:
+    hybrid = args.optimizer == "soap+ssbroyden"
     if not math.isfinite(args.mu_sq) or args.mu_sq <= 0.0:
         raise ValueError(f"--mu-sq must be finite and positive; got {args.mu_sq}")
     use_mat_reference = args.mu_sq == DEFAULT_MU_SQ
@@ -835,33 +616,25 @@ def _train(args: argparse.Namespace) -> str:
             f"got {args.reference_substeps}"
         )
 
-    # float64 (recommended for ENGD) must precede model construction; MPS has
-    # no double support, so it forces CPU.
+    # Choose the device after resolving precision; MPS has no float64 support.
     if torch.get_default_dtype() == torch.float64:
         device = torch.device("cpu")
     else:
         device = pick_device()
-    # ENGD needs torch.func higher-order AD + torch.linalg.lstsq, neither of
-    # which is supported on MPS — fall back to CPU (float32) there.
-    if args.optimizer == "engd" and device.type == "mps":
-        if not args.quiet:
-            print(f"[{EXPERIMENT}] engd: MPS unsupported for its linalg/func "
-                  f"path — using CPU. Add --float64 for the accuracy it's for.",
-                  flush=True)
-        device = torch.device("cpu")
     torch.manual_seed(args.seed)
-    model = build_model(args.arch, args.hidden, args.depth, args.embed).to(device)
-    opt, opt_cfg, scheduler = build_optimizer(
-        args.optimizer, model.parameters(), args.lr, args.weight_decay,
-        warmup=args.warmup_steps, total_steps=args.steps,
-        cosine_decay=args.cosine_decay, eps=args.eps,
-        beta1=args.beta1, beta2=args.beta2,
-        trust_region=args.trust_region,
-        engd_lr=args.engd_lr, engd_damping=args.engd_damping,
-    )
-    engd_resjac = engd_loss = None
-    if args.optimizer == "engd":
-        engd_resjac, engd_loss = build_engd_functions(model, args.mu_sq, args.weights)
+    model = build_model(args.arch, args.hidden, args.depth, args.embedding, args.embed_dim, args.embed_scale).to(device)
+    residual_fn = lambda model, batch: stacked_residuals(model, batch, args.mu_sq, args.weights)
+    if args.optimizer in ("soap+ssbroyden", "engdw"):
+        opt, opt_cfg, scheduler = pinn.build_extra_optimizer(
+            model, args, residual_fn, precondition_frequency=20)
+    else:
+        opt, opt_cfg, scheduler = build_optimizer(
+            args.optimizer, model.parameters(), args.lr, args.weight_decay,
+            warmup=args.warmup_steps, total_steps=args.steps,
+            cosine_decay=args.cosine_decay, eps=args.eps,
+            beta1=args.beta1, beta2=args.beta2,
+            trust_region=args.trust_region,
+        )
 
     n_pde_aux = max(8, int(args.n_pde * args.aux_frac))
     n_ic_aux = max(2, int(args.n_ic * args.aux_frac))
@@ -880,13 +653,14 @@ def _train(args: argparse.Namespace) -> str:
     reference_was_cached = os.path.isfile(reference_cache_path)
 
     hyperparameters = {
+        **pinn.metadata(args),
         # Non-zero means a sibling {run_id}.diag.jsonl exists.
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
         "weights": list(args.weights),
         "partition_residuals": args.optimizer == "gnome" and args.partition_residuals,
         "arch": args.arch,
-        "embed": args.embed,
+        "embed": args.embedding,
         "steps": args.steps,
         "hidden": args.hidden,
         "depth": args.depth,
@@ -950,7 +724,7 @@ def _train(args: argparse.Namespace) -> str:
     if not args.quiet:
         print(
             f"[{EXPERIMENT}] {args.optimizer} | arch={args.arch} "
-            f"{args.depth}x{args.hidden} | embed={args.embed} | params={n_params:,} | "
+            f"{args.depth}x{args.hidden} | embed={args.embedding} | params={n_params:,} | "
             f"device={device}\n"
             f"  N_pde={args.n_pde} N_ic={args.n_ic} N_bc={args.n_bc} | "
             f"aux={n_pde_aux}/{n_ic_aux}/{n_bc_aux} | steps={args.steps}\n"
@@ -1002,23 +776,29 @@ def _train(args: argparse.Namespace) -> str:
     last_pde = last_ic = last_bc = float("nan")
     best_avg = best_rel_l2 = float("inf")
 
+    sampler = pinn.BatchSampler(args, lambda: sample_batch(args.n_pde, args.n_ic, args.n_bc, device))
     for step in range(args.steps):
-        if step == args.float64_after and step > 0:
+        quasi_newton = hybrid and step >= args.soap_steps
+        if hybrid and step == args.soap_steps:
+            opt = pinn.build_ssbroyden_phase(model, args)
+            scheduler = None
+            run.log("optimizer", step=step, optimizer="ssbroyden")
+        if step == args.float64_after and step > 0 and next(model.parameters()).dtype != torch.float64:
             previous_device = device
             device = switch_to_float64(model, opt)
-            if args.optimizer == "engd":
-                # Rebind functional-call buffers after model conversion.
-                engd_resjac, engd_loss = build_engd_functions(model, args.mu_sq, args.weights)
+            sampler.to(device, torch.float64)
             run.log("precision", step=step, from_dtype="torch.float32",
                     dtype="torch.float64", from_device=str(previous_device),
                     device=str(device),
-                    lr=opt.lr if args.optimizer == "engd" else current_lr(opt))
+                    lr=current_lr(opt))
             if not args.quiet:
                 print(f"[{EXPERIMENT}] after {step} steps: float32 → float64 "
                       f"| device={previous_device} → {device}", flush=True)
-        main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
+        main_batch = sampler.batch(step)
         if args.optimizer == "gnome":
-            aux_batch = sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device)
+            aux_batch = (pinn.subsample_txc(main_batch, n_pde_aux, n_ic_aux, n_bc_aux)
+                         if sampler.fixed_batch is not None else sample_batch(
+                             n_pde_aux, n_ic_aux, n_bc_aux, device))
             # if step % 1000 == 0:
             #     args.weights[0] = min(1.0, 1.2 * args.weights[0])
             def main_closure():
@@ -1035,14 +815,14 @@ def _train(args: argparse.Namespace) -> str:
                     residual_partition_sizes(aux_batch) if args.partition_residuals else None
                 ),
             )
-        elif args.optimizer == "engd":
-            loss_val = opt.step(lambda: engd_resjac(main_batch),
-                                lambda: engd_loss(main_batch))
-            loss = None
+
+        elif args.optimizer == "engdw":
+            loss = opt.step(main_batch)
+        elif quasi_newton:
+            loss = pinn.refinement_step(opt, model, main_batch, residual_fn)
         else:
             opt.zero_grad()
-            r = stacked_residuals(model, main_batch, args.mu_sq, args.weights)
-            loss = (r ** 2).sum() / r.shape[0]
+            loss = residual_fn(model, main_batch).square().mean()
             loss.backward()
             opt.step()
 
@@ -1055,7 +835,7 @@ def _train(args: argparse.Namespace) -> str:
             scheduler.step()
 
         if loss is not None:
-            loss_val = float(loss.detach().item())
+            loss_val = float(loss.detach().item()) if torch.is_tensor(loss) else float(loss)
         if diverged(loss_val):
             if diag is not None:
                 diag.close()
@@ -1063,10 +843,11 @@ def _train(args: argparse.Namespace) -> str:
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.",
                   flush=True)
             raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=loss_val)
+        run.log_train(step, loss=loss_val, lr=current_lr(opt), **pinn.phase_metrics(args, step))
         window.append(loss_val)
 
-        if args.log_every and (step + 1) % args.log_every == 0:
+        if ((args.log_every and (step + 1) % args.log_every == 0)
+                or step + 1 == args.steps or (hybrid and step + 1 == args.soap_steps)):
             tl = term_losses(
                 model,
                 sample_batch(args.n_pde, args.n_ic, args.n_bc, device),
@@ -1078,8 +859,7 @@ def _train(args: argparse.Namespace) -> str:
             last_rel_l2 = rl2
             best_avg = min(best_avg, last_avg)
             best_rel_l2 = min(best_rel_l2, rl2)
-            cur_lr = (opt.last_step_size if args.optimizer == "engd"
-                      else current_lr(opt))
+            cur_lr = current_lr(opt)
             run.log_val(step + 1, loss=last_avg, lr=cur_lr,
                         pde=tl["pde"], ic=tl["ic"], bc=tl["bc"], rel_l2=rl2)
             if not args.quiet:
@@ -1094,17 +874,6 @@ def _train(args: argparse.Namespace) -> str:
                 )
             window.clear()
 
-    if args.optimizer == "adamw+lbfgs" and args.lbfgs_steps > 0:
-        res = lbfgs_phase(
-            model, device, args, run, t_ref, x_ref, u_ref,
-            start_step=args.steps, best_rel_l2=best_rel_l2,
-        )
-        last_avg = res["last_avg"]
-        best_avg = min(best_avg, res["last_avg"])
-        last_rel_l2 = res["last_rel_l2"]
-        best_rel_l2 = res["best_rel_l2"]
-        last_pde, last_ic, last_bc = (
-            res["last_pde"], res["last_ic"], res["last_bc"])
 
     if diag is not None:
         diag.close()

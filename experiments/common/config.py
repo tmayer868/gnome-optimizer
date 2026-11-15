@@ -97,6 +97,14 @@ class ConfigParser(argparse.ArgumentParser):
     def parse_args(self, args=None, namespace=None):
         try:
             if isinstance(args, Mapping):
+                args = dict(args)
+                # Python callers may still use the former embedding shorthand.
+                for old, new in (("embed", "embedding"), ("fourier_dim", "embed_dim"),
+                                 ("fourier_scale", "embed_scale")):
+                    if old in args and new in self.schema["fields"]:
+                        if new in args:
+                            raise ValueError(f"Specify only {new!r}, not both {old!r} and {new!r}")
+                        args[new] = args.pop(old)
                 values = load_config_dict(self.config_path)
                 if self.optimizer_fields:
                     # Retain the flat Python override API used by tests and callers.
@@ -105,14 +113,21 @@ class ConfigParser(argparse.ArgumentParser):
                     nested = {name: value for name, value in args.items() if name not in grouped}
                     values = self.validate(merge_config_overrides(values, nested))
                     values.update(deepcopy({name: value for name, value in args.items() if name in grouped}))
-                    return argparse.Namespace(**self.validate_fields(values, self.schema["fields"]))
+                    return self.namespace(self.validate_fields(values, self.schema["fields"]))
                 values.update(deepcopy(dict(args)))
             else:
                 options = super().parse_args(args, namespace)
                 values = load_config_dict(options.config)
-            return argparse.Namespace(**self.validate(values))
+            return self.namespace(self.validate(values))
         except (OSError, ValueError, SyntaxError) as error:
             self.error(str(error))
+
+    def namespace(self, values):
+        args = argparse.Namespace(**values)
+        if self.optimizer_fields:
+            from experiments.common.pinn_options import validate_options
+            validate_options(args)
+        return args
 
     def validate(self, values):
         if self.optimizer_fields:

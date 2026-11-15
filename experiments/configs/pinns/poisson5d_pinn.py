@@ -4,7 +4,7 @@ None keeps an existing automatic/default-dependent setting where supported.
 """
 
 CONFIG = {
-    # Choices: 'gnome', 'soap', 'adamw', 'engdw'.
+    # Choices: 'adamw', 'soap', 'gnome', 'soap+ssbroyden', 'engdw'.
     'optimizer': 'gnome',
     'seed': 0,
     # Compute precision. float64 pushes below the ~1e-5 single-precision floor of second-order
@@ -48,72 +48,58 @@ CONFIG = {
     'quiet': False,
     # Each optimizer keeps its own hyperparameters and learning-rate schedule.
     'optimizers': {
-        'gnome': {
-            # Interior points for Gnome's GGN aux batch (disjoint, small). Gnome only.
-            'aux_n_int': 180,
-            # Boundary points for Gnome's GGN aux batch. Gnome only.
-            'aux_n_bc': 30,
-            # Base learning rate. Gnome typically wants a larger lr here (e.g. 1e-2) than the SOAP/AdamW
-            # baselines.
-            'lr': 1e-2,
-            # Gnome per-coordinate update bound: lambda is set to the smallest value with
-            # max|m̂/(v̂+lambda)| <= this, so no coordinate moves more than lr*trust_region in a step.
-            # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain m̂/(v̂+eps)
-            # damping.
-            'trust_region': .05,
-            # Gnome curvature-damping epsilon in m̂/(v̂+eps): larger -> more gradient-descent-like,
-            # smaller -> fuller Newton step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.
-            'eps': 1e-12,
-            # First-moment (momentum) EMA for Gnome and SOAP.
-            'beta1': 0.99,
-            # Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.
-            'beta2': 0.99,
-            'weight_decay': 1e-8,
-            # Linear LR warmup steps, applied to every optimizer.
+        'adamw': {
+            'lr': 0.001,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Gnome (MSE) never decays regardless.
-            'cosine_decay': 0.10,
+            'cosine_decay': 0.0,
         },
         'soap': {
-            # Base learning rate. Gnome typically wants a larger lr here (e.g. 1e-2) than the SOAP/AdamW
-            # baselines.
             'lr': 0.001,
-            # First-moment (momentum) EMA for Gnome and SOAP.
             'beta1': 0.9,
-            # Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.
             'beta2': 0.99,
-            'weight_decay': 1e-8,
-            # Linear LR warmup steps, applied to every optimizer.
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Gnome (MSE) never decays regardless.
             'cosine_decay': 0.0,
         },
-        'adamw': {
-            # Base learning rate. Gnome typically wants a larger lr here (e.g. 1e-2) than the SOAP/AdamW
-            # baselines.
-            'lr': 0.001,
-            'weight_decay': 1e-8,
-            # Linear LR warmup steps, applied to every optimizer.
+        'gnome': {
+            'aux_n_int': 180,
+            'aux_n_bc': 30,
+            'lr': 0.01,
+            'trust_region': 0.05,
+            'eps': 1e-12,
+            'beta1': 0.99,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Gnome (MSE) never decays regardless.
+            'cosine_decay': 0.1,
+        },
+        'soap+ssbroyden': {
+            'lr': 0.001,
+            'beta1': 0.9,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
+            'warmup_steps': 200,
             'cosine_decay': 0.0,
+            'soap_steps': 30000,
+            'ssbroyden_lr': 1.0,
+            'ssbroyden_tolerance_grad': 1e-10,
         },
         'engdw': {
-            # Base learning rate. Gnome typically wants a larger lr here (e.g. 1e-2) than the SOAP/AdamW
-            # baselines.
             'lr': 0.001,
-            # ENGD-W Tikhonov damping λ in (JJᵀ+λI). Default is the paper's Fig 8 fixed-lr 5D value; pair
-            # with lr 5.2289e-2. engdw only.
-            'engdw_damping': 6.804474e-8,
-            # ENGD-W: use the paper's inherited line search instead of a fixed lr (then pair with damping
-            # 3.173212e-12, the Fig 7 value). engdw only.
+            'engdw_damping': 6.804474e-08,
             'engdw_line_search': False,
-            # jacrev chunk_size for the ENGD-W Jacobian (memory vs speed; lower = less memory). None = no
-            # chunking. engdw only.
-            'engdw_chunk': None,
+            'engdw_chunk': 32,
+            'engdw_momentum': 0.0,
+            'engdw_fixed': False,
         },
     },
+    # Input features: 'none', 'periodic', or 'fourier'.
+    'embedding': 'none',
+    # Even number of random Fourier features.
+    'embed_dim': 32,
+    # Initial standard deviation of the frozen Fourier projection.
+    'embed_scale': 1.0,
+    'fixed_dataset': False,
+    'fix_after': None,
 }

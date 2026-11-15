@@ -4,7 +4,7 @@ None keeps an existing automatic/default-dependent setting where supported.
 """
 
 CONFIG = {
-    # Choices: 'gnome', 'soap', 'adamw', 'engdw', 'soap+ssbroyden', 'gnome+ssbroyden'.
+    # Choices: 'adamw', 'soap', 'gnome', 'soap+ssbroyden', 'engdw'.
     'optimizer': 'gnome',
     # Reaction coefficient. Vanilla whole-domain PINNs are already near 100% relative error at
     # rho=5; rho=10 is the harder published rung.
@@ -17,7 +17,6 @@ CONFIG = {
     'fuse_every': 2,
     # Raw inputs plus a soft BC (published setup), or an exact periodic embedding that drops the
     # BC block. Choices: 'none', 'periodic'.
-    'embed': 'none',
     'seed': 105,
     'steps': 100000,
     'n_pde': 4000,
@@ -48,92 +47,57 @@ CONFIG = {
     'quiet': False,
     # Each optimizer keeps its own hyperparameters and learning-rate schedule.
     'optimizers': {
-        'gnome': {
-            # EMA basis handling: 'overlap' (squared overlaps) or 'soap' (permutation only).
-            'basis_transport': 'overlap',
-            # Estimate curvature separately for each auxiliary residual block.
-            'partition_residuals': False,
-            # Fraction of each residual block used by Gnome's auxiliary curvature pass.
-            'aux_frac': 0.10,
-            'lr': 1e-2,
-            # Gnome trust radius; zero disables the trust-region solve.
-            'trust_region': .07,
-            # Gnome curvature damping. Baselines retain their own epsilon.
-            'eps': 1e-12,
-            'beta1': 0.95,
-            'beta2': 0.99,
-            'weight_decay': 1e-8,
+        'adamw': {
+            'lr': 0.001,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final learning-rate fraction after cosine decay.
-            'cosine_decay': 0.10,
-        },
-        'gnome+ssbroyden': {
-            # EMA basis handling: 'overlap' (squared overlaps) or 'soap' (permutation only).
-            'basis_transport': 'overlap',
-            # Estimate curvature separately for each auxiliary residual block.
-            'partition_residuals': False,
-            # Fraction of each residual block used by Gnome's auxiliary curvature pass.
-            'aux_frac': 0.10,
-            'lr': 1e-2,
-            # Gnome trust radius; zero disables the trust-region solve.
-            'trust_region': .07,
-            # Gnome curvature damping. Baselines retain their own epsilon.
-            'eps': 1e-12,
-            'beta1': 0.95,
-            'beta2': 0.99,
-            'weight_decay': 1e-8,
-            'warmup_steps': 200,
-            # Final learning-rate fraction after cosine decay.
-            'cosine_decay': 0.10,
-            'gnome_steps': 30_000,
-            'ssbroyden_lr': 1.0,
-            'ssbroyden_tolerance_grad': 1e-10,
+            'cosine_decay': 0.0,
         },
         'soap': {
             'lr': 0.003,
             'beta1': 0.99,
             'beta2': 0.999,
-            'weight_decay': 1e-8,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final learning-rate fraction after cosine decay.
             'cosine_decay': 0.0,
         },
-        'adamw': {
-            'lr': 0.001,
-            'weight_decay': 1e-8,
+        'gnome': {
+            'basis_transport': 'overlap',
+            'partition_residuals': False,
+            'aux_frac': 0.1,
+            'lr': 0.01,
+            'trust_region': 0.07,
+            'eps': 1e-12,
+            'beta1': 0.95,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final learning-rate fraction after cosine decay.
-            'cosine_decay': 0.0,
+            'cosine_decay': 0.1,
         },
-        # Total steps includes both phases; SOAP settings apply to the warm start.
         'soap+ssbroyden': {
             'beta1': 0.99,
             'beta2': 0.999,
             'weight_decay': 0.0,
-            'lr': 1e-3,
+            'lr': 0.001,
             'warmup_steps': 0,
             'cosine_decay': 1.0,
-            'soap_steps': 30_000,
+            'soap_steps': 30000,
             'ssbroyden_lr': 1.0,
             'ssbroyden_tolerance_grad': 1e-10,
         },
         'engdw': {
             'lr': 0.001,
-            # ENGD-W fixed damping in JJ^T + lambda I; reaction starting value, not a tuned result. No
-            # weight decay or LR schedule is used.
-            'engdw_damping': 1e-6,
-            # ENGD-W SPRING-style regularization-center momentum in [0, 1). Zero preserves the original
-            # solver; try 0.9, 0.95, or 0.99.
+            'engdw_damping': 1e-06,
             'engdw_momentum': 0.0,
-            # Choose the lowest same-batch loss on 13 log-spaced step sizes from 1e-3 to 1, overriding lr
-            # (same grid as Poisson-5D).
             'engdw_line_search': True,
-            # ENGD-W only: sample PDE/IC/BC training points once and reuse them every step. Validation
-            # points remain independently sampled.
             'engdw_fixed': True,
-            # Samples per vectorized Jacobian chunk for ENGD-W; limits differentiation workspace, while
-            # the full Jacobian and sample Gram remain dense.
             'engdw_chunk': 32,
         },
     },
+    # Input features: 'none', 'periodic', or 'fourier'.
+    'embedding': 'none',
+    # Even number of random Fourier features.
+    'embed_dim': 32,
+    # Initial standard deviation of the frozen Fourier projection.
+    'embed_scale': 1.0,
 }

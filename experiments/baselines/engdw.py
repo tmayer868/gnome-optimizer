@@ -53,7 +53,7 @@ class ENGDW:
         # Optional per-sample implementation: same dict (N, *parameter.shape)
         # as jacrev(residual_fn), avoiding cross-sample differentiation work.
         self.jacobian_fn = jacobian_fn
-        self.params = dict(model.named_parameters())
+        self.params = {k: v for k, v in model.named_parameters() if v.requires_grad}
         self.shapes = [(k, v.shape, v.numel()) for k, v in self.params.items()]
         # Duck-type shim so common.current_lr(opt) works; updated per step to the
         # actual η applied (meaningful when line search is on).

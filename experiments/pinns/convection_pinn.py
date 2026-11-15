@@ -39,7 +39,7 @@ failing the way the paper describes; a run that reports 1e-4 has beaten
 everything in the table and deserves a hard look for a bug before it is
 believed. See ``--beta`` for the one knob that matters most.
 
-Two or three residual blocks depending on ``--embed``: PDE (collocation),
+Two or three residual blocks depending on ``embedding``: PDE (collocation),
 IC, and — unless the periodic embedding makes it exact — the periodic BC.
 Stacked through ``gnome.stack_residuals`` so the multi-block MSE rides
 Gnome's single-MSE surrogate as the per-block independent Rademacher GGN
@@ -66,7 +66,7 @@ Usage:
     # Edit experiments/configs/pinns/convection_pinn.py: optimizer='engdw', beta=40.0, n_pde=128, n_ic=32, n_bc=32, steps=1000
     # In CONFIG["optimizers"]['engdw']: engdw_line_search=True
     uv run -m experiments.pinns.convection_pinn
-    # Edit experiments/configs/pinns/convection_pinn.py: optimizer='gnome', beta=40.0, embed='periodic', arch='modified'
+    # Edit experiments/configs/pinns/convection_pinn.py: optimizer='gnome', beta=40.0, embedding='periodic', arch='modified'
     uv run -m experiments.pinns.convection_pinn
     # Edit experiments/configs/pinns/convection_pinn.py: optimizer='gnome', arch='fused-modified', fuse_every=2, depth=6
     uv run -m experiments.pinns.convection_pinn
@@ -84,8 +84,8 @@ import torch.autograd as autograd
 import torch.nn as nn
 from torch.func import functional_call, jacrev, vmap
 
-from experiments.common.ssbroyden import (
-    build_gnome_phase, build_soap_phase, build_ssbroyden_phase,
+from experiments.baselines.ssbroyden import (
+    build_soap_phase, build_ssbroyden_phase,
     validate_ssbroyden, warm_start_steps,
 )
 from experiments.common.sampling import sample_aux_from_batch
@@ -107,6 +107,8 @@ from experiments.common import (
 )
 
 
+from experiments.common import pinn_options as pinn
+
 EXPERIMENT = "convection_pinn"
 
 T_MIN, T_MAX = 0.0, 1.0
@@ -116,19 +118,14 @@ X_MIN, X_MAX = 0.0, 2.0 * math.pi
 # ========================= Models =========================
 
 
-def build_embedding(embed: str) -> nn.Module:
-    if embed == "none":
-        return ConcatEmbedding(2)
-    if embed == "periodic":
-        return PeriodicEmbedding(
-            2, wavenumber=2.0 * math.pi / (X_MAX - X_MIN)
-        )
-    raise ValueError(f"unknown embedding: {embed}")
+def build_embedding(name: str, embed_dim: int = 32, embed_scale: float = 1.0) -> nn.Module:
+    return pinn.build_embedding(name, 2, spatial_dims=(1,), length=X_MAX - X_MIN,
+                                periodic=True, embed_dim=embed_dim, embed_scale=embed_scale)
 
 
 def build_model(arch: str, embed: nn.Module, hidden: int, depth: int,
                 fuse_every: int = 0) -> nn.Module:
-    """``(t, x) → u``. The input embedding is whatever ``--embed`` selects.
+    """``(t, x) → u``. The input embedding is whatever ``embedding`` selects.
 
     ``fused`` and ``fused-modified`` are the same function classes as ``mlp``
     and ``modified`` respectively — they differ only in how the weights are
@@ -178,7 +175,7 @@ def bc_residual(model: nn.Module, t: torch.Tensor) -> torch.Tensor:
 
     C⁰ only: the PDE is first order, so matching ``u`` across the endpoints
     is the whole boundary condition — unlike the second-order problems here,
-    which also need ``u_x`` to match. Only used with ``--embed none``; the
+    which also need ``u_x`` to match. Only used with ``embedding none``; the
     periodic embedding makes this identically zero.
     """
     x_l = torch.full_like(t, X_MIN)
@@ -226,7 +223,7 @@ def stacked_residuals(
 def term_losses(model: nn.Module, batch, beta: float) -> dict[str, float]:
     """Per-block MSE for diagnostic logging.
 
-    ``bc`` is always reported, even under ``--embed periodic`` where it is
+    ``bc`` is always reported, even under ``embedding periodic`` where it is
     not part of the loss — there it is the check that the embedding is doing
     its job, and should sit at float32 round-off.
     """
@@ -411,7 +408,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     if (args.optimizer == "gnome" and (args.fixed_dataset or args.fix_after is not None)
             and not 0 < args.aux_frac <= 1):
         p.error("fixed_dataset or fix_after requires aux_frac in (0,1] for Gnome")
-    if args.optimizer in ("soap+ssbroyden", "gnome+ssbroyden"):
+    if args.optimizer == "soap+ssbroyden":
         try:
             validate_ssbroyden(args)
         except ValueError as error:
@@ -419,8 +416,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
+@pinn.preserve_default_dtype
 def train(args: argparse.Namespace) -> str:
-    hybrid = args.optimizer in ("soap+ssbroyden", "gnome+ssbroyden")
+    hybrid = args.optimizer == "soap+ssbroyden"
     warm_start = args.optimizer.split("+")[0]
     is_gnome = warm_start == "gnome"
     phase_steps = warm_start_steps(args) if hybrid else args.steps
@@ -466,9 +464,9 @@ def train(args: argparse.Namespace) -> str:
         device = pick_device()
     torch.manual_seed(args.seed)
 
-    use_bc = args.embed != "periodic"
+    use_bc = args.embedding not in ("periodic", "fourier")
     model = build_model(
-        args.arch, build_embedding(args.embed),
+        args.arch, build_embedding(args.embedding, args.embed_dim, args.embed_scale),
         args.hidden, args.depth, args.fuse_every,
     ).to(device)
     if args.optimizer == "engdw":
@@ -491,8 +489,6 @@ def train(args: argparse.Namespace) -> str:
             energy="0.5 * sum(block MSEs)", residual_scaling="1/sqrt(N_block)",
         )
         scheduler = None
-    elif args.optimizer == "gnome+ssbroyden":
-        opt, opt_cfg, scheduler = build_gnome_phase(model, args, build_optimizer)
     elif hybrid:
         opt, opt_cfg, scheduler = build_soap_phase(model, args)
     else:
@@ -511,6 +507,7 @@ def train(args: argparse.Namespace) -> str:
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
+        **pinn.metadata(args),
         "optimizer": args.optimizer,
         "partition_residuals": is_gnome and args.partition_residuals,
         "basis_transport": args.basis_transport if is_gnome else None,
@@ -518,7 +515,7 @@ def train(args: argparse.Namespace) -> str:
         "beta": args.beta,
         "arch": args.arch,
         "fuse_every": getattr(model, "chunks", None),
-        "embed": args.embed,
+        "embed": args.embedding,
         "blocks": ["pde", "ic", "bc"] if use_bc else ["pde", "ic"],
         "weights": list(args.weights),
         "hidden": args.hidden,
@@ -572,7 +569,7 @@ def train(args: argparse.Namespace) -> str:
         print(
             f"[{EXPERIMENT}] {args.optimizer} | beta={args.beta:g} | "
             f"arch={args.arch} {args.depth}x{args.hidden} | "
-            f"embed={args.embed} | params={n_params:,} | device={device} | "
+            f"embed={args.embedding} | params={n_params:,} | device={device} | "
             f"dtype={torch.get_default_dtype()}\n"
             f"  blocks={blocks} | N_pde={args.n_pde} | steps={args.steps} | "
             f"sampling={hyperparameters['sampling']}",

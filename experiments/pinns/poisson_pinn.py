@@ -33,7 +33,7 @@ which suits Gnome on MSE since its step self-anneals as the residual shrinks).
 ENGD-W uses the shared exact damped sample-space solve in float64, with a
 fixed learning rate or same-batch grid line search and no schedule/weight decay.
 Points are resampled each step unless ``--fixed-dataset`` is supplied.
-This flag works for every optimizer. Gnome and WoodburyGGN draw fresh auxiliary subsets from
+This flag works for every optimizer. GnomeGGN draw fresh auxiliary subsets from
 the fixed main points each step. ``--engdw-fixed`` remains an ENGD-W-only
 compatibility flag.
 
@@ -85,6 +85,8 @@ from experiments.common import (
 from experiments.common import MLP as _SharedMLP
 
 
+from experiments.common import pinn_options as pinn
+
 EXPERIMENT = "poisson_pinn"
 
 X_MIN, X_MAX = 0.0, 1.0
@@ -98,12 +100,12 @@ SOURCE_COEFF = 2.0 * PI * PI
 class PINN(_SharedMLP):
     """Maps ``(x, y) → u`` via a plain tanh MLP."""
 
-    def __init__(self, hidden: int = 64, depth: int = 5):
-        super().__init__(ConcatEmbedding(2), hidden=hidden, depth=depth)
+    def __init__(self, hidden: int = 64, depth: int = 5, embedding=None):
+        super().__init__(embedding if embedding is not None else ConcatEmbedding(2), hidden=hidden, depth=depth)
 
 
 def build_model(
-    arch: str, hidden: int, depth: int, fuse_every: int = 0
+    arch: str, hidden: int, depth: int, fuse_every: int = 0, embedding=None
 ) -> nn.Module:
     """``(x, y) -> u``. Both archs compute the same function class; they differ
     only in how the weights are grouped into parameter tensors, which is what
@@ -122,10 +124,10 @@ def build_model(
     ``mlp`` is not the control for ``fused``: it differs in bias handling too.
     """
     if arch == "mlp":
-        return PINN(hidden=hidden, depth=depth)
+        return PINN(hidden=hidden, depth=depth, embedding=embedding)
     if arch == "fused":
         return FusedMLP(
-            ConcatEmbedding(2), hidden=hidden, depth=depth,
+            embedding if embedding is not None else ConcatEmbedding(2), hidden=hidden, depth=depth,
             fuse_every=fuse_every,
         )
     raise ValueError(f"unknown arch: {arch}")
@@ -308,9 +310,6 @@ def build_optimizer(
     warmup: int, total_steps: int, cosine_decay: float, eps: float = 1e-6,
     beta1: float = 0.9, beta2: float = 0.99,
     trust_region: float = 1.0,
-    woodbury_damping: float = 1e-3, history_tol: float = 0.01,
-    max_history: int | None = None, gram_float64: bool = False,
-    woodbury_warmup_steps: int = 100,
 ):
     """Construct the optimizer and its LR schedule.
 
@@ -329,16 +328,6 @@ def build_optimizer(
             loss="mse", precondition_1d=True,
         )
         opt = Gnome(params, **cfg)
-    elif name == "woodbury":
-        cfg = dict(lr=lr, beta1=beta1, beta2=beta2, damping=woodbury_damping,
-                   history_tol=history_tol, max_history=max_history,
-                   gram_dtype=torch.float64 if gram_float64 else None, loss="mse",
-                   trust_radius=(trust_region if trust_region > 0 else None),
-                   curvature_warmup_steps=woodbury_warmup_steps)
-        opt = WoodburyGGN(params, **cfg)
-        cfg["gram_dtype"] = "float64" if gram_float64 else "parameter_dtype_at_least_float32"
-        cfg["history_size"] = opt.param_groups[0]["history_size"]
-        cfg["weight_decay"] = 0.0
     elif name == "soap":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
@@ -368,35 +357,20 @@ def parse_args(argv=None) -> argparse.Namespace:
     p = ConfigParser(__file__)
     args = p.parse_args(argv)
     if args.beta1 is None:
-        args.beta1 = 0.0 if args.optimizer == "woodbury" else 0.9
+        args.beta1 = 0.9
     if min(args.steps, args.n_pde, args.n_bc_per_edge) < 1:
         p.error("steps and collocation counts must be positive")
     if args.engdw_fixed and args.optimizer != "engdw":
         p.error("--engdw-fixed requires --optimizer engdw")
-    if args.optimizer in ("gnome", "woodbury"):
+    if args.optimizer == "gnome":
         if not math.isfinite(args.aux_frac) or args.aux_frac <= 0:
             p.error("--aux-frac must be finite and positive")
         if args.fixed_dataset and args.aux_frac > 1:
-            p.error("--fixed-dataset requires --aux-frac in (0,1] for Gnome/Woodbury")
-    if args.optimizer not in ("gnome", "woodbury") and args.diagnostics_every > 0:
-        p.error("diagnostics are supported by Gnome and Woodbury")
+            p.error("--fixed-dataset requires --aux-frac in (0,1] for Gnome")
+    if args.optimizer != "gnome" and args.diagnostics_every > 0:
+        p.error("diagnostics are supported by Gnome")
     if args.optimizer != "gnome" and args.measure_rho_every > 0:
         p.error("rho measurements are Gnome-only")
-    if args.optimizer == "woodbury":
-        if not math.isfinite(args.trust_region) or args.trust_region < 0:
-            p.error("--trust-region must be finite and nonnegative")
-        if args.woodbury_warmup_steps < 0:
-            p.error("--woodbury-warmup-steps must be nonnegative")
-        if not math.isfinite(args.woodbury_damping) or args.woodbury_damping <= 0:
-            p.error("--woodbury-damping must be finite and positive")
-        if not 0 < args.history_tol < 1:
-            p.error("--history-tol must be in (0,1)")
-        if args.max_history is not None and args.max_history < 1:
-            p.error("--max-history must be positive")
-        if not 0 <= args.beta1 < 1 or not 0 <= args.beta2 < 1:
-            p.error("--beta1 and --beta2 must be in [0,1)")
-        if not math.isfinite(args.lr) or args.lr < 0:
-            p.error("--lr must be finite and nonnegative")
     if args.optimizer == "engdw":
         if not math.isfinite(args.engdw_damping) or args.engdw_damping <= 0:
             p.error("--engdw-damping must be finite and positive")
@@ -409,12 +383,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
+@pinn.preserve_default_dtype
 def train(args: argparse.Namespace) -> str:
+    hybrid = args.optimizer == "soap+ssbroyden"
     fixed_dataset = args.fixed_dataset or args.engdw_fixed
     # float64 must come before any tensor/model construction so params,
     # samples and the reference grid are all double. MPS has no float64
     # support, so double precision forces CPU.
-    if args.float64:
+    if args.float64 or hybrid:
         torch.set_default_dtype(torch.float64)
         device = torch.device("cpu")
     elif args.optimizer == "engdw":
@@ -426,7 +402,9 @@ def train(args: argparse.Namespace) -> str:
         device = pick_device()
     torch.manual_seed(args.seed)
     model = build_model(
-        args.arch, args.hidden, args.depth, args.fuse_every
+        args.arch, args.hidden, args.depth, args.fuse_every,
+        embedding=pinn.build_embedding(args.embedding, 2, spatial_dims=(0, 1),
+                                       embed_dim=args.embed_dim, embed_scale=args.embed_scale),
     ).to(device)
     if args.optimizer == "engdw":
         residual, jacobian = make_engdw_functions(model, args.engdw_chunk)
@@ -440,6 +418,8 @@ def train(args: argparse.Namespace) -> str:
                        energy="0.5 * sum(block MSEs)", residual_scaling="1/sqrt(N_block)",
                        jacobian="vmap(jacrev(single_residual))")
         scheduler = None
+    elif hybrid:
+        opt, opt_cfg, scheduler = pinn.build_soap_phase(model, args)
     else:
         opt, opt_cfg, scheduler = build_optimizer(
             args.optimizer, model.parameters(), args.lr, args.weight_decay,
@@ -447,17 +427,15 @@ def train(args: argparse.Namespace) -> str:
             cosine_decay=args.cosine_decay, eps=args.eps,
             beta1=args.beta1, beta2=args.beta2,
             trust_region=args.trust_region,
-            woodbury_damping=args.woodbury_damping, history_tol=args.history_tol,
-            max_history=args.max_history, gram_float64=args.gram_float64,
-            woodbury_warmup_steps=args.woodbury_warmup_steps,
         )
 
-    uses_surrogate = args.optimizer in ("gnome", "woodbury")
+    uses_surrogate = args.optimizer == "gnome"
     n_pde_aux = max(1, int(args.n_pde * args.aux_frac)) if uses_surrogate else 0
     n_bc_aux_per_edge = max(1, int(args.n_bc_per_edge * args.aux_frac)) if uses_surrogate else 0
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
+        **pinn.metadata(args),
         "optimizer": args.optimizer,
         "steps": args.steps,
         "arch": args.arch,
@@ -479,7 +457,7 @@ def train(args: argparse.Namespace) -> str:
         "n_pde_aux": n_pde_aux,
         "n_bc_aux_per_edge": n_bc_aux_per_edge,
         "fixed_dataset": fixed_dataset,
-        "sampling": "fixed" if fixed_dataset else "resample_each_step",
+        "sampling": pinn.sampling_settings(args)[1],
         "aux_sampling": ("subsample_fixed_main_each_step" if fixed_dataset else "resample_each_step") if uses_surrogate else None,
         # Non-zero means a sibling {run_id}.diag.jsonl exists for this run.
         "diagnostics_every": args.diagnostics_every,
@@ -501,9 +479,9 @@ def train(args: argparse.Namespace) -> str:
     # over and slow load_run() down for everyone not looking at it.
     diag = None
     if args.diagnostics_every > 0:
-        if args.optimizer not in ("gnome", "woodbury"):
+        if args.optimizer != "gnome":
             raise SystemExit(
-                f"--diagnostics-every requires Gnome or Woodbury; --optimizer "
+                f"--diagnostics-every requires Gnome; --optimizer "
                 f"{args.optimizer} exposes no diagnostics hook."
             )
         diag_params = (
@@ -514,9 +492,6 @@ def train(args: argparse.Namespace) -> str:
             os.path.dirname(run.path) or ".", f"{run.run_id}.diag.jsonl"
         )
         diag = JsonlDiagnostics(diag_path, params=diag_params)
-        if args.optimizer == "woodbury":
-            opt.diagnostics = diag
-            opt.diagnostics_every = args.diagnostics_every
 
     # Exact rho measurement, in its own file. Unlike the diagnostics above this
     # is not free — it needs per-sample gradients, i.e. one backward pass per
@@ -545,28 +520,23 @@ def train(args: argparse.Namespace) -> str:
         if diag is not None:
             print(f"  diagnostics every {args.diagnostics_every} steps "
                   f"→ {diag.path}", flush=True)
-        if args.optimizer == "woodbury":
-            print(f"  history_max={opt_cfg['history_size']} | damping={args.woodbury_damping:g} | "
-                  f"trust_radius={opt_cfg['trust_radius']} | "
-                  f"curvature_warmup={args.woodbury_warmup_steps} | "
-                  f"beta1={args.beta1:g} beta2={args.beta2:g} | gram={opt_cfg['gram_dtype']}", flush=True)
     x_ref, y_ref, u_ref = poisson_reference()
 
     t_start = time.perf_counter()
     window: list[float] = []
     last_avg = last_rel_l2 = float("nan")
     best_avg = best_rel_l2 = float("inf")
-    fixed_batch = None
+    sampler = pinn.BatchSampler(args, lambda: sample_batch(args.n_pde, args.n_bc_per_edge, device))
 
     for step in range(args.steps):
-        if fixed_batch is None:
-            main_batch = sample_batch(args.n_pde, args.n_bc_per_edge, device)
-            if fixed_dataset:
-                fixed_batch = main_batch
-        else:
-            main_batch = fixed_batch
+        quasi_newton = hybrid and step >= args.soap_steps
+        if hybrid and step == args.soap_steps:
+            opt = pinn.build_ssbroyden_phase(model, args)
+            scheduler = None
+            run.log("optimizer", step=step, optimizer="ssbroyden")
+        main_batch = sampler.batch(step)
         if uses_surrogate:
-            if fixed_dataset:
+            if sampler.fixed_batch is not None:
                 aux_batch = sample_aux_from_batch(main_batch, n_pde_aux, n_bc_aux_per_edge)
             else:
                 aux_batch = sample_batch(n_pde_aux, n_bc_aux_per_edge, device)
@@ -582,6 +552,8 @@ def train(args: argparse.Namespace) -> str:
             loss = opt.step(main_closure, aux_closure)
         elif args.optimizer == "engdw":
             loss = opt.step(main_batch)
+        elif quasi_newton:
+            loss = pinn.refinement_step(opt, model, main_batch, stacked_residuals)
         else:
             opt.zero_grad()
             r = stacked_residuals(model, main_batch)
@@ -610,7 +582,7 @@ def train(args: argparse.Namespace) -> str:
                 print(f"  [rho @ step {step + 1}]")
                 print(format_records(records, prefix="    "), flush=True)
 
-        applied_lr = opt.param_groups[0]["applied_lr"] if args.optimizer == "woodbury" else current_lr(opt)
+        applied_lr = current_lr(opt)
         if scheduler is not None:
             scheduler.step()
 
@@ -623,10 +595,10 @@ def train(args: argparse.Namespace) -> str:
                 rho_log.close()
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
             raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=loss_val, lr=applied_lr)
+        run.log_train(step, loss=loss_val, lr=applied_lr, **pinn.phase_metrics(args, step))
         window.append(loss_val)
 
-        if (args.log_every and (step + 1) % args.log_every == 0) or step + 1 == args.steps:
+        if (args.log_every and (step + 1) % args.log_every == 0) or step + 1 == args.steps or (hybrid and step + 1 == args.soap_steps):
             tl = term_losses(
                 model, sample_batch(args.n_pde, args.n_bc_per_edge, device)
             )
@@ -636,7 +608,7 @@ def train(args: argparse.Namespace) -> str:
             best_avg = min(best_avg, last_avg)
             best_rel_l2 = min(best_rel_l2, rl2)
             run.log_val(step + 1, loss=last_avg,
-                        lr=applied_lr if args.optimizer == "woodbury" else current_lr(opt),
+                        lr=current_lr(opt),
                         pde=tl["pde"], bc=tl["bc"], rel_l2=rl2)
             if not args.quiet:
                 ms_per = (time.perf_counter() - t_start) / (step + 1) * 1000

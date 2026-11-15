@@ -4,7 +4,7 @@ None keeps an existing automatic/default-dependent setting where supported.
 """
 
 CONFIG = {
-    # Choices: 'gnome', 'soap', 'adamw'.
+    # Choices: 'adamw', 'soap', 'gnome', 'soap+ssbroyden', 'engdw'.
     'optimizer': 'gnome',
     # arch fused only: consecutive hidden layers per parameter tensor. 1 = one tensor per layer,
     # the control every larger value is compared against (identical function and initialization,
@@ -22,15 +22,6 @@ CONFIG = {
     # Network: plain tanh MLP or the gated modified MLP. Choices: 'mlp', 'modified', 'fused',
     # 'fused-modified'.
     'arch': 'mlp',
-    # 'fourier' applies trainable Fourier features after [t, cos(pi x), sin(pi x)].
-    # Period-2 features do not enforce Dirichlet BCs; use hard_bc or the soft BC loss.
-    # Choices: 'none', 'periodic', 'fourier'.
-    'embed': 'none',
-    # Fourier embedding output dim (even). embed fourier.
-    'fourier_dim': 196,
-    # Initial Fourier frequency spread (B ~ N(0, scale²)); B is trained with the model. jaxpi
-    # uses ~10 for wave. embed fourier.
-    'fourier_scale': 1.5,
     # Enforce Dirichlet u=0 by construction via u = sin(πx)·N(t,x); drops the soft bc loss block.
     'hard_bc': False,
     'weights': [5e-4, 1.0, 1.0, 1.0],  # [pde, displacement IC, velocity IC, Dirichlet BC]
@@ -58,45 +49,59 @@ CONFIG = {
     'quiet': False,
     # Each optimizer keeps its own hyperparameters and learning-rate schedule.
     'optimizers': {
-        'gnome': {
-            # Estimate curvature separately for each auxiliary residual block.
-            'partition_residuals': False,
-            # Aux batch sizes for Gnome are max(K_min, int(N * aux_frac)) per block. Each aux pass is a
-            # full higher-order residual eval, so keep small.
-            'aux_frac': 0.1,
-            'lr': 7e-3,
-            # Gnome per-coordinate update bound: lambda is set to the smallest value with
-            # max|m̂/(v̂+lambda)| <= this, so no coordinate moves more than lr*trust_region in a step.
-            # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain m̂/(v̂+eps)
-            # damping.
-            'trust_region': .15,
-            # Gnome curvature-damping epsilon in m̂/(v̂+eps). Gnome only; SOAP/AdamW keep eps=1e-8.
-            'eps': 1e-12,
-            'beta1': 0.95,
-            'beta2': 0.99,
-            'weight_decay': 1e-8,
+        'adamw': {
+            'lr': 0.001,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero, 1.0 disables. Gnome
-            # never decays.
-            'cosine_decay': 0.10,
+            'cosine_decay': 0.0,
         },
         'soap': {
             'lr': 0.001,
             'beta1': 0.99,
             'beta2': 0.999,
-            'weight_decay': 1e-8,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero, 1.0 disables. Gnome
-            # never decays.
             'cosine_decay': 0.0,
         },
-        'adamw': {
-            'lr': 0.001,
-            'weight_decay': 1e-8,
+        'gnome': {
+            'partition_residuals': False,
+            'aux_frac': 0.1,
+            'lr': 0.007,
+            'trust_region': 0.15,
+            'eps': 1e-12,
+            'beta1': 0.95,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero, 1.0 disables. Gnome
-            # never decays.
+            'cosine_decay': 0.1,
+        },
+        'soap+ssbroyden': {
+            'lr': 0.001,
+            'beta1': 0.99,
+            'beta2': 0.999,
+            'weight_decay': 1e-08,
+            'warmup_steps': 200,
             'cosine_decay': 0.0,
+            'soap_steps': 30000,
+            'ssbroyden_lr': 1.0,
+            'ssbroyden_tolerance_grad': 1e-10,
+        },
+        'engdw': {
+            'lr': 0.05,
+            'engdw_damping': 1e-06,
+            'engdw_momentum': 0.0,
+            'engdw_line_search': True,
+            'engdw_chunk': 32,
+            'engdw_fixed': False,
         },
     },
+    # Input features: 'none', 'periodic', or 'fourier'.
+    'embedding': 'none',
+    # Even number of random Fourier features.
+    'embed_dim': 196,
+    # Initial standard deviation of the frozen Fourier projection.
+    'embed_scale': 1.5,
+    'fixed_dataset': False,
+    'fix_after': None,
+    'float64': False,
 }

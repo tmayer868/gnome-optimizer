@@ -100,6 +100,8 @@ from experiments.common import (
 )
 
 
+from experiments.common import pinn_options as pinn
+
 EXPERIMENT = "poisson5d_pinn"
 
 PI = math.pi
@@ -117,8 +119,8 @@ class PINN(_SharedMLP):
     exact architecture isn't important for the optimizer comparison.
     """
 
-    def __init__(self, d_in: int, hidden: int = 64, depth: int = 5):
-        super().__init__(ConcatEmbedding(d_in), hidden=hidden, depth=depth)
+    def __init__(self, d_in: int, hidden: int = 64, depth: int = 5, embedding=None):
+        super().__init__(embedding if embedding is not None else ConcatEmbedding(d_in), hidden=hidden, depth=depth)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return super().forward(*x.split(1, dim=-1))
@@ -127,8 +129,8 @@ class PINN(_SharedMLP):
 class FusedPINN(FusedMLP):
     """Shared fused MLP accepting the benchmark's single ``(batch, d)`` input."""
 
-    def __init__(self, d_in: int, hidden: int = 64, depth: int = 5, fuse_every: int = 0):
-        super().__init__(ConcatEmbedding(d_in), hidden=hidden, depth=depth,
+    def __init__(self, d_in: int, hidden: int = 64, depth: int = 5, fuse_every: int = 0, embedding=None):
+        super().__init__(embedding if embedding is not None else ConcatEmbedding(d_in), hidden=hidden, depth=depth,
                          fuse_every=fuse_every)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -136,11 +138,11 @@ class FusedPINN(FusedMLP):
 
 
 def build_model(arch: str, d_in: int, hidden: int = 64, depth: int = 5,
-                fuse_every: int = 0) -> nn.Module:
+                fuse_every: int = 0, embedding=None) -> nn.Module:
     if arch == "mlp":
-        return PINN(d_in, hidden=hidden, depth=depth)
+        return PINN(d_in, hidden=hidden, depth=depth, embedding=embedding)
     if arch == "fused":
-        return FusedPINN(d_in, hidden=hidden, depth=depth, fuse_every=fuse_every)
+        return FusedPINN(d_in, hidden=hidden, depth=depth, fuse_every=fuse_every, embedding=embedding)
     raise ValueError(f"unknown arch: {arch}")
 
 
@@ -365,9 +367,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
+@pinn.preserve_default_dtype
 def train(args: argparse.Namespace) -> str:
+    hybrid = args.optimizer == "soap+ssbroyden"
     torch.manual_seed(args.seed)
-    dtype = torch.float64 if args.dtype == "float64" else torch.float32
+    dtype = torch.float64 if hybrid or args.optimizer == "engdw" or args.dtype == "float64" else torch.float32
     device = pick_device()
     bcw = args.bc_volume_weight
     if args.optimizer == "engdw":
@@ -389,16 +393,22 @@ def train(args: argparse.Namespace) -> str:
             print(f"[{EXPERIMENT}] float64 requested; MPS has no float64 "
                   f"— falling back to CPU.", flush=True)
     model = build_model(args.arch, args.d, hidden=args.hidden, depth=args.depth,
-                        fuse_every=args.fuse_every).to(device=device, dtype=dtype)
+                        fuse_every=args.fuse_every, embedding=pinn.build_embedding(
+                            args.embedding, args.d, spatial_dims=tuple(range(args.d)),
+                            embed_dim=args.embed_dim, embed_scale=args.embed_scale,
+                        )).to(device=device, dtype=dtype)
 
     if args.optimizer == "engdw":
         residual_fn = make_functional_residual(model, args.d, bcw)
         opt = ENGDW(model, residual_fn, lr=args.lr, damping=args.engdw_damping,
+                    momentum=args.engdw_momentum,
                     line_search=args.engdw_line_search, chunk_size=args.engdw_chunk)
         opt_cfg = dict(lr=args.lr, damping=args.engdw_damping,
                        line_search=args.engdw_line_search,
                        loss="energy", residual_scaling="paper_methods")
         scheduler = None
+    elif hybrid:
+        opt, opt_cfg, scheduler = pinn.build_soap_phase(model, args)
     else:
         opt, opt_cfg, scheduler = build_optimizer(
             args.optimizer, model.parameters(), args.lr, args.weight_decay,
@@ -411,13 +421,14 @@ def train(args: argparse.Namespace) -> str:
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
+        **pinn.metadata(args),
         # Non-zero means a sibling {run_id}.diag.jsonl exists.
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
         "arch": args.arch,
         "fuse_every": getattr(model, "chunks", None),
         "steps": args.steps,
-        "dtype": args.dtype,
+        "dtype": str(dtype).removeprefix("torch."),
         "d": args.d,
         "hidden": args.hidden,
         "depth": args.depth,
@@ -479,30 +490,47 @@ def train(args: argparse.Namespace) -> str:
     last_avg = last_rel_l2 = float("nan")
     best_avg = best_rel_l2 = float("inf")
 
+    def draw(n_int, n_bc):
+        return (torch.rand(n_int, args.d, device=device, dtype=dtype),
+                sample_boundary(n_bc, args.d, device, dtype))
+
+    def residual_fn(model, batch):
+        interior, boundary = batch
+        r_int = pde_residual(model, interior.clone().requires_grad_(True))
+        r_bc = bc_residual(model, boundary)
+        return stack_residuals([r_int, r_bc], [1.0, float(2 * args.d)] if bcw else None)
+
+    sampler = pinn.BatchSampler(args, lambda: draw(args.n_int, args.n_bc))
     for step in range(args.steps):
+        quasi_newton = hybrid and step >= args.soap_steps
+        if hybrid and step == args.soap_steps:
+            opt = pinn.build_ssbroyden_phase(model, args)
+            scheduler = None
+            run.log("optimizer", step=step, optimizer="ssbroyden")
+        main_batch = sampler.batch(step)
         if args.optimizer == "gnome":
+            if sampler.fixed_batch is None:
+                aux_batch = draw(args.aux_n_int, args.aux_n_bc)
+            else:
+                aux_batch = tuple(pinn.subsample_block((block,), n)[0] for block, n in
+                                  zip(main_batch, (args.aux_n_int, args.aux_n_bc)))
+
             def main_closure():
-                r = stacked_residuals(
-                    model, args.n_int, args.n_bc, args.d, device, dtype, bcw)
+                r = residual_fn(model, main_batch)
                 return r, torch.zeros_like(r)
 
             def aux_closure():
-                r = stacked_residuals(
-                    model, args.aux_n_int, args.aux_n_bc, args.d, device, dtype, bcw)
+                r = residual_fn(model, aux_batch)
                 return r, torch.zeros_like(r)
 
             loss = opt.step(main_closure, aux_closure)
         elif args.optimizer == "engdw":
-            # Plain (no-grad) points: the functional Laplacian differentiates
-            # w.r.t. x via torch.func, so x must not be an autograd leaf.
-            x_int = torch.rand(args.n_int, args.d, device=device, dtype=dtype)
-            x_bc = sample_boundary(args.n_bc, args.d, device, dtype)
-            loss = opt.step(x_int, x_bc)                 # returns a float
+            loss = opt.step(*main_batch)
+        elif quasi_newton:
+            loss = pinn.refinement_step(opt, model, main_batch, residual_fn)
         else:
             opt.zero_grad()
-            r = stacked_residuals(
-                model, args.n_int, args.n_bc, args.d, device, dtype, bcw)
-            loss = (r ** 2).sum() / r.shape[0]
+            loss = residual_fn(model, main_batch).square().mean()
             loss.backward()
             opt.step()
 
@@ -521,10 +549,11 @@ def train(args: argparse.Namespace) -> str:
             run.finish(completed=False, diverged=True, diverged_step=step)
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
             raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=loss_val)
+        run.log_train(step, loss=loss_val, lr=current_lr(opt), **pinn.phase_metrics(args, step))
         window.append(loss_val)
 
-        if args.log_every and (step + 1) % args.log_every == 0:
+        if ((args.log_every and (step + 1) % args.log_every == 0)
+                or step + 1 == args.steps or (hybrid and step + 1 == args.soap_steps)):
             tl = term_losses(model, args.n_int, args.n_bc, args.d, device, dtype)
             rl2 = eval_rel_l2(model, x_eval, u_eval)
             last_avg = sum(window) / len(window)

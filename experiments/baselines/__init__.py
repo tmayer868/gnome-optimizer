@@ -1,7 +1,8 @@
 """Baselines for Gnome benchmarks.
 
 SOAP, dense ENGD, and Woodbury ENGD. AdamW comes from ``torch.optim``
-and is not re-exported.
+and is not re-exported. SOAP warm-start and SS-Broyden refinement helpers live
+in ``experiments.baselines.ssbroyden``; Scimba is loaded only when requested.
 """
 
 from experiments.baselines.soap import SOAP

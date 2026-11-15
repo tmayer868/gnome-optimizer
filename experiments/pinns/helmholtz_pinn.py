@@ -24,18 +24,12 @@ the curvature, step there) with the curvature source swapped from gradient
 outer products to a Hutchinson GGN estimate. This problem isolates exactly
 that substitution, on the rung where the effect is largest.
 
-**Toggling the embedding.** ``--embedding {fourier,raw}`` and
-``--bc {auto,none,dirichlet}`` are independent, giving the full 2x2:
-
-* ``fourier`` + ``none`` (default) — the paper's setup, single-block loss.
-* ``raw`` + ``dirichlet`` (the other ``auto`` default) — a conventional
-  two-block PINN. Periodicity is gone, so a BC block is *required*: without
-  one, ``Δ + k²`` on a bounded domain admits any homogeneous solution and the
-  problem is genuinely ill-posed. The script warns if you ask for this.
-* ``fourier`` + ``dirichlet`` — the clean single-variable ablation. The
-  embedding is unchanged and only the block count moves, so it separates "hard
-  periodicity constraint" from "one block vs two".
-* ``raw`` + ``none`` — ill-posed, warned about, kept only for completeness.
+**Toggling the embedding.** ``embedding`` accepts ``periodic`` (the paper's
+fixed harmonics, and the default), ``fourier`` (random Fourier features over
+those harmonics), or ``none`` (raw coordinates). With ``bc='auto'``, both
+periodic feature choices use a PDE-only loss, while raw coordinates use a
+Dirichlet BC block. Explicit ``bc='dirichlet'`` retains that block with any
+embedding. ``bc='none'`` with raw coordinates leaves the problem unanchored.
 
 Note that adding the Dirichlet block does *not* rescue the weakly-observed
 modes by much at ``k=1``. A constant offset ``c`` produces ``|r_pde| = k²c = c``
@@ -125,6 +119,8 @@ from experiments.common import (
 )
 
 
+from experiments.common import pinn_options as pinn
+
 EXPERIMENT = "helmholtz_pinn"
 
 X_MIN, X_MAX = -1.0, 1.0
@@ -163,25 +159,18 @@ class PINN(_SharedMLP):
     ``depth`` counts *total* linear layers, so the paper's "4 hidden layers,
     30 neurons" is ``--depth 5 --hidden 30``.
 
-    ``embedding="raw"`` feeds ``(x, y)`` straight in. No input normalization is
+    ``embedding="none"`` feeds ``(x, y)`` straight in. No input normalization is
     needed either way — the domain is already ``[-1, 1]²`` and the Fourier
     features are bounded by construction — so the two paths differ only in
     periodicity and frequency content, not in input scale.
     """
 
     def __init__(self, hidden: int = 30, depth: int = 5, modes: int = 1,
-                 embedding: str = "fourier"):
-        if embedding == "fourier":
-            embed: nn.Module = PeriodicEmbedding(
-                2,
-                n_harmonics=modes,
-                wavenumber=2.0 * math.pi / L_DOMAIN,
-                periodic_dims=(0, 1),
-            )
-        elif embedding == "raw":
-            embed = ConcatEmbedding(2)
-        else:
-            raise ValueError(f"unknown embedding: {embedding}")
+                 embedding: str = "periodic", embed_dim: int = 32, embed_scale: float = 1.0):
+        embed = pinn.build_embedding(
+            embedding, 2, spatial_dims=(0, 1), length=L_DOMAIN, periodic=True,
+            n_harmonics=modes, embed_dim=embed_dim, embed_scale=embed_scale,
+        )
         super().__init__(embed, hidden=hidden, depth=depth)
         self.embedding = embedding
 
@@ -361,9 +350,7 @@ def build_optimizer(
             precondition_frequency=10, precondition_1d=True,
         )
         opt = SOAP(params, **cfg)
-    elif name in ("adamw", "adamw+lbfgs"):
-        # adamw+lbfgs uses plain AdamW for phase 1; the L-BFGS refinement is
-        # a separate phase appended after the main loop (see lbfgs_phase).
+    elif name == "adamw":
         cfg = dict(
             lr=lr, weight_decay=weight_decay,
             betas=(0.9, 0.999), eps=1e-8,
@@ -378,88 +365,6 @@ def build_optimizer(
     return opt, cfg, scheduler
 
 
-def lbfgs_phase(
-    model: nn.Module, fixed_batch, eval_coords, u_ref: torch.Tensor,
-    args: argparse.Namespace, run: RunLogger, bc_weight: float | None,
-    start_step: int, best: dict[str, float],
-) -> dict:
-    """Full-batch L-BFGS refinement, run after the AdamW phase.
-
-    This is the paper's Table 3 case 1 comparator — "BFGS (PyTorch)", which
-    reached rel_L2 3.7e-7. Note that is ~100x *worse* than the ~1e-9 cluster;
-    what gets to 1e-9 there is the **self-scaled** quasi-Newton variants
-    (SSBFGS / SSBroyden) paired with a trust-region or Wolfe line search.
-    Ordinary L-BFGS has no self-scaling, so 1e-7 is the number to beat here,
-    not 1e-9.
-
-    L-BFGS approximates curvature from a history of (grad, step) pairs, which
-    is only valid if the objective is a fixed function — so we draw ONE
-    collocation set here and reuse it for every iteration (unlike the AdamW
-    phase, which resamples each step). ``torch.optim.LBFGS`` re-evaluates the
-    closure several times per ``.step()`` for its strong-Wolfe line search;
-    each outer step runs ``--lbfgs-max-iter`` inner iterations (must be >1 —
-    the line search cannot recover from a cold identity Hessian in a single
-    iteration and stalls).
-    """
-    opt = torch.optim.LBFGS(
-        model.parameters(), lr=args.lbfgs_lr, max_iter=args.lbfgs_max_iter,
-        history_size=args.lbfgs_history, line_search_fn="strong_wolfe",
-        tolerance_grad=1e-16, tolerance_change=1e-16,
-    )
-    log_every = max(1, args.log_every // args.lbfgs_max_iter)
-
-    if not args.quiet:
-        total = args.lbfgs_steps * args.lbfgs_max_iter
-        print(
-            f"[{EXPERIMENT}] L-BFGS refinement: {args.lbfgs_steps} outer steps "
-            f"x {args.lbfgs_max_iter} = {total} iters on a fixed batch "
-            f"(N_pde={args.n_pde}, history={args.lbfgs_history}, "
-            f"lr={args.lbfgs_lr})",
-            flush=True,
-        )
-
-    t0 = time.perf_counter()
-    last_loss = float("nan")
-    last = {"rel_l2": float("nan"), "rel_linf": float("nan")}
-
-    for i in range(args.lbfgs_steps):
-        def closure():
-            opt.zero_grad()
-            r = residuals(model, fixed_batch, args.a1, args.a2, args.k,
-                          bc_weight)
-            loss = (r ** 2).sum() / r.shape[0]
-            loss.backward()
-            return loss
-
-        loss = opt.step(closure)
-        last_loss = float(loss.detach().item())
-        step = start_step + i
-        if diverged(last_loss):
-            run.finish(completed=False, diverged=True, diverged_step=step)
-            print(f"[{EXPERIMENT}] L-BFGS diverged at step {step} — stopping.",
-                  flush=True)
-            raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=last_loss)
-
-        if (i + 1) % log_every == 0:
-            rl2, rlinf = eval_errors(model, eval_coords, u_ref)
-            last = {"rel_l2": rl2, "rel_linf": rlinf}
-            best["rel_l2"] = min(best["rel_l2"], rl2)
-            best["rel_linf"] = min(best["rel_linf"], rlinf)
-            run.log_val(step + 1, loss=last_loss, lr=args.lbfgs_lr,
-                        rel_l2=rl2, rel_linf=rlinf)
-            if not args.quiet:
-                ms_per = (time.perf_counter() - t0) / (i + 1) * 1000
-                print(
-                    f"  L-BFGS {i + 1:5d}/{args.lbfgs_steps}  "
-                    f"loss={last_loss:.4e}  rel_l2={rl2:.3e}  "
-                    f"rel_linf={rlinf:.3e}  {ms_per:.1f} ms/step",
-                    flush=True,
-                )
-
-    return {"last_avg": last_loss, "last": last, "best": best}
-
-
 # ========================= CLI / training =========================
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -468,10 +373,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+@pinn.preserve_default_dtype
 def train(args: argparse.Namespace) -> str:
+    hybrid = args.optimizer == "soap+ssbroyden"
     torch.manual_seed(args.seed)
     device = pick_device()
-    dtype = getattr(torch, args.dtype)
+    dtype = torch.float64 if hybrid or args.optimizer == "engdw" else getattr(torch, args.dtype)
     if device.type == "mps" and dtype is torch.float64:
         device = torch.device("cpu")            # MPS has no float64
         if not args.quiet:
@@ -480,34 +387,40 @@ def train(args: argparse.Namespace) -> str:
     torch.set_default_dtype(dtype)              # periodic-frequency buffer dtype
 
     use_bc = args.bc == "dirichlet" or (
-        args.bc == "auto" and args.embedding == "raw")
+        args.bc == "auto" and args.embedding == "none")
     bc_weight = args.bc_weight if use_bc else None
-    if args.embedding == "raw" and not use_bc:
-        print(f"[{EXPERIMENT}] WARNING: --embedding raw with no BC block. "
+    if args.embedding == "none" and not use_bc:
+        print(f"[{EXPERIMENT}] WARNING: embedding=none with no BC block. "
               f"Nothing enforces the boundary conditions, so Helmholtz on a "
               f"bounded domain is ill-posed here — any homogeneous solution "
               f"(Lv = 0) can be added freely. Results are not meaningful.",
               flush=True)
 
     model = PINN(hidden=args.hidden, depth=args.depth, modes=args.modes,
-                 embedding=args.embedding).to(device=device, dtype=dtype)
-    opt, opt_cfg, scheduler = build_optimizer(
-        args.optimizer, model.parameters(), args.lr, args.weight_decay,
-        warmup=args.warmup_steps, total_steps=args.steps,
-        cosine_decay=args.cosine_decay, eps=args.eps,
-        beta1=args.beta1, beta2=args.beta2,
-        trust_region=args.trust_region,
-    )
+                 embedding=args.embedding, embed_dim=args.embed_dim, embed_scale=args.embed_scale).to(device=device, dtype=dtype)
+    residual_fn = lambda model, batch: residuals(model, batch, args.a1, args.a2, args.k, bc_weight)
+    if args.optimizer in ("soap+ssbroyden", "engdw"):
+        opt, opt_cfg, scheduler = pinn.build_extra_optimizer(
+            model, args, residual_fn, precondition_frequency=10)
+    else:
+        opt, opt_cfg, scheduler = build_optimizer(
+            args.optimizer, model.parameters(), args.lr, args.weight_decay,
+            warmup=args.warmup_steps, total_steps=args.steps,
+            cosine_decay=args.cosine_decay, eps=args.eps,
+            beta1=args.beta1, beta2=args.beta2,
+            trust_region=args.trust_region,
+        )
 
     n_aux = max(8, int(args.n_pde * args.aux_frac))
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
+        **pinn.metadata(args),
         # Non-zero means a sibling {run_id}.diag.jsonl exists.
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
         "steps": args.steps,
-        "dtype": args.dtype,
+        "dtype": str(dtype).removeprefix("torch."),
         "a1": args.a1,
         "a2": args.a2,
         "k": args.k,
@@ -583,10 +496,17 @@ def train(args: argparse.Namespace) -> str:
         return (sample_batch(n_int, device, dtype),
                 sample_boundary(n_bnd, device, dtype) if use_bc else None)
 
+    sampler = pinn.BatchSampler(args, lambda: draw(args.n_pde, args.n_bc))
     for step in range(args.steps):
-        main_batch = draw(args.n_pde, args.n_bc)
+        quasi_newton = hybrid and step >= args.soap_steps
+        if hybrid and step == args.soap_steps:
+            opt = pinn.build_ssbroyden_phase(model, args)
+            scheduler = None
+            run.log("optimizer", step=step, optimizer="ssbroyden")
+        main_batch = sampler.batch(step)
         if args.optimizer == "gnome":
-            aux_batch = draw(n_aux, n_bc_aux)
+            aux_batch = (pinn.subsample_nested(main_batch, n_aux, n_bc_aux)
+                         if sampler.fixed_batch is not None else draw(n_aux, n_bc_aux))
 
             def main_closure():
                 r = residuals(model, main_batch, args.a1, args.a2, args.k,
@@ -599,6 +519,10 @@ def train(args: argparse.Namespace) -> str:
                 return r, torch.zeros_like(r)
 
             loss = opt.step(main_closure, aux_closure)
+        elif args.optimizer == "engdw":
+            loss = opt.step(main_batch)
+        elif quasi_newton:
+            loss = pinn.refinement_step(opt, model, main_batch, residual_fn)
         else:
             opt.zero_grad()
             r = residuals(model, main_batch, args.a1, args.a2, args.k,
@@ -616,17 +540,18 @@ def train(args: argparse.Namespace) -> str:
         if scheduler is not None:
             scheduler.step()
 
-        loss_val = float(loss.detach().item())
+        loss_val = float(loss.detach().item()) if torch.is_tensor(loss) else float(loss)
         if diverged(loss_val):
             if diag is not None:
                 diag.close()
             run.finish(completed=False, diverged=True, diverged_step=step)
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
             raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=loss_val)
+        run.log_train(step, loss=loss_val, lr=current_lr(opt), **pinn.phase_metrics(args, step))
         window.append(loss_val)
 
-        if args.log_every and (step + 1) % args.log_every == 0:
+        if ((args.log_every and (step + 1) % args.log_every == 0)
+                or step + 1 == args.steps or (hybrid and step + 1 == args.soap_steps)):
             rl2, rlinf = eval_errors(model, eval_coords, u_ref)
             last_avg = sum(window) / len(window)
             last_rel_l2, last_rel_linf = rl2, rlinf
@@ -646,18 +571,6 @@ def train(args: argparse.Namespace) -> str:
                 )
             window.clear()
 
-    if args.optimizer == "adamw+lbfgs" and args.lbfgs_steps > 0:
-        best_d = {"rel_l2": best_rel_l2, "rel_linf": best_rel_linf}
-        res = lbfgs_phase(
-            model, draw(args.n_pde, args.n_bc), eval_coords, u_ref,
-            args, run, bc_weight, args.steps, best_d,
-        )
-        last_avg = res["last_avg"]
-        best_avg = min(best_avg, last_avg)
-        last_rel_l2 = res["last"]["rel_l2"]
-        last_rel_linf = res["last"]["rel_linf"]
-        best_rel_l2 = res["best"]["rel_l2"]
-        best_rel_linf = res["best"]["rel_linf"]
 
     if diag is not None:
         diag.close()

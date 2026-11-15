@@ -300,67 +300,6 @@ def test_unsupported_parameters_rejected(shape):
         WoodburyGGN([torch.nn.Parameter(torch.zeros(shape))])
 
 
-@pytest.mark.parametrize("fixed", [False, True])
-@pytest.mark.parametrize("arch", ["mlp", "fused"])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-def test_poisson_integration(tmp_path, monkeypatch, fixed, arch, dtype):
-    old_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    monkeypatch.setattr(poisson, "pick_device", lambda: torch.device("cpu"))
-    reference = poisson.poisson_reference
-    monkeypatch.setattr(poisson, "poisson_reference", lambda: reference(9, 8))
-    batches = []
-    residual = poisson.stacked_residuals
-    def capture(model, batch):
-        batches.append(tuple(t.detach().clone() for t in batch))
-        return residual(model, batch)
-    monkeypatch.setattr(poisson, "stacked_residuals", capture)
-    args = poisson.parse_args(config_overrides(poisson, [
-        "--optimizer", "woodbury", "--hidden", "3", "--depth", "4", "--arch", arch,
-        "--steps", "4", "--n-pde", "8", "--n-bc-per-edge", "3", "--aux-frac", "0.5",
-        "--woodbury-damping", "0.1", "--max-history", "2", "--gram-float64",
-        "--woodbury-warmup-steps", "2",
-        "--beta1", "0", "--trust-region", "1.0",
-        "--diagnostics-every", "2", "--diagnostics-params", "0", "--warmup-steps", "0",
-        "--log-every", "2", "--runs-dir", str(tmp_path), "--quiet",
-    ] + (["--fixed-dataset"] if fixed else [])))
-    try:
-        path = poisson.train(args)
-    finally:
-        torch.set_default_dtype(old_dtype)
-    records = [json.loads(line) for line in Path(path).read_text().splitlines()]
-    cfg = records[0]["hyperparameters"]
-    assert cfg["opt.beta1"] == 0 and cfg["opt.history_size"] == 2
-    assert cfg["opt.damping"] == 0.1 and cfg["opt.weight_decay"] == 0
-    assert cfg["opt.trust_radius"] == 1.0
-    assert cfg["opt.curvature_warmup_steps"] == 2
-    training_lrs = [r["metrics"]["lr"] for r in records if r["type"] == "train"]
-    assert training_lrs[:2] == [0, 0]
-    assert all(lr > 0 for lr in training_lrs[2:])
-    validation_lrs = [r["metrics"]["lr"] for r in records if r["type"] == "val"]
-    assert validation_lrs == [training_lrs[1], training_lrs[3]]
-    assert cfg["opt.gram_dtype"] == "float64"
-    assert cfg["aux_sampling"] == ("subsample_fixed_main_each_step" if fixed else "resample_each_step")
-    assert records[-1]["completed"] and math.isfinite(records[-1]["final_rel_l2"])
-    assert len(batches) == 8  # main and aux each step
-    main, aux = batches[::2], batches[1::2]
-    assert all(torch.equal(a, b) for a, b in zip(main[0], main[1])) == fixed
-    assert any(not torch.equal(aux[0][0], batch[0]) for batch in aux[1:])
-    for subset, parent in zip(aux, main):
-        s, p = torch.cat(subset[:2], 1), torch.cat(parent[:2], 1)
-        membership = (s[:, None] == p[None]).all(-1).any(-1)
-        assert membership.all() if fixed else not membership.any()
-        if fixed:
-            s, p = torch.cat(subset[2:], 1), torch.cat(parent[2:], 1)
-            for edge in range(4):
-                assert (s[edge:edge+1, None] == p[None, edge*3:(edge+1)*3]).all(-1).any()
-    diag_path, = Path(path).parent.glob("*.diag.jsonl")
-    diag = [json.loads(line) for line in diag_path.read_text().splitlines()]
-    assert [r["step"] for r in diag] == [2, 4]
-    assert all(r["param"] == 0 and r["history_length"] == 2 for r in diag)
-    assert [r["curvature_warmup"] for r in diag] == [True, False]
-    assert [r["lr"] for r in diag] == validation_lrs
-    assert all(r["trust_ratio"] <= 1 + 1e-5 and r["damping"] >= 0.1 for r in diag)
 
 
 @pytest.mark.parametrize("option,value", [
@@ -552,12 +491,6 @@ def test_adaptive_damping_resume_momentum_and_independent_groups():
             assert state["lm_lambda"] == pytest.approx(lam, rel=5e-6)
 
 
-def test_poisson_trust_disabled_restores_fixed_damping():
-    args = poisson.parse_args(config_overrides(poisson, ["--optimizer", "woodbury", "--trust-region", "0"]))
-    opt, cfg, _ = poisson.build_optimizer(
-        "woodbury", [torch.nn.Parameter(torch.zeros(2, 2))], args.lr, args.weight_decay,
-        warmup=0, total_steps=10, cosine_decay=1, trust_region=args.trust_region)
-    assert opt.param_groups[0]["trust_radius"] is cfg["trust_radius"] is None
 
 
 def test_legacy_checkpoint_does_not_enable_trust_region():

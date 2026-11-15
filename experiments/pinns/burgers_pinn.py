@@ -68,6 +68,8 @@ from experiments.reference_solutions import (
 )
 
 
+from experiments.common import pinn_options as pinn
+
 EXPERIMENT = "burgers_pinn"
 
 T_MIN, T_MAX = 0.0, 1.0
@@ -92,8 +94,9 @@ JAXPI_REFERENCE_CACHE = reference_path("burgers.mat")
 class PINN(_SharedMLP):
     """Maps ``(t, x) → u`` via a plain tanh MLP."""
 
-    def __init__(self, hidden: int = 20, depth: int = 9):
-        super().__init__(ConcatEmbedding(2), hidden=hidden, depth=depth)
+    def __init__(self, hidden: int = 20, depth: int = 9,
+                 embedding: nn.Module | None = None):
+        super().__init__(embedding if embedding is not None else ConcatEmbedding(2), hidden=hidden, depth=depth)
 
 
 # ========================= Residuals =========================
@@ -490,16 +493,22 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
+@pinn.preserve_default_dtype
 def train(args: argparse.Namespace) -> str:
+    hybrid = args.optimizer == "soap+ssbroyden"
     fixed_dataset = args.fixed_dataset or args.engdw_fixed
     torch.manual_seed(args.seed)
     device = pick_device()
-    dtype = torch.float64 if args.float64 or args.optimizer == "engdw" else torch.float32
+    dtype = torch.float64 if args.float64 or hybrid or args.optimizer == "engdw" else torch.float32
     if dtype == torch.float64 and device.type == "mps":
         device = torch.device("cpu")
         if not args.quiet:
             print(f"[{EXPERIMENT}] float64: MPS has no double support; using CPU.")
-    model = PINN(hidden=args.hidden, depth=args.depth).to(device=device, dtype=dtype)
+    embedding = pinn.build_embedding(
+        args.embedding, 2, spatial_dims=(1,), length=2.0,
+        embed_dim=args.embed_dim, embed_scale=args.embed_scale,
+    )
+    model = PINN(hidden=args.hidden, depth=args.depth, embedding=embedding).to(device=device, dtype=dtype)
     if args.optimizer == "engdw":
         residual, jacobian = make_engdw_functions(model, args.engdw_chunk)
         opt = ENGDW(model, residual, jacobian_fn=jacobian, lr=args.lr,
@@ -512,6 +521,8 @@ def train(args: argparse.Namespace) -> str:
                        energy="0.5 * sum(block MSEs)", residual_scaling="1/sqrt(N_block)",
                        jacobian="vmap(jacrev(single_residual))")
         scheduler = None
+    elif hybrid:
+        opt, opt_cfg, scheduler = pinn.build_soap_phase(model, args)
     else:
         opt, opt_cfg, scheduler = build_optimizer(
             args.optimizer, model.parameters(), args.lr, args.weight_decay,
@@ -530,6 +541,7 @@ def train(args: argparse.Namespace) -> str:
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
+        **pinn.metadata(args),
         # Non-zero means a sibling {run_id}.diag.jsonl exists.
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
@@ -543,7 +555,7 @@ def train(args: argparse.Namespace) -> str:
         "n_ic_aux": n_ic_aux,
         "n_bc_aux": n_bc_aux,
         "fixed_dataset": fixed_dataset,
-        "sampling": "fixed" if fixed_dataset else "resample_each_step",
+        "sampling": pinn.sampling_settings(args)[1],
         "aux_sampling": ("subsample_fixed_main_each_step" if fixed_dataset else "resample_each_step") if args.optimizer == "gnome" else None,
         "n_params": n_params,
         "nu": NU,
@@ -617,12 +629,19 @@ def train(args: argparse.Namespace) -> str:
     last_pde = last_ic = last_bc = float("nan")
     best_avg = best_rel_l2 = best_rel_l2_j = float("inf")
 
-    fixed_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device, dtype) if fixed_dataset else None
+    sampler = pinn.BatchSampler(args, lambda: sample_batch(
+        args.n_pde, args.n_ic, args.n_bc, device, dtype))
     for step in range(args.steps):
-        main_batch = fixed_batch if fixed_dataset else sample_batch(args.n_pde, args.n_ic, args.n_bc, device, dtype)
+        quasi_newton = hybrid and step >= args.soap_steps
+        if hybrid and step == args.soap_steps:
+            opt = pinn.build_ssbroyden_phase(model, args)
+            scheduler = None
+            run.log("optimizer", step=step, optimizer="ssbroyden")
+        main_batch = sampler.batch(step)
         if args.optimizer == "gnome":
-            aux_batch = (sample_aux_from_batch(main_batch, n_pde_aux, n_ic_aux, n_bc_aux)
-                         if fixed_dataset else sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device, dtype))
+            aux_batch = (sample_aux_from_batch(main_batch, min(args.n_pde, n_pde_aux),
+                                               min(args.n_ic, n_ic_aux), min(args.n_bc, n_bc_aux))
+                         if sampler.fixed_batch is not None else sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device, dtype))
 
             def main_closure():
                 r = stacked_residuals(model, main_batch)
@@ -635,6 +654,8 @@ def train(args: argparse.Namespace) -> str:
             loss = opt.step(main_closure, aux_closure)
         elif args.optimizer == "engdw":
             loss = opt.step(main_batch)
+        elif quasi_newton:
+            loss = pinn.refinement_step(opt, model, main_batch, stacked_residuals)
         else:
             opt.zero_grad()
             r = stacked_residuals(model, main_batch)
@@ -659,10 +680,10 @@ def train(args: argparse.Namespace) -> str:
             run.finish(completed=False, diverged=True, diverged_step=step)
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
             raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=loss_val, lr=applied_lr)
+        run.log_train(step, loss=loss_val, lr=applied_lr, **pinn.phase_metrics(args, step))
         window.append(loss_val)
 
-        if (args.log_every and (step + 1) % args.log_every == 0) or step + 1 == args.steps:
+        if (args.log_every and (step + 1) % args.log_every == 0) or step + 1 == args.steps or (hybrid and step + 1 == args.soap_steps):
             tl = term_losses(
                 model, sample_batch(args.n_pde, args.n_ic, args.n_bc, device, dtype)
             )

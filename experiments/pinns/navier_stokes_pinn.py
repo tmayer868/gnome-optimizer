@@ -67,6 +67,8 @@ from experiments.common import MLP as _SharedMLP, ConcatEmbedding
 from experiments.reference_solutions import cached_reference_path, reference_path
 
 
+from experiments.common import pinn_options as pinn
+
 EXPERIMENT = "navier_stokes_pinn"
 
 # Domain matches Raissi's wake region. Time span is 200 snapshots × 0.1 dt.
@@ -101,8 +103,9 @@ class PINN(_SharedMLP):
         depth: int = 8,
         lambda1_init: float = 0.0,
         lambda2_init: float = 0.0,
+        embedding: nn.Module | None = None,
     ):
-        super().__init__(ConcatEmbedding(3), hidden=hidden, depth=depth,
+        super().__init__(embedding if embedding is not None else ConcatEmbedding(3), hidden=hidden, depth=depth,
                          out_features=3)
         self.lambda1 = nn.Parameter(torch.tensor(float(lambda1_init)))
         self.lambda2 = nn.Parameter(torch.tensor(float(lambda2_init)))
@@ -347,9 +350,9 @@ def eval_rel_l2(
         for i in range(0, tt.shape[0], batch_size):
             preds.append(
                 model(
-                    tt[i:i + batch_size].to(device),
-                    xx[i:i + batch_size].to(device),
-                    yy[i:i + batch_size].to(device),
+                    tt[i:i + batch_size].to(device=device, dtype=next(model.parameters()).dtype),
+                    xx[i:i + batch_size].to(device=device, dtype=next(model.parameters()).dtype),
+                    yy[i:i + batch_size].to(device=device, dtype=next(model.parameters()).dtype),
                 ).cpu()
             )
     if was_training:
@@ -425,37 +428,54 @@ def parse_args(argv=None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+@pinn.preserve_default_dtype
 def train(args: argparse.Namespace) -> str:
+    hybrid = args.optimizer == "soap+ssbroyden"
     torch.manual_seed(args.seed)
     device = pick_device()
+    if args.float64 or hybrid or args.optimizer == "engdw":
+        torch.set_default_dtype(torch.float64)
+        if device.type == "mps":
+            device = torch.device("cpu")
 
     if not args.quiet:
         print(f"[{EXPERIMENT}] loading reference DNS...", flush=True)
     ref = load_reference()
-    data_pool = sparse_data_pool(ref, args.n_data, device, seed=args.seed)
+    data_pool = tuple(t.to(dtype=torch.get_default_dtype()) for t in
+                      sparse_data_pool(ref, args.n_data, device, seed=args.seed))
 
-    model = PINN(
-        hidden=args.hidden, depth=args.depth,
-        lambda1_init=args.lambda1_init, lambda2_init=args.lambda2_init,
-    ).to(device)
-
-    opt, opt_cfg, scheduler = build_optimizer(
-        args.optimizer, model.parameters(), args.lr, args.weight_decay,
-        warmup=args.warmup_steps, total_steps=args.steps,
-        cosine_decay=args.cosine_decay, eps=args.eps,
-        beta1=args.beta1, beta2=args.beta2,
-        trust_region=args.trust_region,
-    )
-
-    n_pde_aux = max(8, int(args.n_pde * args.aux_frac))
-    n_data_aux = max(8, int(args.n_data * args.aux_frac))
     block_weights = (
         args.w_data_u, args.w_data_v,
         args.w_continuity, args.w_momentum_x, args.w_momentum_y,
     )
 
+    model = PINN(
+        hidden=args.hidden, depth=args.depth,
+        lambda1_init=args.lambda1_init, lambda2_init=args.lambda2_init,
+        embedding=pinn.build_embedding(args.embedding, 3, spatial_dims=(1, 2),
+                                       length=max(X_MAX-X_MIN, Y_MAX-Y_MIN),
+                                       embed_dim=args.embed_dim, embed_scale=args.embed_scale),
+    ).to(device)
+
+    residual_fn = lambda model, batch: stacked_residuals(model, data_pool, batch, block_weights)
+    if args.optimizer in ("soap+ssbroyden", "engdw"):
+        opt, opt_cfg, scheduler = pinn.build_extra_optimizer(
+            model, args, residual_fn, precondition_frequency=10)
+    else:
+        opt, opt_cfg, scheduler = build_optimizer(
+            args.optimizer, model.parameters(), args.lr, args.weight_decay,
+            warmup=args.warmup_steps, total_steps=args.steps,
+            cosine_decay=args.cosine_decay, eps=args.eps,
+            beta1=args.beta1, beta2=args.beta2,
+            trust_region=args.trust_region,
+        )
+
+    n_pde_aux = max(8, int(args.n_pde * args.aux_frac))
+    n_data_aux = max(8, int(args.n_data * args.aux_frac))
+
     n_params = sum(p.numel() for p in model.parameters())
     hyperparameters = {
+        **pinn.metadata(args),
         # Non-zero means a sibling {run_id}.diag.jsonl exists.
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
@@ -477,6 +497,7 @@ def train(args: argparse.Namespace) -> str:
         "true_lambda1": TRUE_LAMBDA1,
         "true_lambda2": TRUE_LAMBDA2,
         "device": str(device),
+        "dtype": str(torch.get_default_dtype()),
         **{f"opt.{k}": v for k, v in opt_cfg.items()},
     }
     run = RunLogger(
@@ -529,11 +550,18 @@ def train(args: argparse.Namespace) -> str:
     last_l1 = float(model.lambda1.item())
     last_l2 = float(model.lambda2.item())
 
+    sampler = pinn.BatchSampler(args, lambda: sample_pde_batch(args.n_pde, device))
     for step in range(args.steps):
-        pde_batch = sample_pde_batch(args.n_pde, device)
+        quasi_newton = hybrid and step >= args.soap_steps
+        if hybrid and step == args.soap_steps:
+            opt = pinn.build_ssbroyden_phase(model, args)
+            scheduler = None
+            run.log("optimizer", step=step, optimizer="ssbroyden")
+        pde_batch = sampler.batch(step)
 
         if args.optimizer == "gnome":
-            aux_pde = sample_pde_batch(n_pde_aux, device)
+            aux_pde = (pinn.subsample_block(pde_batch, n_pde_aux)
+                       if sampler.fixed_batch is not None else sample_pde_batch(n_pde_aux, device))
             aux_idx = torch.randperm(args.n_data, device=device)[:n_data_aux]
             aux_data = tuple(d[aux_idx] for d in data_pool)
 
@@ -546,6 +574,10 @@ def train(args: argparse.Namespace) -> str:
                 return r, torch.zeros_like(r)
 
             loss = opt.step(main_closure, aux_closure)
+        elif args.optimizer == "engdw":
+            loss = opt.step(pde_batch)
+        elif quasi_newton:
+            loss = pinn.refinement_step(opt, model, pde_batch, residual_fn)
         else:
             opt.zero_grad()
             r = stacked_residuals(model, data_pool, pde_batch, block_weights)
@@ -561,17 +593,18 @@ def train(args: argparse.Namespace) -> str:
         if scheduler is not None:
             scheduler.step()
 
-        loss_val = float(loss.detach().item())
+        loss_val = float(loss.detach().item()) if torch.is_tensor(loss) else float(loss)
         if diverged(loss_val):
             if diag is not None:
                 diag.close()
             run.finish(completed=False, diverged=True, diverged_step=step)
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
             raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=loss_val)
+        run.log_train(step, loss=loss_val, lr=current_lr(opt), **pinn.phase_metrics(args, step))
         window.append(loss_val)
 
-        if args.log_every and (step + 1) % args.log_every == 0:
+        if ((args.log_every and (step + 1) % args.log_every == 0)
+                or step + 1 == args.steps or (hybrid and step + 1 == args.soap_steps)):
             tl = term_losses(
                 model, data_pool, sample_pde_batch(args.n_pde, device)
             )

@@ -29,7 +29,7 @@ Architecture options (all share the optimizer, so it's the only variable):
 
 * ``--arch {mlp, modified}`` — plain tanh MLP, or the gated modified MLP of
   Wang, Teng & Perdikaris (2021). ``--hidden`` / ``--depth`` size both.
-* ``--embed {none, periodic, fourier}`` — the input embedding:
+* ``embedding {none, periodic, fourier}`` — the input embedding:
     - ``none``: raw ``(t, x)``.
     - ``periodic``: ``[t, cos(πx), sin(πx)]`` (period-2 in x). NOTE this
       does NOT enforce wave's *Dirichlet* BC (cos(πx)≠0 at the boundaries);
@@ -47,7 +47,7 @@ Architecture options (all share the optimizer, so it's the only variable):
   transform ``u = sin(πx)·N(t, x)`` (vanishes at x = 0, 1). When set, the
   soft ``bc`` loss block is dropped (it would be identically zero). This is
   the wave analog of AC's exact-periodicity embedding, and pairs naturally
-  with ``--embed fourier``.
+  with ``embedding fourier``.
 
 Every optimizer gets linear-warmup + cosine-decay (``--cosine-decay`` =
 final-lr fraction; 1.0 gives warmup then constant, which suits Gnome since
@@ -55,9 +55,9 @@ its Gauss-Newton step self-anneals). Reference: analytic (no download).
 
 Usage:
 
-    # Edit experiments/configs/pinns/wave_pinn.py: optimizer='gnome', arch='modified', embed='fourier', fourier_scale=10.0, hard_bc=True
+    # Edit experiments/configs/pinns/wave_pinn.py: optimizer='gnome', arch='modified', embedding='fourier', fourier_scale=10.0, hard_bc=True
     uv run -m experiments.pinns.wave_pinn
-    # Edit experiments/configs/pinns/wave_pinn.py: optimizer='soap', arch='mlp', embed='none'
+    # Edit experiments/configs/pinns/wave_pinn.py: optimizer='soap', arch='mlp', embedding='none'
     uv run -m experiments.pinns.wave_pinn
 """
 
@@ -92,6 +92,8 @@ from experiments.common import (
     TrainableFourierEmbedding,
 )
 
+
+from experiments.common import pinn_options as pinn
 
 EXPERIMENT = "wave_pinn"
 
@@ -385,7 +387,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
+@pinn.preserve_default_dtype
 def train(args: argparse.Namespace) -> str:
+    hybrid = args.optimizer == "soap+ssbroyden"
     # Rebind before any residual, reference or model construction: u_exact and
     # ic_u_residual read it at call time.
     global SECOND_MODE
@@ -393,18 +397,27 @@ def train(args: argparse.Namespace) -> str:
 
     torch.manual_seed(args.seed)
     device = pick_device()
-    embed = build_embedding(args.embed, args.fourier_dim, args.fourier_scale)
+    if args.float64 or hybrid or args.optimizer == "engdw":
+        torch.set_default_dtype(torch.float64)
+        if device.type == "mps":
+            device = torch.device("cpu")
+    embed = build_embedding(args.embedding, args.embed_dim, args.embed_scale)
     model = build_model(
         args.arch, embed, args.hidden, args.depth, args.hard_bc,
         args.fuse_every,
     ).to(device)
-    opt, opt_cfg, scheduler = build_optimizer(
-        args.optimizer, model.parameters(), args.lr, args.weight_decay,
-        warmup=args.warmup_steps, total_steps=args.steps,
-        cosine_decay=args.cosine_decay, eps=args.eps,
-        beta1=args.beta1, beta2=args.beta2,
-        trust_region=args.trust_region,
-    )
+    residual_fn = lambda model, batch: stacked_residuals(model, batch, args.hard_bc, args.weights)
+    if args.optimizer in ("soap+ssbroyden", "engdw"):
+        opt, opt_cfg, scheduler = pinn.build_extra_optimizer(
+            model, args, residual_fn, precondition_frequency=10)
+    else:
+        opt, opt_cfg, scheduler = build_optimizer(
+            args.optimizer, model.parameters(), args.lr, args.weight_decay,
+            warmup=args.warmup_steps, total_steps=args.steps,
+            cosine_decay=args.cosine_decay, eps=args.eps,
+            beta1=args.beta1, beta2=args.beta2,
+            trust_region=args.trust_region,
+        )
 
     n_pde_aux = max(8, int(args.n_pde * args.aux_frac))
     n_ic_aux = max(2, int(args.n_ic * args.aux_frac))
@@ -412,19 +425,21 @@ def train(args: argparse.Namespace) -> str:
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
+        **pinn.metadata(args),
         # Non-zero means a sibling {run_id}.diag.jsonl exists.
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
+        "dtype": str(torch.get_default_dtype()),
         "partition_residuals": args.optimizer == "gnome" and args.partition_residuals,
         "arch": args.arch,
         # Realized chunk sizes, not the raw flag: 0 and any value >= depth-2
         # both mean "one chunk", and the sweep needs those runs to compare
         # equal. None for the archs that have no such grouping.
         "fuse_every": getattr(model, "chunks", None),
-        "embed": args.embed,
-        "fourier_dim": args.fourier_dim if args.embed == "fourier" else None,
-        "fourier_scale": args.fourier_scale if args.embed == "fourier" else None,
-        "fourier_trainable": args.embed == "fourier",
+        "embed": args.embedding,
+        "fourier_dim": args.embed_dim if args.embedding == "fourier" else None,
+        "fourier_scale": args.embed_scale if args.embedding == "fourier" else None,
+        "fourier_trainable": args.embedding == "fourier",
         "hard_bc": args.hard_bc,
         "weights": list(args.weights),
         "steps": args.steps,
@@ -473,9 +488,9 @@ def train(args: argparse.Namespace) -> str:
         diag = JsonlDiagnostics(diag_path, params=diag_params)
 
     if not args.quiet:
-        embed_desc = args.embed
-        if args.embed == "fourier":
-            embed_desc += f"(dim={args.fourier_dim}, scale={args.fourier_scale})"
+        embed_desc = args.embedding
+        if args.embedding == "fourier":
+            embed_desc += f"(dim={args.embed_dim}, scale={args.embed_scale})"
         print(
             f"[{EXPERIMENT}] {args.optimizer} | arch={args.arch} "
             f"{args.depth}x{args.hidden} | embed={embed_desc} | "
@@ -495,10 +510,18 @@ def train(args: argparse.Namespace) -> str:
     last_pde = last_ic = last_ict = last_bc = float("nan")
     best_avg = best_rel_l2 = float("inf")
 
+    sampler = pinn.BatchSampler(args, lambda: sample_batch(args.n_pde, args.n_ic, args.n_bc, device))
     for step in range(args.steps):
-        main_batch = sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
+        quasi_newton = hybrid and step >= args.soap_steps
+        if hybrid and step == args.soap_steps:
+            opt = pinn.build_ssbroyden_phase(model, args)
+            scheduler = None
+            run.log("optimizer", step=step, optimizer="ssbroyden")
+        main_batch = sampler.batch(step)
         if args.optimizer == "gnome":
-            aux_batch = sample_batch(n_pde_aux, n_ic_aux, n_bc_aux, device)
+            aux_batch = (pinn.subsample_txc(main_batch, n_pde_aux, n_ic_aux, n_bc_aux)
+                         if sampler.fixed_batch is not None else sample_batch(
+                             n_pde_aux, n_ic_aux, n_bc_aux, device))
 
             def main_closure():
                 r = stacked_residuals(model, main_batch, args.hard_bc, args.weights)
@@ -515,6 +538,10 @@ def train(args: argparse.Namespace) -> str:
                     if args.partition_residuals else None
                 ),
             )
+        elif args.optimizer == "engdw":
+            loss = opt.step(main_batch)
+        elif quasi_newton:
+            loss = pinn.refinement_step(opt, model, main_batch, residual_fn)
         else:
             opt.zero_grad()
             r = stacked_residuals(model, main_batch, args.hard_bc, args.weights)
@@ -530,7 +557,7 @@ def train(args: argparse.Namespace) -> str:
         if scheduler is not None:
             scheduler.step()
 
-        loss_val = float(loss.detach().item())
+        loss_val = float(loss.detach().item()) if torch.is_tensor(loss) else float(loss)
         if diverged(loss_val):
             if diag is not None:
                 diag.close()
@@ -538,10 +565,11 @@ def train(args: argparse.Namespace) -> str:
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.",
                   flush=True)
             raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=loss_val)
+        run.log_train(step, loss=loss_val, lr=current_lr(opt), **pinn.phase_metrics(args, step))
         window.append(loss_val)
 
-        if args.log_every and (step + 1) % args.log_every == 0:
+        if ((args.log_every and (step + 1) % args.log_every == 0)
+                or step + 1 == args.steps or (hybrid and step + 1 == args.soap_steps)):
             tl = term_losses(
                 model, sample_batch(args.n_pde, args.n_ic, args.n_bc, device)
             )

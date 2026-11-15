@@ -4,7 +4,7 @@ None keeps an existing automatic/default-dependent setting where supported.
 """
 
 CONFIG = {
-    # Choices: 'gnome', 'soap', 'adamw', 'engdw', 'woodbury'.
+    # Choices: 'adamw', 'soap', 'gnome', 'soap+ssbroyden', 'engdw'.
     'optimizer': 'gnome',
     'seed': 0,
     'steps': 100_000,
@@ -26,52 +26,56 @@ CONFIG = {
     'quiet': False,
     # Each optimizer keeps its own hyperparameters and learning-rate schedule.
     'optimizers': {
-        'gnome': {
-            'aux_frac': 0.10,
-            'lr': 2.5e-2,
-            'trust_region': .01,
-            'eps': 1e-12,
-            'beta1': .99,
-            'beta2': 0.99,
-            'weight_decay': 1e-8,
+        'adamw': {
+            'lr': 0.01,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            'cosine_decay': 0.10,
+            'cosine_decay': 0.1,
         },
         'soap': {
-            'lr': 1e-2,
-            'beta1': .95,
+            'lr': 0.01,
+            'beta1': 0.95,
             'beta2': 0.99,
-            'weight_decay': 1e-8,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            'cosine_decay': 0.10,
+            'cosine_decay': 0.1,
         },
-        'adamw': {
-            'lr': 1e-2,
-            'weight_decay': 1e-8,
+        'gnome': {
+            'aux_frac': 0.1,
+            'lr': 0.025,
+            'trust_region': 0.01,
+            'eps': 1e-12,
+            'beta1': 0.99,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            'cosine_decay': 0.10,
+            'cosine_decay': 0.1,
+        },
+        'soap+ssbroyden': {
+            'lr': 0.01,
+            'beta1': 0.95,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
+            'warmup_steps': 200,
+            'cosine_decay': 0.1,
+            'soap_steps': 30000,
+            'ssbroyden_lr': 1.0,
+            'ssbroyden_tolerance_grad': 1e-10,
         },
         'engdw': {
-            'lr': 1e-2,
-            'engdw_damping': 1e-6,
+            'lr': 0.01,
+            'engdw_damping': 1e-06,
             'engdw_momentum': 0.0,
             'engdw_line_search': True,
             'engdw_chunk': 32,
             'engdw_fixed': False,
         },
-        'woodbury': {
-            'aux_frac': 0.10,
-            'lr': 1e-2,
-            'trust_region': .05,
-            'beta1': .95,
-            'beta2': 0.99,
-            'woodbury_damping': 0.001,
-            'woodbury_warmup_steps': 100,
-            'history_tol': 0.01,
-            'max_history': None,
-            'gram_float64': False,
-            'warmup_steps': 200,
-            'cosine_decay': 0.10,
-        },
     },
+    # Input features: 'none', 'periodic', or 'fourier'.
+    'embedding': 'none',
+    # Even number of random Fourier features.
+    'embed_dim': 32,
+    # Initial standard deviation of the frozen Fourier projection.
+    'embed_scale': 1.0,
+    'fix_after': None,
 }

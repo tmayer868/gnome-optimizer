@@ -1,4 +1,4 @@
-"""(2+1)D viscous Burgers PINN: AdamW vs SOAP vs Gnome vs ENGD-W.
+"""(2+1)D viscous Burgers PINN: AdamW, SOAP, Gnome, ENGD-W, SOAP + SS-Broyden.
 
 PDE:  u_t + f(u)_x + g(u)_y = ν·(u_xx + u_yy),   f(u) = g(u) = u²/2
       ⇔  u_t + u·u_x + u·u_y = ν·(u_xx + u_yy)
@@ -41,6 +41,11 @@ Its residual blocks are scaled by 1/sqrt(N_block). Optional momentum,
 same-batch grid line search, and fixed collocation are configured in the
 ``optimizers['engdw']`` block. The dense solve uses all residual rows;
 ``engdw_chunk`` limits Jacobian evaluation chunks, not the solve size.
+
+SOAP + SS-Broyden uses float64 throughout. SOAP's schedule spans only
+``soap_steps``; the remaining iterations refine the same residual objective
+on a frozen PDE/IC/BC batch. ``fixed_dataset`` fixes training points from the
+start; ``fix_after`` can freeze them before the handoff.
 
 **Reference architecture.** The paper gives "10 hidden layers, tanh" and a
 parameter count of 3881, which pins the width exactly: with 3 inputs and 1
@@ -109,7 +114,12 @@ from experiments.common import (
     pick_device,
 )
 from experiments.common import MLP as _SharedMLP, ConcatEmbedding
+from experiments.baselines.ssbroyden import (
+    build_soap_phase, build_ssbroyden_phase, validate_ssbroyden,
+)
 
+
+from experiments.common import pinn_options as pinn
 
 EXPERIMENT = "burgers2d_pinn"
 
@@ -146,8 +156,9 @@ class PINN(_SharedMLP):
     "10 hidden layers" plus the output layer.
     """
 
-    def __init__(self, hidden: int = 20, depth: int = 11):
-        super().__init__(ConcatEmbedding(3), hidden=hidden, depth=depth)
+    def __init__(self, hidden: int = 20, depth: int = 11,
+                 embedding: nn.Module | None = None):
+        super().__init__(embedding if embedding is not None else ConcatEmbedding(3), hidden=hidden, depth=depth)
 
 
 # ========================= Residuals =========================
@@ -225,6 +236,15 @@ def sample_batch(
 def residual_partition_sizes(batch) -> list[int]:
     """One scalar residual per point in each actual auxiliary block."""
     return [coords[0].numel() for coords in batch]
+
+
+def sample_aux_from_batch(batch, n_pde: int, n_ic: int, n_bc: int):
+    """Subsample each fixed residual block, preserving coordinate tuples."""
+    blocks = []
+    for block, n in zip(batch, (n_pde, n_ic, n_bc)):
+        indices = torch.randperm(len(block[0]), device=block[0].device)[:n]
+        blocks.append(tuple(t[indices] for t in block))
+    return tuple(blocks)
 
 
 def stacked_residuals(model: nn.Module, batch) -> torch.Tensor:
@@ -397,6 +417,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         p.error("engdw_fixed requires optimizer='engdw'")
     if args.diagnostics_every > 0 and args.optimizer != "gnome":
         p.error("diagnostics_every is Gnome-only")
+    if args.fix_after is not None and not 0 <= args.fix_after < args.steps:
+        p.error("fix_after must satisfy 0 <= fix_after < steps, or be None")
+    if (args.optimizer == "gnome" and (args.fixed_dataset or args.fix_after is not None)
+            and not 0 < args.aux_frac <= 1):
+        p.error("fixed_dataset or fix_after requires aux_frac in (0,1] for Gnome")
+    if args.optimizer == "soap+ssbroyden":
+        try:
+            validate_ssbroyden(args)
+        except ValueError as error:
+            p.error(str(error))
     if args.optimizer == "engdw":
         if not math.isfinite(args.engdw_damping) or args.engdw_damping <= 0:
             p.error("engdw_damping must be finite and positive")
@@ -409,17 +439,33 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
+@pinn.preserve_default_dtype
 def train(args: argparse.Namespace) -> str:
+    hybrid = args.optimizer == "soap+ssbroyden"
+    if hybrid:
+        validate_ssbroyden(args)
+    fixed_dataset = args.fixed_dataset or args.engdw_fixed
+    fixed_from_step = 0 if fixed_dataset else args.fix_after
+    if hybrid:
+        fixed_from_step = (args.soap_steps if fixed_from_step is None
+                           else min(fixed_from_step, args.soap_steps))
+    sampling = ("fixed" if fixed_from_step == 0 else
+                "resample_then_fixed" if args.fix_after is not None else
+                "resample_soap_then_fixed" if hybrid else "resample_each_step")
     torch.manual_seed(args.seed)
     device = pick_device()
-    dtype = torch.float64 if args.optimizer == "engdw" else getattr(torch, args.dtype)
+    dtype = torch.float64 if hybrid or args.optimizer == "engdw" else getattr(torch, args.dtype)
     if device.type == "mps" and dtype is torch.float64:
         device = torch.device("cpu")            # MPS has no float64
         if not args.quiet:
             print(f"[{EXPERIMENT}] float64 requested; MPS has no float64 "
                   f"— falling back to CPU.", flush=True)
 
-    model = PINN(hidden=args.hidden, depth=args.depth).to(device=device, dtype=dtype)
+    embedding = pinn.build_embedding(
+        args.embedding, 3, spatial_dims=(1, 2), length=1.0,
+        embed_dim=args.embed_dim, embed_scale=args.embed_scale,
+    )
+    model = PINN(hidden=args.hidden, depth=args.depth, embedding=embedding).to(device=device, dtype=dtype)
     if args.optimizer == "engdw":
         residual, jacobian = make_engdw_functions(model, args.engdw_chunk)
         opt = ENGDW(model, residual, jacobian_fn=jacobian, lr=args.lr,
@@ -432,6 +478,8 @@ def train(args: argparse.Namespace) -> str:
                        energy="0.5 * sum(block MSEs)", residual_scaling="1/sqrt(N_block)",
                        jacobian="vmap(jacrev(single_residual))")
         scheduler = None
+    elif hybrid:
+        opt, opt_cfg, scheduler = build_soap_phase(model, args)
     else:
         opt, opt_cfg, scheduler = build_optimizer(
             args.optimizer, model.parameters(), args.lr, args.weight_decay,
@@ -447,14 +495,17 @@ def train(args: argparse.Namespace) -> str:
     n_params = sum(p.numel() for p in model.parameters())
 
     hyperparameters = {
+        **pinn.metadata(args),
         # Non-zero means a sibling {run_id}.diag.jsonl exists.
         "diagnostics_every": args.diagnostics_every,
         "optimizer": args.optimizer,
         "partition_residuals": args.optimizer == "gnome" and args.partition_residuals,
         "steps": args.steps,
         "dtype": str(dtype).removeprefix("torch."),
-        "sampling": "fixed" if args.engdw_fixed else "resample_each_step",
-        "fixed_dataset": args.engdw_fixed,
+        "sampling": sampling,
+        "fixed_dataset": fixed_dataset,
+        "fix_after": args.fix_after,
+        "fixed_from_step": fixed_from_step,
         "hidden": args.hidden,
         "depth": args.depth,
         "n_pde": args.n_pde,
@@ -518,14 +569,23 @@ def train(args: argparse.Namespace) -> str:
     last_pde = last_ic = last_bc = float("nan")
     best_avg = best_rel_l2 = float("inf")
 
-    fixed_batch = (sample_batch(args.n_pde, args.n_ic, args.n_bc, device, dtype)
-                   if args.engdw_fixed else None)
+    fixed_batch = None
     for step in range(args.steps):
+        quasi_newton = hybrid and step >= args.soap_steps
+        if hybrid and step == args.soap_steps:
+            opt = build_ssbroyden_phase(model, args)
+            scheduler = None
+            if not args.quiet:
+                print(f"[{EXPERIMENT}] switching to SS-Broyden at step {step}", flush=True)
         main_batch = fixed_batch if fixed_batch is not None else sample_batch(
             args.n_pde, args.n_ic, args.n_bc, device, dtype)
+        if fixed_batch is None and fixed_from_step is not None and step >= fixed_from_step:
+            fixed_batch = main_batch
+            run.log("sampling", step=step, sampling="fixed")
         if args.optimizer == "gnome":
-            aux_batch = sample_batch(
-                n_pde_aux, n_ic_aux, n_bc_aux, device, dtype)
+            aux_batch = (sample_aux_from_batch(main_batch, n_pde_aux, n_ic_aux, n_bc_aux)
+                         if fixed_batch is not None else sample_batch(
+                             n_pde_aux, n_ic_aux, n_bc_aux, device, dtype))
 
             def main_closure():
                 r = stacked_residuals(model, main_batch)
@@ -543,6 +603,15 @@ def train(args: argparse.Namespace) -> str:
             )
         elif args.optimizer == "engdw":
             loss = opt.step(main_batch)
+        elif quasi_newton:
+            def closure():
+                opt.zero_grad()
+                r = stacked_residuals(model, main_batch)
+                value = r.square().mean()
+                value.backward()
+                return value
+
+            loss = opt.step(closure)
         else:
             opt.zero_grad()
             r = stacked_residuals(model, main_batch)
@@ -567,10 +636,13 @@ def train(args: argparse.Namespace) -> str:
             run.finish(completed=False, diverged=True, diverged_step=step)
             print(f"[{EXPERIMENT}] diverged at step {step} — stopping.", flush=True)
             raise SystemExit(DIVERGED_EXIT)
-        run.log_train(step, loss=loss_val, lr=applied_lr)
+        run.log_train(step, loss=loss_val, lr=applied_lr, **(
+            {"phase": "ssbroyden" if quasi_newton else "soap"} if hybrid else {}
+        ))
         window.append(loss_val)
 
-        if (args.log_every and (step + 1) % args.log_every == 0) or step + 1 == args.steps:
+        if ((args.log_every and (step + 1) % args.log_every == 0)
+                or step + 1 == args.steps or (hybrid and step + 1 == args.soap_steps)):
             tl = term_losses(model, sample_batch(
                 args.n_pde, args.n_ic, args.n_bc, device, dtype))
             rl2 = eval_rel_l2(model, eval_coords, u_ref)

@@ -38,7 +38,7 @@ def assert_preserved(before, after):
 
 @pytest.mark.parametrize("optimizer", ["gnome", "soap", "adamw"])
 @pytest.mark.parametrize("arch,embed", [
-    ("mlp", "none"), ("modified", "polynomial"),
+    ("mlp", "none"), ("modified", "periodic"),
     ("fused", "periodic"), ("fused-modified", "fourier"),
 ])
 def test_training_switch_preserves_state(tmp_path, monkeypatch, optimizer, arch, embed):

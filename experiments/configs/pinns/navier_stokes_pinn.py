@@ -4,7 +4,7 @@ None keeps an existing automatic/default-dependent setting where supported.
 """
 
 CONFIG = {
-    # Choices: 'gnome', 'soap', 'adamw'.
+    # Choices: 'adamw', 'soap', 'gnome', 'soap+ssbroyden', 'engdw'.
     'optimizer': 'gnome',
     'seed': 0,
     'steps': 200000,
@@ -33,49 +33,58 @@ CONFIG = {
     'quiet': False,
     # Each optimizer keeps its own hyperparameters and learning-rate schedule.
     'optimizers': {
-        'gnome': {
-            'aux_frac': 0.03,
+        'adamw': {
             'lr': 0.001,
-            # Gnome per-coordinate update bound: lambda is set to the smallest value with
-            # max|m̂/(v̂+lambda)| <= this, so no coordinate moves more than lr*trust_region in a step.
-            # Larger -> weaker bound -> longer steps. 0 disables it, falling back to plain m̂/(v̂+eps)
-            # damping.
-            'trust_region': 1.0,
-            # Gnome curvature-damping epsilon in m̂/(v̂+eps): larger -> more gradient-descent-like,
-            # smaller -> fuller Newton step. Gnome only; SOAP/AdamW keep their fixed eps=1e-8.
-            'eps': 1e-6,
-            # First-moment (momentum) EMA for Gnome and SOAP.
-            'beta1': 0.9,
-            # Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.
-            'beta2': 0.99,
-            'weight_decay': 1e-8,
-            # Linear LR warmup steps, applied to every optimizer.
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Gnome (MSE) never decays regardless.
             'cosine_decay': 0.0,
         },
         'soap': {
             'lr': 0.001,
-            # First-moment (momentum) EMA for Gnome and SOAP.
             'beta1': 0.9,
-            # Second-moment / preconditioner EMA (also shampoo_beta) for Gnome and SOAP.
             'beta2': 0.99,
-            'weight_decay': 1e-8,
-            # Linear LR warmup steps, applied to every optimizer.
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Gnome (MSE) never decays regardless.
             'cosine_decay': 0.0,
         },
-        'adamw': {
+        'gnome': {
+            'aux_frac': 0.03,
             'lr': 0.001,
-            'weight_decay': 1e-8,
-            # Linear LR warmup steps, applied to every optimizer.
+            'trust_region': 1.0,
+            'eps': 1e-06,
+            'beta1': 0.9,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
             'warmup_steps': 200,
-            # Final-LR fraction for the baseline cosine decay: 0.0 decays to zero (standard treatment),
-            # 1.0 disables decay. Gnome (MSE) never decays regardless.
             'cosine_decay': 0.0,
+        },
+        'soap+ssbroyden': {
+            'lr': 0.001,
+            'beta1': 0.9,
+            'beta2': 0.99,
+            'weight_decay': 1e-08,
+            'warmup_steps': 200,
+            'cosine_decay': 0.0,
+            'soap_steps': 30000,
+            'ssbroyden_lr': 1.0,
+            'ssbroyden_tolerance_grad': 1e-10,
+        },
+        'engdw': {
+            'lr': 0.05,
+            'engdw_damping': 1e-06,
+            'engdw_momentum': 0.0,
+            'engdw_line_search': True,
+            'engdw_chunk': 32,
+            'engdw_fixed': False,
         },
     },
+    # Input features: 'none', 'periodic', or 'fourier'.
+    'embedding': 'none',
+    # Even number of random Fourier features.
+    'embed_dim': 32,
+    # Initial standard deviation of the frozen Fourier projection.
+    'embed_scale': 1.0,
+    'fixed_dataset': False,
+    'fix_after': None,
+    'float64': False,
 }

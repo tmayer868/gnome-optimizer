@@ -1,4 +1,5 @@
 import importlib
+import ast
 import json
 from pathlib import Path
 import subprocess
@@ -11,6 +12,31 @@ from experiments.common.config import (
     default_config_path, load_config_dict, write_config,
 )
 from experiments.common.config_schema import pinn_optimizer_fields
+
+
+def test_sweep_registry_has_existing_runners():
+    from scripts.sweep import EXPERIMENT_PACKAGES
+
+    for package, names in EXPERIMENT_PACKAGES.items():
+        for name in names:
+            assert (EXPERIMENTS_DIR / package / (name + ".py")).is_file()
+    runners = {path.stem for path in (EXPERIMENTS_DIR / "pinns").glob("*.py")
+               if path.stem != "__init__"}
+    assert EXPERIMENT_PACKAGES["pinns"] == runners
+
+
+def test_pinn_configs_have_existing_runners():
+    for path in (CONFIGS_DIR / "pinns").glob("*.py"):
+        if (EXPERIMENTS_DIR / "pinns" / path.name).is_file():
+            continue
+        # Derived pilot configs belong to the base runner they import.
+        bases = [node.module for node in ast.parse(path.read_text()).body
+                 if isinstance(node, ast.ImportFrom)
+                 and any(alias.name == "CONFIG" and alias.asname == "BASE_CONFIG"
+                         for alias in node.names)]
+        assert len(bases) == 1, f"Orphan config: {path}"
+        key = bases[0].removeprefix("experiments.configs.").replace(".", "/")
+        assert (EXPERIMENTS_DIR / (key + ".py")).is_file()
 
 
 @pytest.mark.parametrize("key", sorted(SCHEMAS))
@@ -79,7 +105,8 @@ def test_optimizer_dependent_defaults():
     from experiments.pinns import poisson_pinn
     from experiments.transformers import modded_nanogpt
 
-    assert poisson_pinn.parse_args({"optimizer": "woodbury", "beta1": None}).beta1 == 0
+    with pytest.raises(SystemExit):
+        poisson_pinn.parse_args({"optimizer": "woodbury"})
     args = modded_nanogpt.parse_args({"preset": "dev", "synthetic": True, "optimizer": "muon",
                                      "steps": None, "lr": None})
     assert args.vocab_size == 256 and args.steps == 5 and args.lr == 0.025
@@ -201,8 +228,8 @@ def test_kaggle_config_loads():
 @pytest.mark.parametrize("key,optimizer,updates", [
     *[("pinns/poisson_pinn", optimizer,
        dict(steps=2, hidden=3, depth=2, n_pde=4, n_bc_per_edge=2,
-            log_every=0, float64=True))
-      for optimizer in ("gnome", "soap", "adamw", "engdw", "woodbury")],
+            log_every=0, float64=True, soap_steps=1))
+      for optimizer in ("gnome", "soap", "adamw", "engdw", "soap+ssbroyden")],
 ])
 def test_entrypoint_trains_from_custom_config(key, optimizer, updates, tmp_path):
     config = load_config_dict(CONFIGS_DIR / (key + ".py"))
@@ -211,6 +238,8 @@ def test_entrypoint_trains_from_custom_config(key, optimizer, updates, tmp_path)
         if "warmup_steps" in block:
             block["warmup_steps"] = 0
         block["lr"] = 2e-4
+    updates = dict(updates)
+    config["optimizers"]["soap+ssbroyden"]["soap_steps"] = updates.pop("soap_steps", 1)
     config.update(updates, optimizer=optimizer, quiet=True, runs_dir=str(tmp_path / "runs"))
     path = write_config(tmp_path / "smoke.py", config)
     result = subprocess.run([sys.executable, "-m", "experiments." + key.replace("/", "."),
